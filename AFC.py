@@ -13,6 +13,7 @@ import time
 import json
 import toolhead
 import stepper
+import random
 from configparser import Error as error
 from kinematics import extruder
 from . import stepper_enable, output_pin
@@ -134,7 +135,7 @@ class afc:
         self.VarFile = config.get('VarFile')
         
         # Get debug and cast to boolean
-        self.debug = True == config.get('debug', 0)
+        self.debug = config.getboolean('debug', 0)
 
     cmd_LANE_MOVE_help = "Lane Manual Movements"
     def cmd_LANE_MOVE(self, gcmd):
@@ -142,6 +143,7 @@ class afc:
         distance = gcmd.get_float('DISTANCE', 0)
         CUR_LANE = self.printer.lookup_object('AFC_stepper ' + lane)
         CUR_LANE.move(distance, self.short_moves_speed, self.short_moves_accel)
+        CUR_LANE.do_enable(False)
 
     def respond_info(self, msg):
         """
@@ -261,6 +263,8 @@ class afc:
         else:
             self.lanes={}
         temp=[]
+
+        if self.debug: self.respond_info("Debugging info will be printed")
         
         for PO in self.printer.objects:
             if 'AFC_stepper' in PO and 'tmc' not in PO:
@@ -512,6 +516,7 @@ class afc:
 
     cmd_TOOL_LOAD_help = "Load lane into tool"
     def cmd_TOOL_LOAD(self, gcmd):
+        if self.debug: self.respond_info("TOOL_LOAD: Start")
         self.failure = False
         extruder = self.toolhead.get_extruder() #Get extruder
         self.heater = extruder.get_heater() #Get extruder heater
@@ -519,6 +524,8 @@ class afc:
         CUR_LANE = self.printer.lookup_object('AFC_stepper ' + lane)
         CUR_LANE.status = 'loading'
         led_cont=CUR_LANE.led_index.split(':')
+
+        if self.debug: self.respond_info("TOOL_LOAD: Led set loading")
         self.afc_led(self.led_loading, CUR_LANE.led_index)
         if CUR_LANE.load_state == True and self.hub.filament_present == False:
             if self.hub_cut_active:
@@ -531,20 +538,36 @@ class afc:
                     self.gcode.respond_info('Extruder below min_extrude_temp, heating to 5 degrees above min')
                     self.gcode.run_script_from_command('M109 S' + str((self.heater.min_extrude_temp) + 5))
             CUR_LANE.do_enable(True)
+
+            if self.debug: self.respond_info("TOOL_LOAD: Load to hub load")
             if CUR_LANE.hub_load == False:
                 CUR_LANE.move(CUR_LANE.dist_hub, CUR_LANE.dist_hub_move_speed, CUR_LANE.dist_hub_move_accel)
             CUR_LANE.hub_load = True
+
+            if self.debug: self.respond_info("TOOL_LOAD: Hub load")
+            if self.hub.filament_present == False:
+                CUR_LANE.move( self.hub_dis + self.short_move_dis, self.short_moves_speed, self.short_moves_accel)
+                self.toolhead.wait_moves()
+            
             hub_attempts = 0
+
             while self.hub.filament_present == False:
                 CUR_LANE.move( self.short_move_dis, self.short_moves_speed, self.short_moves_accel)
                 hub_attempts += 1
+                self.toolhead.wait_moves()
+
                 #callout if filament doesn't go past hub during load
-                if hub_attempts > 10:
+                if hub_attempts > 20:
                     message = (' PAST HUB, CHECK FILAMENT PATH\n||=====||==>--||-----||\nTRG   LOAD   HUB   TOOL')
                     self.handle_lane_failure(CUR_LANE, message)
                     break
-            CUR_LANE.move( self.afc_bowden_length, self.long_moves_speed, self.long_moves_accel)
+            if self.debug: self.respond_info("TOOL_LOAD: Attempts for hub {}".format(hub_attempts))
+
+            if self.debug: self.respond_info("TOOL_LOAD: Bowden loading")
+            CUR_LANE.move( self.afc_bowden_length - (hub_attempts*self.short_move_dis), self.long_moves_speed, self.long_moves_accel)
             CUR_LANE.extruder_stepper.sync_to_extruder(CUR_LANE.extruder_name)
+            
+            if self.debug: self.respond_info("TOOL_LOAD: Load tool sensor")
             tool_attempts = 0
             while self.tool.filament_present == False:
                 tool_attempts += 1
@@ -593,17 +616,21 @@ class afc:
                                 break
                     break
             if self.failure == False:
+                if self.debug: self.respond_info("TOOL_LOAD: Tool load sensor done")
                 pos = self.toolhead.get_position()
                 pos[3] += self.tool_stn
+                if self.debug: self.respond_info("TOOL_LOAD: Load to nozzle")
                 self.toolhead.manual_move(pos, self.tool_load_speed)
                 self.toolhead.wait_moves()
                 self.printer.lookup_object('AFC_stepper ' + CUR_LANE.name).status = 'tool'
                 self.lanes[CUR_LANE.unit][CUR_LANE.name]['tool_loaded'] = True
                 self.lanes[CUR_LANE.unit][CUR_LANE.name]['hub_loaded'] = CUR_LANE.hub_load
+                
 
                 self.save_vars()
 
                 self.current = CUR_LANE.name
+                if self.debug: self.respond_info("TOOL_LOAD: Set tool load led")
                 self.afc_led(self.led_tool_loaded, CUR_LANE.led_index)
                 if self.poop:
                     self.gcode.run_script_from_command(self.poop_cmd)
@@ -629,12 +656,15 @@ class afc:
                 self.respond_error(msg, raise_error=False)
                 self.gcode.run_script_from_command('PAUSE')
                 self.afc_led(self.led_not_ready, CUR_LANE.led_index)
+        
+        if self.debug: self.respond_info("TOOL_LOAD: Done")
 
     cmd_TOOL_UNLOAD_help = "Unload from tool head"
     def cmd_TOOL_UNLOAD(self, gcmd):
         if self.current == None:
             return
         #self.toolhead = self.printer.lookup_object('toolhead')
+        if self.debug: self.respond_info("TOOL_UNLOAD: Start")
         pos = self.toolhead.get_position()
         pos[2] += self.z_hop
         self.toolhead.manual_move(pos, self.tool_unload_speed)
@@ -646,16 +676,19 @@ class afc:
         CUR_LANE = self.printer.lookup_object('AFC_stepper '+ lane)
         CUR_LANE.status = 'unloading'
         led_cont = CUR_LANE.led_index.split(':')
+        if self.debug: self.respond_info("TOOL_UNLOAD: Unload LED")
         self.afc_led(self.led_unloading, CUR_LANE.led_index)
         CUR_LANE.extruder_stepper.sync_to_extruder(CUR_LANE.extruder_name)
         
         if not self.heater.can_extrude: #Heat extruder if not at min temp 
             self.gcode.respond_info('Extruder below min_extrude_temp, heating to 5 degrees above min')
             self.gcode.run_script_from_command('M109 S' + str((self.heater.min_extrude_temp) + 5))
-            
+        
         if self.tool_cut_active:
+            if self.debug: self.respond_info("TOOL_UNLOAD: CUT")
             self.gcode.run_script_from_command(self.tool_cut_cmd)
             if self.park:
+                if self.debug: self.respond_info("TOOL_UNLOAD: PARK")
                 self.gcode.run_script_from_command(self.park_cmd)
 
         if self.form_tip:
@@ -664,10 +697,12 @@ class afc:
                 self.afc_tip_form()
             else:
                 self.gcode.run_script_from_command(self.form_tip_cmd)
-
+        
         x = 0
+        if self.debug: self.respond_info("TOOL_UNLOAD: Tool UNLOAD")
         while self.tool.filament_present == True:
             x += 1
+            if self.debug: self.respond_info("TOOL_UNLOAD: Tool UNLOAD try {}".format(x))
             if x > self.tool_max_unload_attempts:
                 self.pause_print()
                 msg = ('FAILED TO UNLOAD ' + CUR_LANE.name.upper() + '. FILAMENT STUCK IN TOOLHEAD.\n||=====||====||====|x|\nTRG   LOAD   HUB   TOOL')
@@ -683,9 +718,16 @@ class afc:
             pos[3] += self.tool_sensor_after_extruder * -1
             self.toolhead.manual_move(pos, self.tool_unload_speed)
             self.toolhead.wait_moves()
-            
+        
+        if self.debug: self.respond_info("TOOL_UNLOAD: Retracting from bowden")
         CUR_LANE.extruder_stepper.sync_to_extruder(None)
         CUR_LANE.move( self.afc_bowden_length * -1, self.long_moves_speed, self.long_moves_accel, True)
+
+        if self.debug: self.respond_info("TOOL_UNLOAD: Checking if filament is in hub")
+        if self.hub.filament_present == True:
+            CUR_LANE.move( self.hub_dis * -1, self.short_moves_speed, self.short_moves_accel)
+            self.toolhead.wait_moves()
+
         x = 0
         while self.hub.filament_present == True:
             CUR_LANE.move(self.short_move_dis * -1, self.short_moves_speed, self.short_moves_accel, True)
@@ -700,6 +742,7 @@ class afc:
         self.lanes[CUR_LANE.unit][CUR_LANE.name]['hub_loaded'] = CUR_LANE.hub_load 
         self.save_vars()
         x = 0
+        if self.debug: self.respond_info("TOOL_UNLOAD: Hub successfully cleared")
         while CUR_LANE.load_state == False and CUR_LANE.prep_state == True:
             CUR_LANE.move( self.hub_move_dis, self.short_moves_speed, self.short_moves_accel)
             x += 1
@@ -708,24 +751,42 @@ class afc:
                 message = (' FAILED TO RELOAD CHECK FILAMENT AT TRIGGER\n||==>--||----||-----||\nTRG   LOAD   HUB   TOOL')
                 self.handle_lane_failure(CUR_LANE, message)
                 break
+        if self.debug: self.respond_info("TOOL_UNLOAD: Before setting led ready")
         self.afc_led(self.led_ready, CUR_LANE.led_index)
         CUR_LANE.status = None
         self.current = None
         CUR_LANE.do_enable(False)
+        if self.debug: self.respond_info("TOOL_UNLOAD: Done")
     
     cmd_CHANGE_TOOL_help = "change filaments in tool head"
     def cmd_CHANGE_TOOL(self, gcmd):
         #self.toolhead = self.printer.lookup_object('toolhead')
         lane = gcmd.get('LANE', None)
         if lane != self.current:
+            save_name = "_AFC_CHANGE_TOOL_{}".format(int(random.random()*100000))
+            if self.debug: self.respond_info("CHANGE_TOOL: Save state name {}".format(save_name))
+            self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME={}".format(save_name))
+            # self.gcode.run_script_from_command("GET_POSITION")
+
             store_pos = self.toolhead.get_position()
             if self.current != None:
                 self.gcode.run_script_from_command('TOOL_UNLOAD LANE=' + self.current)
+
             self.gcode.run_script_from_command('TOOL_LOAD LANE=' + lane)
             newpos = self.toolhead.get_position()
             newpos[2] = store_pos[2]
             self.toolhead.manual_move(newpos, self.tool_unload_speed)
             self.toolhead.wait_moves()
+
+            # self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME={}".format("_AFC_CHANGE_TOOL_POST_MOVE_BACK_TO_POS"))
+            self.gcode.run_script_from_command("RESTORE_GCODE_STATE NAME={} MOVE=1 MOVE_SPEED=100".format(save_name))
+            self.toolhead.wait_moves()
+            
+            # self.gcode.run_script_from_command("GET_POSITION")
+            # self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME={}".format("_AFC_CHANGE_TOOL_POST_RESUME"))
+
+        else:
+            self.respond_info("{} is already loaded".format(lane.upper()))
 
     def hub_cut(self, lane):
         CUR_LANE=self.printer.lookup_object('AFC_stepper '+lane)
