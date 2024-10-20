@@ -31,7 +31,7 @@ class afc:
         self.gcode = self.printer.lookup_object('gcode')
         self.VarFile = config.get('VarFile')
         self.Type = config.get('Type')
-        self.buffer_type = config.get('Buffer_Type','')
+        self.buffer_name = config.get('Buffer_Name','')
         self.current = None
         self.failure = False
         self.lanes = {}
@@ -467,8 +467,8 @@ class afc:
 
         if check_success == True:                            
             self.gcode.respond_info(logo)
-            if self.buffer_type != '':
-                self.buffer = self.printer.lookup_object('AFC_buffer {}'.format(self.buffer_type))
+            if self.buffer_name != '':
+                self.buffer = self.printer.lookup_object('AFC_buffer {}'.format(self.buffer_name))
                 self.buffer.enable_buffer()
         else:
             self.gcode.respond_info(logo_error)
@@ -634,7 +634,7 @@ class afc:
                 self.save_vars()
 
                 self.current = CUR_LANE.name
-                if self.buffer_type != None:
+                if self.buffer_name != None:
                     self.buffer.enable_buffer()
 
                 if self.debug: self.respond_info("TOOL_LOAD: Set tool load led")
@@ -683,9 +683,9 @@ class afc:
         CUR_LANE = self.printer.lookup_object('AFC_stepper '+ lane)
         CUR_LANE.status = 'unloading'
 
-        if self.buffer_type != None:
+        if self.buffer_name != None:
             self.buffer.disable_buffer()
-            
+
         led_cont = CUR_LANE.led_index.split(':')
         if self.debug: self.respond_info("TOOL_UNLOAD: Unload LED")
         self.afc_led(self.led_unloading, CUR_LANE.led_index)
