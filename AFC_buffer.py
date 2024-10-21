@@ -142,6 +142,8 @@ class AFCtrigger:
     
     def set_multiplier(self, multiplier):
         if not self.enable: return
+        if self.AFC.current is None : return
+
         self.update_rotation_distance( multiplier )
         if self.debug == True: 
             stepper = self.printer.lookup_object('AFC_stepper ' + self.printer.lookup_object('AFC').current).extruder_stepper.stepper
@@ -189,6 +191,7 @@ class AFCtrigger:
                     if self.debug == True: self.gcode.respond_info("Buffer Triggered State: Advanced")
         
         self.last_state = ADVANCE_STATE_NAME
+        if self.debug == True: self.gcode.respond_info("Buffer Triggered State: Advanced")
 
     def trailing_callback(self, eventtime, state):
         if self.printer.state_message == 'Printer is ready' and self.enable and self.last_state != TRAILING_STATE_NAME:
@@ -198,6 +201,7 @@ class AFCtrigger:
                     if self.debug == True: self.gcode.respond_info("Buffer Triggered State: Trailing")
         
         self.last_state = TRAILING_STATE_NAME
+        if self.debug == True: self.gcode.respond_info("Buffer Triggered State: Trailing")  
 
 def load_config_prefix(config):
     return AFCtrigger(config)
