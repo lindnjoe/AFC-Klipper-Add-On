@@ -546,10 +546,6 @@ class afc:
                 self.toolhead.wait_moves()
                 self.printer.lookup_object('AFC_stepper ' + CUR_LANE.name).status = 'tool'
                 self.lanes[CUR_LANE.unit][CUR_LANE.name]['tool_loaded'] = True
-                self.lanes[CUR_LANE.unit][CUR_LANE.name]['hub_loaded'] = CUR_LANE.hub_load
-                
-
-                self.save_vars()
 
                 self.current = CUR_LANE.name
                 if self.buffer_name != None:
@@ -598,15 +594,11 @@ class afc:
         self.toolhead.wait_moves()
         extruder = self.toolhead.get_extruder() #Get extruder
         self.heater = extruder.get_heater() #Get extruder heater
-        lane = gcmd.get('LANE', self.current)
-        CUR_LANE = self.printer.lookup_object('AFC_stepper '+ lane)
         CUR_LANE.status = 'unloading'
 
         if self.buffer_name != None:
             self.buffer.disable_buffer()
 
-        led_cont = CUR_LANE.led_index.split(':')
-        if self.debug: self.respond_info("TOOL_UNLOAD: Unload LED")
         self.afc_led(self.led_unloading, CUR_LANE.led_index)
         CUR_LANE.extruder_stepper.sync_to_extruder(CUR_LANE.extruder_name)
         extruder = self.printer.lookup_object('toolhead').get_extruder()
