@@ -63,15 +63,15 @@ class AFCtrigger:
     cmd_LANE_ROT_FACTOR_help = "change rotation distance by factor specified"
     def cmd_SET_ROTATION_FACTOR(self, gcmd):
         if self.enable and self.turtleneck:
-            if self.printer.lookup_object('AFC').current != None:
+            if self.AFC.current != None:
                 change_factor = gcmd.get_float('FACTOR', 1.0)
                 if change_factor == 1.0:
-                    stepper = self.printer.lookup_object('AFC_stepper ' + self.printer.lookup_object('AFC').current).extruder_stepper.stepper
+                    stepper = self.printer.lookup_object('AFC_stepper ' + self.AFC.current).extruder_stepper.stepper
                     stepper.set_rotation_distance(self.base_rotation_dist)
                     self.gcode.respond_info("Rotation distance reset to base value: {}".format(self.base_rotation_dist))
                 elif change_factor != 0:
                     self.set_multiplier(change_factor)
-                    stepper = self.printer.lookup_object('AFC_stepper ' + self.printer.lookup_object('AFC').current).extruder_stepper.stepper
+                    stepper = self.printer.lookup_object('AFC_stepper ' + self.AFC.current).extruder_stepper.stepper
                     new_rotation_dist = stepper.get_rotation_distance()[0]
                     self.gcode.respond_info("New rotation distance after applying factor: {}".format(new_rotation_dist))
                 else:
@@ -85,7 +85,7 @@ class AFCtrigger:
 
     def cmd_QUERY_BUFFER(self, gcmd):
         if self.turtleneck:
-            tool_loaded=self.printer.lookup_object('AFC').current
+            tool_loaded=self.AFC.current
             LANE = self.printer.lookup_object('AFC_stepper ' + tool_loaded)
             stepper = LANE.extruder_stepper.stepper
             rotation_dist = stepper.get_rotation_distance()[0]
@@ -102,8 +102,8 @@ class AFCtrigger:
         self.min_event_systime = self.reactor.monotonic() + 2.
 
     def _set_extruder_stepper(self):
-        if self.printer.state_message == 'Printer is ready' and self.printer.lookup_object('AFC').current != None:
-            tool_loaded=self.printer.lookup_object('AFC').current
+        if self.printer.state_message == 'Printer is ready' and self.AFC.current != None:
+            tool_loaded=self.AFC.current
             LANE = self.printer.lookup_object('AFC_stepper ' + tool_loaded)
             stepper = LANE.extruder_stepper.stepper
             base_rotation_dist = stepper.get_rotation_distance()[0]
@@ -142,7 +142,7 @@ class AFCtrigger:
 
         self.update_rotation_distance( multiplier )
         if self.debug == True: 
-            stepper = self.printer.lookup_object('AFC_stepper ' + self.printer.lookup_object('AFC').current).extruder_stepper.stepper
+            stepper = self.printer.lookup_object('AFC_stepper ' + self.AFC.current).extruder_stepper.stepper
             new_rotation_dist = stepper.get_rotation_distance()[0]
             self.gcode.respond_info("New rotation distance after applying factor: {}".format(new_rotation_dist))
 
@@ -151,7 +151,7 @@ class AFCtrigger:
     #         multiplier = self.multiplier_low
     #         self.set_multiplier(multiplier)
     #         if self.debug == True: 
-    #             stepper = self.printer.lookup_object('AFC_stepper ' + self.printer.lookup_object('AFC').current).extruder_stepper.stepper
+    #             stepper = self.printer.lookup_object('AFC_stepper ' + self.AFC.current).extruder_stepper.stepper
     #             new_rotation_dist = stepper.get_rotation_distance()[0]
     #             self.gcode.respond_info("New rotation distance after applying factor: {}".format(new_rotation_dist))
 
@@ -160,7 +160,7 @@ class AFCtrigger:
     #         multiplier = self.multiplier_high
     #         self.set_multiplier(multiplier)
     #         if self.debug == True: 
-    #             stepper = self.printer.lookup_object('AFC_stepper ' + self.printer.lookup_object('AFC').current).extruder_stepper.stepper
+    #             stepper = self.printer.lookup_object('AFC_stepper ' + self.AFC.current).extruder_stepper.stepper
     #             new_rotation_dist = stepper.get_rotation_distance()[0]
     #             self.gcode.respond_info("New rotation distance after applying factor: {}".format(new_rotation_dist))
 
@@ -171,9 +171,9 @@ class AFCtrigger:
     def sensor_callback(self, eventtime, state):
         self.last_state = state
         if self.printer.state_message == 'Printer is ready':
-            if self.printer.lookup_object('filament_switch_sensor tool_start').runout_helper.filament_present == True:
-                if self.printer.lookup_object('AFC').current != None:
-                    tool_loaded=self.printer.lookup_object('AFC').current
+            if self.AFC.tool_start.filament_present == True:
+                if self.AFC.current != None:
+                    tool_loaded=self.AFC.current
                     LANE = self.printer.lookup_object('AFC_stepper ' + tool_loaded)
                     if LANE.status != 'unloading':
                         if self.debug == True: self.gcode.respond_info("Buffer Triggered, State: {}".format(state))
@@ -181,8 +181,8 @@ class AFCtrigger:
 
     def advance_callback(self, eventtime, state):
         if self.printer.state_message == 'Printer is ready' and self.enable and self.last_state != ADVANCE_STATE_NAME:
-            if self.printer.lookup_object('filament_switch_sensor tool').runout_helper.filament_present == True:
-                if self.printer.lookup_object('AFC').current != None:
+            if self.AFC.tool_start.filament_present == True:
+                if self.AFC.current != None:
                     self.set_multiplier( self.multiplier_high )
                     if self.debug == True: self.gcode.respond_info("Buffer Triggered State: Advanced")
                     
@@ -191,8 +191,8 @@ class AFCtrigger:
 
     def trailing_callback(self, eventtime, state):
         if self.printer.state_message == 'Printer is ready' and self.enable and self.last_state != TRAILING_STATE_NAME:
-            if self.printer.lookup_object('filament_switch_sensor tool').runout_helper.filament_present == True:
-                if self.printer.lookup_object('AFC').current != None:
+            if self.AFC.tool_start.filament_present == True:
+                if self.AFC.current != None:
                     self.set_multiplier( self.multiplier_low )
                     if self.debug == True: self.gcode.respond_info("Buffer Triggered State: Trailing")
         
