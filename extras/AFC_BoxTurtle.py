@@ -27,6 +27,7 @@ class afcBoxTurtle:
         self.logo_error+='! \_________/ |___|</span>\n'
 
         self.AFC.gcode.register_mux_command('CALIBRATE_AFC', None, None, self.cmd_CALIBRATE_AFC, desc=self.cmd_CALIBRATE_AFC_help)
+        self.AFC.gcode.register_command('SAVE_CAL_VALUES', self.cmd_SAVE_CAL_VALUES)
 
     def system_Test(self, UNIT, LANE, delay, assignTcmd):
         msg = ''
@@ -204,14 +205,19 @@ class afcBoxTurtle:
                 CUR_LANE.move(CUR_HUB.move_dis * -1, self.AFC.short_moves_speed, self.AFC.short_moves_accel, True)
             CUR_LANE.loaded_to_hub = True
             CUR_LANE.do_enable(False)
-            cal_msg = "\n{} dist_hub: {}".format(CUR_LANE.name.upper(), (hub_pos - CUR_HUB.hub_clear_move_dis))
+            cal_dist = (hub_pos - CUR_HUB.hub_clear_move_dis)
+            cal_msg = "\n{} dist_hub: {}".format(CUR_LANE.name.upper(), cal_dist)
+
+            # Saving calibration
+            self.cal_value.update({"{}".format(CUR_LANE.name): {"value_name": "dist_hub", "dist_hub": cal_dist, "obj": CUR_LANE}})
             return True, cal_msg
 
         # Determine if a specific lane is provided
         if lane is not None:
             self.AFC.gcode.respond_info('Starting AFC distance Calibrations')
             cal_msg += 'AFC Calibration distances +/-{}mm'.format(tol)
-            cal_msg += '\n<span class=info--text>Update values in AFC_Hardware.cfg</span>'
+            cal_msg += '\n<span class=info--text>To save and start using these values use</span> SAVE_CAL_VALUES <span class=info--text>command</span>'
+            cal_msg += '\n<span class=info--text>Values can also be manually updated in your AFC configuration files</span>'
             if lane != 'all':
                 # Calibrate the specific lane
                 checked, msg = calibrate_lane(lane)
@@ -232,7 +238,8 @@ class afcBoxTurtle:
             if lane is None:
                 self.AFC.gcode.respond_info('Starting AFC distance Calibrations')
                 cal_msg += 'AFC Calibration distances +/-{}mm'.format(tol)
-                cal_msg += '\n<span class=info--text>Update values in AFC_Hardware.cfg</span>'
+                cal_msg += '\n<span class=info--text>To save and start using these values use</span> SAVE_CAL_VALUES <span class=info--text>command</span>'
+                cal_msg += '\n<span class=info--text>Values can also be manually updated in your AFC configuration files</span>'
 
             lane_to_calibrate = find_lane_to_calibrate(afc_bl)
 
@@ -261,16 +268,51 @@ class afcBoxTurtle:
                 calibrate_hub(CUR_LANE, CUR_HUB)
                 if CUR_HUB.state:
                     CUR_LANE.move(CUR_HUB.move_dis * -1, self.AFC.short_moves_speed, self.AFC.short_moves_accel, True)
+                bowden_dist = 0
                 if CUR_EXTRUDER.tool_start == 'buffer':
-                    cal_msg += '\n afc_bowden_length: {}'.format(bow_pos - (short_dis * 2))
+                    bowden_dist = bow_pos - (short_dis * 2)
+                    cal_msg += '\n afc_bowden_length: {}'.format(bowden_dist)
                 else:
-                    cal_msg += '\n afc_bowden_length: {}'.format(bow_pos - short_dis)
+                    bowden_dist = bow_pos - short_dis
+                    cal_msg += '\n afc_bowden_length: {}'.format(bowden_dist)
+
+                self.cal_value.update({"{}".format(CUR_HUB.name): {"value_name": "bowden_length", "bowden_length": bowden_dist, "obj": CUR_HUB}})
                 CUR_LANE.do_enable(False)
             else:
                 self.AFC.gcode.respond_info('CALIBRATE_AFC is not currently supported without tool start sensor')
 
         self.AFC.save_vars()
         self.AFC.gcode.respond_info(cal_msg)
+
+    def cmd_SAVE_CAL_VALUES(self, gcmd):
+        """
+        This function handles saving calibration data to saved variables file. Please make sure there is a [saved_variables] section configured
+        in your printer config to utilize saving calibration. The saved calibration results will be loaded and used when klipper first loads
+
+        This function also updates current values so that a restart is not necessary to start using the current calibration data
+        """
+        if len(self.cal_value) == 0:
+            self.AFC.ERROR.AFC_error("No calibration values to save", False)
+            return
+
+        saved_variables = self.printer.lookup_object("save_variables", None)
+        if not saved_variables:
+            self.AFC.ERROR.AFC_error("Cannot save variables, please make sure you have a [save_variables] section in your printer config", False)
+            return
+
+        for key, value in self.cal_value.items():
+
+            value_name = value["value_name"]
+            self.AFC.gcode.respond_info("Key: {}".format(key))
+            self.AFC.gcode.run_script_from_command('SAVE_VARIABLE VARIABLE=afc_cal_{}_{} VALUE={}'.format(key.lower(), value_name.lower(), value[value_name]))
+            if "dist_hub" in value:
+                value["obj"].dist_hub = value[value_name]
+            else:
+                value["obj"].afc_bowden_length = value[value_name]
+
+        self.AFC.gcode.respond_info("<span class=info--text>Values saved into {} file and updated current values for each lane/bowden calibration was ran for</span>".format(saved_variables.filename))
+
+
 
 def load_config(config):
     return afcBoxTurtle(config)

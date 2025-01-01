@@ -51,6 +51,7 @@ class AFCExtruderStepper:
         self.gcode = self.printer.lookup_object('gcode')
         self.reactor = self.printer.get_reactor()
         self.extruder_stepper = extruder.ExtruderStepper(config)
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
         #stored status variables
         self.name = config.get_name().split()[-1]
@@ -135,6 +136,16 @@ class AFCExtruderStepper:
 
         # Get and save base rotation dist
         self.base_rotation_dist = self.extruder_stepper.stepper.get_rotation_distance()[0]
+
+    def handle_connect(self):
+        try:
+            saved_variables = self.printer.lookup_object("save_variables", None)
+            variable_name = "afc_cal_{}_{}".format(self.name, "dist_hub")
+            if saved_variables and variable_name in saved_variables.allVariables:
+                self.dist_hub = saved_variables.allVariables[variable_name]
+                self.AFC.gcode.respond_info("Using dist_hub saved value({}) for AFC_stepper {}".format(self.dist_hub, self.name))
+        except:
+            self.AFC.ERROR.AFC_error("Problem looking up extruder saved variables", False)
 
     def _get_tmc_values(self, config):
         """

@@ -47,6 +47,15 @@ class afc_hub:
         self.gcode = self.AFC.gcode
         self.reactor = self.AFC.reactor
 
+        try:
+            saved_variables = self.printer.lookup_object("save_variables", None)
+            variable_name = "afc_cal_{}_{}".format(self.name, "bowden_length").lower()
+            if saved_variables and variable_name in saved_variables.allVariables:
+                self.afc_bowden_length = saved_variables.allVariables[variable_name]
+                self.AFC.gcode.respond_info("Using afc_bowden_length saved value({}) for AFC_hub {}".format(self.afc_bowden_length, self.name))
+        except:
+            self.AFC.ERROR.AFC_error("Problem looking up extruder saved variables", False)
+
 
     def switch_pin_callback(self, eventtime, state):
         self.state = state
