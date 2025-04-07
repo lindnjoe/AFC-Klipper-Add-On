@@ -287,7 +287,10 @@ class afcFunction:
         msg += " last_position: {}".format(self.AFC.gcode_move.last_position)
         msg += " homing_position: {}".format(self.AFC.gcode_move.homing_position)
         msg += " speed: {}".format(self.AFC.gcode_move.speed)
-        msg += " absolute_coord: {}\n".format(self.AFC.gcode_move.absolute_coord)
+        msg += " speed_factor: {}".format(self.AFC.gcode_move.speed_factor)
+        msg += " extrude_factor: {}".format(self.AFC.gcode_move.extrude_factor)
+        msg += " absolute_coord: {}".format(self.AFC.gcode_move.absolute_coord)
+        msg += " absolute_extrude: {}\n".format(self.AFC.gcode_move.absolute_extrude)
         self.logger.debug(msg, only_debug=True)
 
     def HexConvert(self,tmp):
