@@ -767,11 +767,18 @@ class AFCLane:
                         # different extruder/hub
                         self._prep_capture_td1()
 
-                elif self.prep_state == True and self.load_state == True and not self.afc.function.is_printing():
-                    message = 'Cannot load {} load sensor is triggered.'.format(self.name)
-                    message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
-                    message += '\n    Once cleared try loading again'
-                    self.afc.error.AFC_error(message, pause=False)
+                elif self.prep_state == True and self.load_state == True:
+                    if self.shared_prep_load_sensor:
+                        if self.status != AFCLaneState.LOADED:
+                            self.status = AFCLaneState.LOADED
+                            self.unit_obj.lane_loaded(self)
+                            self.afc.spool._set_values(self)
+                            self._prep_capture_td1()
+                    elif not self.afc.function.is_printing():
+                        message = 'Cannot load {} load sensor is triggered.'.format(self.name)
+                        message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
+                        message += '\n    Once cleared try loading again'
+                        self.afc.error.AFC_error(message, pause=False)
         self.prep_active = False
         self.afc.save_vars()
 
