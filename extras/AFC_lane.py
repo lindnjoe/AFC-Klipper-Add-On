@@ -677,17 +677,30 @@ class AFCLane:
 
     def _clear_spool_assignment(self):
         """Reset stored spool metadata when filament leaves the lane."""
+        had_values = bool(
+            self.spool_id
+            or self.tool_loaded
+            or self.loaded_to_hub
+            or self.td1_data
+            or self.status not in (AFCLaneState.NONE,)
+        )
+
         self.tool_loaded = False
         self.status = AFCLaneState.NONE
         self.loaded_to_hub = False
         self.td1_data = {}
+
+        # Reset any cached spool metadata so Moonraker shows the lane as empty.
         self.afc.spool.clear_values(self)
+        self.afc.spool.set_active_spool(None)
         self.unit_obj.lane_unloaded(self)
+
+        return had_values
 
     def _shared_prep_load_runout(self, eventtime, state):
         """Runout handler when prep and load sensors are the same."""
         self.handle_prep_runout(eventtime, state)
-        if not state and self.spool_id:
+        if not state and (self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data):
             self._clear_spool_assignment()
         self.handle_load_runout(eventtime, state)
 
@@ -756,13 +769,7 @@ class AFCLane:
                     else:
                         self._perform_pause_runout()
                 elif self.status != "calibrating":
-                    self.tool_loaded = False
-                    self.afc.function.afc_led(self.led_not_ready, self.led_index)
-                    self.status = AFCLaneState.NONE
-                    self.loaded_to_hub = False
-                    self.td1_data = {}
-                    self.afc.spool.clear_values(self)
-                    self.afc.function.afc_led(self.afc.led_not_ready, self.led_index)
+                    self._clear_spool_assignment()
 
         self.afc.save_vars()
 
@@ -881,21 +888,21 @@ class AFCLane:
                     self.logger.warning("Prep runout has been detected, but pause and runout detection has been disabled")
                 # Checking to make sure runout_lane is set
                 elif self.runout_lane is not None:
-                    self.afc.spool.clear_values(self)
-                    cleared_spool_assignment = True
+                    cleared = self._clear_spool_assignment()
+                    cleared_spool_assignment = cleared_spool_assignment or cleared
                     self._perform_infinite_runout()
                 else:
-                    self.afc.spool.clear_values(self)
-                    cleared_spool_assignment = True
+                    cleared = self._clear_spool_assignment()
+                    cleared_spool_assignment = cleared_spool_assignment or cleared
                     self._perform_pause_runout()
             elif not prep_state:
                 # Filament is unloaded
-                self._clear_spool_assignment()
-                cleared_spool_assignment = True
+                cleared = self._clear_spool_assignment()
+                cleared_spool_assignment = cleared_spool_assignment or cleared
 
         if not prep_state and not cleared_spool_assignment and self.spool_id:
-            self._clear_spool_assignment()
-            cleared_spool_assignment = True
+            cleared = self._clear_spool_assignment()
+            cleared_spool_assignment = cleared_spool_assignment or cleared
 
         self.afc.save_vars()
 
