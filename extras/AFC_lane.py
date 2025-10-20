@@ -856,6 +856,7 @@ class AFCLane:
 
         :param eventtime: Event time from the button press
         """
+        cleared_spool_assignment = False
         # Call filament sensor callback so that state is registered
         try:
             self.prep_debounce_button._old_note_filament_present(is_filament_present=prep_state)
@@ -869,8 +870,12 @@ class AFCLane:
                     self.logger.warning("Prep runout has been detected, but pause and runout detection has been disabled")
                 # Checking to make sure runout_lane is set
                 elif self.runout_lane is not None:
+                    self.afc.spool.clear_values(self)
+                    cleared_spool_assignment = True
                     self._perform_infinite_runout()
                 else:
+                    self.afc.spool.clear_values(self)
+                    cleared_spool_assignment = True
                     self._perform_pause_runout()
             elif not prep_state:
                 # Filament is unloaded
@@ -880,6 +885,12 @@ class AFCLane:
                 self.td1_data = {}
                 self.afc.spool.clear_values(self)
                 self.unit_obj.lane_unloaded(self)
+                cleared_spool_assignment = True
+
+        if not prep_state and not cleared_spool_assignment and self.spool_id:
+            self.afc.spool.clear_values(self)
+            self.unit_obj.lane_unloaded(self)
+            cleared_spool_assignment = True
 
         self.afc.save_vars()
 
