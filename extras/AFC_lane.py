@@ -675,9 +675,20 @@ class AFCLane:
         self.load_callback(eventtime, state)
         self.prep_callback(eventtime, state)
 
+    def _clear_spool_assignment(self):
+        """Reset stored spool metadata when filament leaves the lane."""
+        self.tool_loaded = False
+        self.status = AFCLaneState.NONE
+        self.loaded_to_hub = False
+        self.td1_data = {}
+        self.afc.spool.clear_values(self)
+        self.unit_obj.lane_unloaded(self)
+
     def _shared_prep_load_runout(self, eventtime, state):
         """Runout handler when prep and load sensors are the same."""
         self.handle_prep_runout(eventtime, state)
+        if not state and self.spool_id:
+            self._clear_spool_assignment()
         self.handle_load_runout(eventtime, state)
 
     def _enable_shared_prep_load_sensor(self):
@@ -879,17 +890,11 @@ class AFCLane:
                     self._perform_pause_runout()
             elif not prep_state:
                 # Filament is unloaded
-                self.tool_loaded = False
-                self.status = AFCLaneState.NONE
-                self.loaded_to_hub = False
-                self.td1_data = {}
-                self.afc.spool.clear_values(self)
-                self.unit_obj.lane_unloaded(self)
+                self._clear_spool_assignment()
                 cleared_spool_assignment = True
 
         if not prep_state and not cleared_spool_assignment and self.spool_id:
-            self.afc.spool.clear_values(self)
-            self.unit_obj.lane_unloaded(self)
+            self._clear_spool_assignment()
             cleared_spool_assignment = True
 
         self.afc.save_vars()
