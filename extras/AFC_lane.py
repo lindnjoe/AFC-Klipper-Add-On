@@ -216,6 +216,11 @@ class AFCLane:
         self.espooler = AFC_assist.Espooler(self.name, config)
         self.lane_load_count = None
 
+        self._shared_clear_deadline = self.reactor.NEVER
+        self._shared_clear_timer = self.reactor.register_timer(
+            self._shared_sensor_clear_cb
+        )
+
         self.filament_diameter  = config.getfloat("filament_diameter", 1.75)    # Diameter of filament being used
         self.filament_density   = config.getfloat("filament_density", 1.24)     # Density of filament being used
         self.inner_diameter     = config.getfloat("spool_inner_diameter", 100)  # Inner diameter in mm
@@ -677,6 +682,7 @@ class AFCLane:
 
     def _clear_spool_assignment(self):
         """Reset stored spool metadata when filament leaves the lane."""
+        self._cancel_pending_shared_clear()
         had_values = bool(
             self.spool_id
             or self.tool_loaded
@@ -699,10 +705,35 @@ class AFCLane:
 
     def _shared_prep_load_runout(self, eventtime, state):
         """Runout handler when prep and load sensors are the same."""
+        if state:
+            self._cancel_pending_shared_clear()
         self.handle_prep_runout(eventtime, state)
-        if not state and (self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data):
-            self._clear_spool_assignment()
+        if not state and (
+            self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data
+        ):
+            self._schedule_shared_clear(eventtime)
         self.handle_load_runout(eventtime, state)
+
+    def _cancel_pending_shared_clear(self):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        self._shared_clear_deadline = self.reactor.NEVER
+        self.reactor.update_timer(self._shared_clear_timer, self.reactor.NEVER)
+
+    def _schedule_shared_clear(self, eventtime):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        delay = max(self.debounce_delay, 0.2)
+        self._shared_clear_deadline = eventtime + delay
+        self.reactor.update_timer(self._shared_clear_timer, self._shared_clear_deadline)
+
+    def _shared_sensor_clear_cb(self, eventtime):
+        self._shared_clear_deadline = self.reactor.NEVER
+        if self.prep_state or self.load_state:
+            return self.reactor.NEVER
+        if self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data:
+            self._clear_spool_assignment()
+        return self.reactor.NEVER
 
     def _enable_shared_prep_load_sensor(self):
         """Force shared prep/load behavior after initialization."""
