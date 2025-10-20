@@ -116,6 +116,13 @@ class AFCLane:
         # Overrides buffers set at the unit and extruder level
         self.buffer_name        = config.get("buffer", None)                            # Buffer name(AFC_buffer) that belongs to this stepper, overrides buffer that is set in extruder(AFC_extruder) or unit(AFC_BoxTurtle/NightOwl/etc) sections.
         self.unit               = unit.split(':')[0]
+        self._shared_prep_load_override = config.getboolean(
+            "shared_prep_load_sensor", None
+        )
+        if self._shared_prep_load_override is None:
+            unit_prefix = self.unit.strip().upper() if self.unit else ""
+            if unit_prefix.startswith("AMS"):
+                self._shared_prep_load_override = True
         try:
             self.index              = int(unit.split(':')[1])
         except:
@@ -188,10 +195,14 @@ class AFCLane:
 
         self._normalized_prep_pin = self._normalize_pin_name(self.prep)
         self._normalized_load_pin = self._normalize_pin_name(self.load)
-        self.shared_prep_load_sensor = bool(
+        shared_detected = bool(
             self._normalized_prep_pin
             and self._normalized_prep_pin == self._normalized_load_pin
         )
+        if self._shared_prep_load_override is None:
+            self.shared_prep_load_sensor = shared_detected
+        else:
+            self.shared_prep_load_sensor = self._shared_prep_load_override
 
         if self.prep is not None:
             prep_callback = self._shared_prep_load_callback if self.shared_prep_load_sensor else self.prep_callback
@@ -384,6 +395,12 @@ class AFCLane:
         self.extruder_name = self.extruder_obj.name
         if add_to_other_obj:
             self.extruder_obj.lanes[self.name] = self
+
+        if (
+            self._shared_prep_load_override is None
+            and getattr(self.unit_obj, "type", "").upper() == "AMS"
+        ):
+            self._enable_shared_prep_load_sensor()
 
         # Use buffer defined in stepper and override buffers that maybe set at the UNIT or extruder levels
         self.buffer_obj = self.unit_obj.buffer_obj
@@ -662,6 +679,25 @@ class AFCLane:
         """Runout handler when prep and load sensors are the same."""
         self.handle_prep_runout(eventtime, state)
         self.handle_load_runout(eventtime, state)
+
+    def _enable_shared_prep_load_sensor(self):
+        """Force shared prep/load behavior after initialization."""
+        if self.shared_prep_load_sensor:
+            return
+
+        self.shared_prep_load_sensor = True
+        self._shared_prep_load_override = True
+
+        if hasattr(self, "prep_debounce_button"):
+            self.prep_debounce_button.button_action = self._shared_prep_load_runout
+            if getattr(self, "load_debounce_button", None) is None:
+                self.load_debounce_button = self.prep_debounce_button
+
+        if hasattr(self, "fila_prep") and getattr(self, "fila_load", None) is None:
+            self.fila_load = self.fila_prep
+
+        if self.prep_state:
+            self.load_state = self.prep_state
 
 
     def load_callback(self, eventtime, state):
