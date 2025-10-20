@@ -49,6 +49,31 @@ class AFCLaneState:
 
 class AFCLane:
     UPDATE_WEIGHT_DELAY = 10.0
+
+    def _normalize_pin_name(self, pin):
+        if pin is None:
+            return None
+
+        pin_str = str(pin).strip()
+        if not pin_str or pin_str.lower() == "none":
+            return None
+
+        if ":" in pin_str:
+            pin_str = pin_str.split(":", 1)[1]
+
+        pin_str = pin_str.strip()
+        strip_chars = "!^~"
+        while pin_str and pin_str[0] in strip_chars:
+            pin_str = pin_str[1:]
+        while pin_str and pin_str[-1] in strip_chars:
+            pin_str = pin_str[:-1]
+
+        pin_str = pin_str.strip()
+        if not pin_str:
+            return None
+
+        return pin_str.lower()
+
     def __init__(self, config):
         self.printer            = config.get_printer()
         self.afc                = self.printer.lookup_object('AFC')
@@ -91,6 +116,13 @@ class AFCLane:
         # Overrides buffers set at the unit and extruder level
         self.buffer_name        = config.get("buffer", None)                            # Buffer name(AFC_buffer) that belongs to this stepper, overrides buffer that is set in extruder(AFC_extruder) or unit(AFC_BoxTurtle/NightOwl/etc) sections.
         self.unit               = unit.split(':')[0]
+        self._shared_prep_load_override = config.getboolean(
+            "shared_prep_load_sensor", None
+        )
+        if self._shared_prep_load_override is None:
+            unit_prefix = self.unit.strip().upper() if self.unit else ""
+            if unit_prefix.startswith("AMS"):
+                self._shared_prep_load_override = True
         try:
             self.index              = int(unit.split(':')[1])
         except:
@@ -152,15 +184,34 @@ class AFCLane:
         # lane triggers
         buttons = self.printer.load_object(config, "buttons")
         self.prep = config.get('prep', None)                                    # MCU pin for prep trigger
-        self.prep_state = False
-        if self.prep is not None:
-            buttons.register_buttons([self.prep], self.prep_callback)
-
+        if isinstance(self.prep, str) and self.prep.strip().lower() in ("", "none"):
+            self.prep = None
         self.load = config.get('load', None)                                    # MCU pin load trigger
+        if isinstance(self.load, str) and self.load.strip().lower() in ("", "none"):
+            self.load = None
+
+        self.prep_state = False
         self.load_state = False
-        if self.load is not None:
+
+        self._normalized_prep_pin = self._normalize_pin_name(self.prep)
+        self._normalized_load_pin = self._normalize_pin_name(self.load)
+        shared_detected = bool(
+            self._normalized_prep_pin
+            and self._normalized_prep_pin == self._normalized_load_pin
+        )
+        if self._shared_prep_load_override is None:
+            self.shared_prep_load_sensor = shared_detected
+        else:
+            self.shared_prep_load_sensor = self._shared_prep_load_override
+
+        if self.prep is not None:
+            prep_callback = self._shared_prep_load_callback if self.shared_prep_load_sensor else self.prep_callback
+            buttons.register_buttons([self.prep], prep_callback)
+
+        if self.load is not None and not self.shared_prep_load_sensor:
             buttons.register_buttons([self.load], self.load_callback)
-        else: self.load_state = True
+        elif self.load is None:
+            self.load_state = True
 
         self.espooler = AFC_assist.Espooler(self.name, config)
         self.lane_load_count = None
@@ -191,14 +242,20 @@ class AFCLane:
             self.prep_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
 
         if self.load is not None:
-            show_sensor = True
-            if not self.enable_sensors_in_gui or (self.sensor_to_show is not None and 'load' not in self.sensor_to_show):
-                show_sensor = False
-            self.fila_load, self.load_debounce_button = add_filament_switch(f"{self.name}_load", self.load, self.printer,
-                                                                            show_sensor, enable_runout=self.enable_runout,
-                                                                            debounce_delay=self.debounce_delay )
-            self.load_debounce_button.button_action = self.handle_load_runout
-            self.load_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
+            if self.shared_prep_load_sensor:
+                self.fila_load = self.fila_prep
+                self.load_debounce_button = self.prep_debounce_button
+                if hasattr(self, "prep_debounce_button"):
+                    self.prep_debounce_button.button_action = self._shared_prep_load_runout
+            else:
+                show_sensor = True
+                if not self.enable_sensors_in_gui or (self.sensor_to_show is not None and 'load' not in self.sensor_to_show):
+                    show_sensor = False
+                self.fila_load, self.load_debounce_button = add_filament_switch(f"{self.name}_load", self.load, self.printer,
+                                                                                show_sensor, enable_runout=self.enable_runout,
+                                                                                debounce_delay=self.debounce_delay )
+                self.load_debounce_button.button_action = self.handle_load_runout
+                self.load_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
 
         self.connect_done = False
         self.prep_active = False
@@ -338,6 +395,12 @@ class AFCLane:
         self.extruder_name = self.extruder_obj.name
         if add_to_other_obj:
             self.extruder_obj.lanes[self.name] = self
+
+        if (
+            self._shared_prep_load_override is None
+            and getattr(self.unit_obj, "type", "").upper() == "AMS"
+        ):
+            self._enable_shared_prep_load_sensor()
 
         # Use buffer defined in stepper and override buffers that maybe set at the UNIT or extruder levels
         self.buffer_obj = self.unit_obj.buffer_obj
@@ -607,6 +670,46 @@ class AFCLane:
             else:
                 self.logger.info(f"Cannot get TD-1 data for {self.name}, either toolhead is loaded or hub shows filament in path")
 
+    def _shared_prep_load_callback(self, eventtime, state):
+        """Callback used when prep and load sensors share the same physical input."""
+        self.load_callback(eventtime, state)
+        self.prep_callback(eventtime, state)
+
+    def _clear_spool_assignment(self):
+        """Reset stored spool metadata when filament leaves the lane."""
+        self.tool_loaded = False
+        self.status = AFCLaneState.NONE
+        self.loaded_to_hub = False
+        self.td1_data = {}
+        self.afc.spool.clear_values(self)
+        self.unit_obj.lane_unloaded(self)
+
+    def _shared_prep_load_runout(self, eventtime, state):
+        """Runout handler when prep and load sensors are the same."""
+        self.handle_prep_runout(eventtime, state)
+        if not state and self.spool_id:
+            self._clear_spool_assignment()
+        self.handle_load_runout(eventtime, state)
+
+    def _enable_shared_prep_load_sensor(self):
+        """Force shared prep/load behavior after initialization."""
+        if self.shared_prep_load_sensor:
+            return
+
+        self.shared_prep_load_sensor = True
+        self._shared_prep_load_override = True
+
+        if hasattr(self, "prep_debounce_button"):
+            self.prep_debounce_button.button_action = self._shared_prep_load_runout
+            if getattr(self, "load_debounce_button", None) is None:
+                self.load_debounce_button = self.prep_debounce_button
+
+        if hasattr(self, "fila_prep") and getattr(self, "fila_load", None) is None:
+            self.fila_load = self.fila_prep
+
+        if self.prep_state:
+            self.load_state = self.prep_state
+
 
     def load_callback(self, eventtime, state):
         self.load_state = state
@@ -625,10 +728,11 @@ class AFCLane:
         :param eventtime: Event time from the button press
         """
         # Call filament sensor callback so that state is registered
-        try:
-            self.load_debounce_button._old_note_filament_present(is_filament_present=load_state)
-        except:
-            self.load_debounce_button._old_note_filament_present(eventtime, load_state)
+        if not self.shared_prep_load_sensor:
+            try:
+                self.load_debounce_button._old_note_filament_present(is_filament_present=load_state)
+            except:
+                self.load_debounce_button._old_note_filament_present(eventtime, load_state)
 
         if self.printer.state_message == 'Printer is ready' and self.unit_obj.type == "HTLF":
             if load_state and not self.tool_loaded:
@@ -664,6 +768,8 @@ class AFCLane:
 
     def prep_callback(self, eventtime, state):
         self.prep_state = state
+        if self.shared_prep_load_sensor:
+            self.load_state = state
 
         delta_time = eventtime - self.last_prep_time
         self.last_prep_time = eventtime
@@ -735,11 +841,18 @@ class AFCLane:
                         # different extruder/hub
                         self._prep_capture_td1()
 
-                elif self.prep_state == True and self.load_state == True and not self.afc.function.is_printing():
-                    message = 'Cannot load {} load sensor is triggered.'.format(self.name)
-                    message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
-                    message += '\n    Once cleared try loading again'
-                    self.afc.error.AFC_error(message, pause=False)
+                elif self.prep_state == True and self.load_state == True:
+                    if self.shared_prep_load_sensor:
+                        if self.status != AFCLaneState.LOADED:
+                            self.status = AFCLaneState.LOADED
+                            self.unit_obj.lane_loaded(self)
+                            self.afc.spool._set_values(self)
+                            self._prep_capture_td1()
+                    elif not self.afc.function.is_printing():
+                        message = 'Cannot load {} load sensor is triggered.'.format(self.name)
+                        message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
+                        message += '\n    Once cleared try loading again'
+                        self.afc.error.AFC_error(message, pause=False)
         self.prep_active = False
         self.afc.save_vars()
 
@@ -754,6 +867,7 @@ class AFCLane:
 
         :param eventtime: Event time from the button press
         """
+        cleared_spool_assignment = False
         # Call filament sensor callback so that state is registered
         try:
             self.prep_debounce_button._old_note_filament_present(is_filament_present=prep_state)
@@ -767,17 +881,21 @@ class AFCLane:
                     self.logger.warning("Prep runout has been detected, but pause and runout detection has been disabled")
                 # Checking to make sure runout_lane is set
                 elif self.runout_lane is not None:
+                    self.afc.spool.clear_values(self)
+                    cleared_spool_assignment = True
                     self._perform_infinite_runout()
                 else:
+                    self.afc.spool.clear_values(self)
+                    cleared_spool_assignment = True
                     self._perform_pause_runout()
             elif not prep_state:
                 # Filament is unloaded
-                self.tool_loaded = False
-                self.status = AFCLaneState.NONE
-                self.loaded_to_hub = False
-                self.td1_data = {}
-                self.afc.spool.clear_values(self)
-                self.unit_obj.lane_unloaded(self)
+                self._clear_spool_assignment()
+                cleared_spool_assignment = True
+
+        if not prep_state and not cleared_spool_assignment and self.spool_id:
+            self._clear_spool_assignment()
+            cleared_spool_assignment = True
 
         self.afc.save_vars()
 
