@@ -357,6 +357,9 @@ class afc:
         self.gcode.register_command('_AFC_TEST_MESSAGES',   self.cmd__AFC_TEST_MESSAGES,    desc=self.cmd__AFC_TEST_MESSAGES_help)
         self.gcode.register_command('AFC_M104',             self._cmd_AFC_M104,             desc=self._cmd_AFC_M104_help)
         self.gcode.register_command('AFC_M109',             self._cmd_AFC_M109,             desc=self._cmd_AFC_M109_help)
+        self.gcode.register_command('SET_TEMPERATURE_WITH_DEADBAND',
+                                    self._cmd_SET_TEMPERATURE_WITH_DEADBAND,
+                                    desc=self._cmd_SET_TEMPERATURE_WITH_DEADBAND_help)
 
         self._rename_macros()
 
@@ -1973,6 +1976,11 @@ class afc:
         should_wait = wait and abs(current_temp - temp) > self.temp_wait_tolerance
         pheaters.set_temperature(heater, temp, should_wait)
         self.logger.debug("Done setting temp")
+
+    _cmd_SET_TEMPERATURE_WITH_DEADBAND_help = "Set temperature using optional deadband support"
+    def _cmd_SET_TEMPERATURE_WITH_DEADBAND(self, gcmd):
+        """Wrapper so external macros can invoke AFC's M109 deadband logic."""
+        self._cmd_AFC_M109(gcmd, wait=True)
 
     def _heat_next_extruder(self, wait=True):
         """
