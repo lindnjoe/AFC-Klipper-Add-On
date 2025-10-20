@@ -49,6 +49,31 @@ class AFCLaneState:
 
 class AFCLane:
     UPDATE_WEIGHT_DELAY = 10.0
+
+    def _normalize_pin_name(self, pin):
+        if pin is None:
+            return None
+
+        pin_str = str(pin).strip()
+        if not pin_str or pin_str.lower() == "none":
+            return None
+
+        if ":" in pin_str:
+            pin_str = pin_str.split(":", 1)[1]
+
+        pin_str = pin_str.strip()
+        strip_chars = "!^~"
+        while pin_str and pin_str[0] in strip_chars:
+            pin_str = pin_str[1:]
+        while pin_str and pin_str[-1] in strip_chars:
+            pin_str = pin_str[:-1]
+
+        pin_str = pin_str.strip()
+        if not pin_str:
+            return None
+
+        return pin_str.lower()
+
     def __init__(self, config):
         self.printer            = config.get_printer()
         self.afc                = self.printer.lookup_object('AFC')
@@ -161,10 +186,12 @@ class AFCLane:
         self.prep_state = False
         self.load_state = False
 
-        self.shared_prep_load_sensor = False
-        if self.prep is not None and self.load is not None:
-            if str(self.prep).strip().lower() == str(self.load).strip().lower():
-                self.shared_prep_load_sensor = True
+        self._normalized_prep_pin = self._normalize_pin_name(self.prep)
+        self._normalized_load_pin = self._normalize_pin_name(self.load)
+        self.shared_prep_load_sensor = bool(
+            self._normalized_prep_pin
+            and self._normalized_prep_pin == self._normalized_load_pin
+        )
 
         if self.prep is not None:
             prep_callback = self._shared_prep_load_callback if self.shared_prep_load_sensor else self.prep_callback
