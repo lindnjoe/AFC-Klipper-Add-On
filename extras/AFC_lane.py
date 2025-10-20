@@ -850,6 +850,8 @@ class AFCLane:
 
                 elif self.prep_state == True and self.load_state == True:
                     if self.shared_prep_load_sensor:
+                        if self.spool_id and not self.tool_loaded:
+                            self._clear_spool_assignment()
                         if self.status != AFCLaneState.LOADED:
                             self.status = AFCLaneState.LOADED
                             self.unit_obj.lane_loaded(self)
