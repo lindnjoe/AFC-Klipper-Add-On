@@ -49,6 +49,31 @@ class AFCLaneState:
 
 class AFCLane:
     UPDATE_WEIGHT_DELAY = 10.0
+
+    def _normalize_pin_name(self, pin):
+        if pin is None:
+            return None
+
+        pin_str = str(pin).strip()
+        if not pin_str or pin_str.lower() == "none":
+            return None
+
+        if ":" in pin_str:
+            pin_str = pin_str.split(":", 1)[1]
+
+        pin_str = pin_str.strip()
+        strip_chars = "!^~"
+        while pin_str and pin_str[0] in strip_chars:
+            pin_str = pin_str[1:]
+        while pin_str and pin_str[-1] in strip_chars:
+            pin_str = pin_str[:-1]
+
+        pin_str = pin_str.strip()
+        if not pin_str:
+            return None
+
+        return pin_str.lower()
+
     def __init__(self, config):
         self.printer            = config.get_printer()
         self.afc                = self.printer.lookup_object('AFC')
@@ -157,10 +182,21 @@ class AFCLane:
             buttons.register_buttons([self.prep], self.prep_callback)
 
         self.load = config.get('load', None)                                    # MCU pin load trigger
+        normalized_prep = self._normalize_pin_name(self.prep)
+        normalized_load = self._normalize_pin_name(self.load)
+        self.shared_prep_load_sensor = config.getboolean("shared_prep_load_sensor", False)
+        if not self.shared_prep_load_sensor:
+            unit_prefix = self.unit.strip().upper() if self.unit else ""
+            if normalized_prep and normalized_load and normalized_prep == normalized_load:
+                self.shared_prep_load_sensor = True
+            elif unit_prefix.startswith("AMS") and normalized_prep and not normalized_load:
+                self.shared_prep_load_sensor = True
+
         self.load_state = False
-        if self.load is not None:
+        if self.load is not None and not self.shared_prep_load_sensor:
             buttons.register_buttons([self.load], self.load_callback)
-        else: self.load_state = True
+        elif self.load is None and not self.shared_prep_load_sensor:
+            self.load_state = True
 
         self.espooler = AFC_assist.Espooler(self.name, config)
         self.lane_load_count = None
@@ -187,10 +223,13 @@ class AFCLane:
             self.fila_prep, self.prep_debounce_button = add_filament_switch(f"{self.name}_prep", self.prep, self.printer,
                                                                             show_sensor, enable_runout=self.enable_runout,
                                                                             debounce_delay=self.debounce_delay )
+            if self.shared_prep_load_sensor:
+                self.fila_load = self.fila_prep
+                self.load_debounce_button = self.prep_debounce_button
             self.prep_debounce_button.button_action = self.handle_prep_runout
             self.prep_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
 
-        if self.load is not None:
+        if self.load is not None and not self.shared_prep_load_sensor:
             show_sensor = True
             if not self.enable_sensors_in_gui or (self.sensor_to_show is not None and 'load' not in self.sensor_to_show):
                 show_sensor = False
@@ -488,17 +527,9 @@ class AFCLane:
             else:
                 return self.dist_hub_move_speed, self.dist_hub_move_accel
     def is_direct_hub(self):
-        """
-        Helper function to see if hub for lane is 'direct' or 'direct_load' hub.
-
-        :return boolean: True if hub for lane is 'direct' or 'direct_load'
-        """
         return self.hub and 'direct' in self.hub
-
+    
     def select_lane(self):
-        """
-        Helper function to select lane, calls unit lane selection function.
-        """
         self.unit_obj.select_lane( self )
 
     def move(self, distance, speed, accel, assist_active=False):
@@ -664,6 +695,8 @@ class AFCLane:
 
     def prep_callback(self, eventtime, state):
         self.prep_state = state
+        if self.shared_prep_load_sensor:
+            self.load_state = state
 
         delta_time = eventtime - self.last_prep_time
         self.last_prep_time = eventtime
@@ -735,11 +768,18 @@ class AFCLane:
                         # different extruder/hub
                         self._prep_capture_td1()
 
-                elif self.prep_state == True and self.load_state == True and not self.afc.function.is_printing():
-                    message = 'Cannot load {} load sensor is triggered.'.format(self.name)
-                    message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
-                    message += '\n    Once cleared try loading again'
-                    self.afc.error.AFC_error(message, pause=False)
+                elif self.prep_state == True and self.load_state == True:
+                    if self.shared_prep_load_sensor:
+                        if self.status != AFCLaneState.LOADED:
+                            self.status = AFCLaneState.LOADED
+                            self.unit_obj.lane_loaded(self)
+                            self.afc.spool._set_values(self)
+                            self._prep_capture_td1()
+                    elif not self.afc.function.is_printing():
+                        message = 'Cannot load {} load sensor is triggered.'.format(self.name)
+                        message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
+                        message += '\n    Once cleared try loading again'
+                        self.afc.error.AFC_error(message, pause=False)
         self.prep_active = False
         self.afc.save_vars()
 
@@ -754,6 +794,8 @@ class AFCLane:
 
         :param eventtime: Event time from the button press
         """
+        if self.shared_prep_load_sensor:
+            self.load_state = prep_state
         # Call filament sensor callback so that state is registered
         try:
             self.prep_debounce_button._old_note_filament_present(is_filament_present=prep_state)
