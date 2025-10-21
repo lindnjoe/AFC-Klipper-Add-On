@@ -275,6 +275,9 @@ class AFCSpool:
         cur_lane.material = self.afc.default_material_type
         cur_lane.weight = 1000 # Defaulting weight to 1000 upon load
 
+        if hasattr(cur_lane, "_has_spool_assignment"):
+            cur_lane._has_spool_assignment = True
+
         if self.afc.spoolman is not None and self.next_spool_id != '':
             spool_id = self.next_spool_id
             self.next_spool_id = ''
@@ -291,6 +294,9 @@ class AFCSpool:
         cur_lane.extruder_temp = None
         cur_lane.bed_temp = None
         cur_lane.clear_lane_data()
+
+        if hasattr(cur_lane, "_has_spool_assignment"):
+            cur_lane._has_spool_assignment = False
 
     def set_spoolID(self, cur_lane, SpoolID, save_vars=True):
         if self.afc.spoolman is not None:
@@ -314,6 +320,9 @@ class AFCSpool:
                         cur_lane.color = '#{}'.format(self._get_filament_values(result['filament'], 'color_hex'))
 
                     cur_lane.send_lane_data()
+
+                    if hasattr(cur_lane, "_has_spool_assignment"):
+                        cur_lane._has_spool_assignment = True
 
                 except Exception as e:
                     self.afc.error.AFC_error("Error when trying to get Spoolman data for ID:{}, Error: {}".format(SpoolID, e), False)
