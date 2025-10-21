@@ -921,19 +921,33 @@ class AFCLane:
                     self.logger.warning("Prep runout has been detected, but pause and runout detection has been disabled")
                 # Checking to make sure runout_lane is set
                 elif self.runout_lane is not None:
-                    cleared = self._clear_spool_assignment()
+                    if self.shared_prep_load_sensor:
+                        cleared = False
+                    else:
+                        cleared = self._clear_spool_assignment()
                     cleared_spool_assignment = cleared_spool_assignment or cleared
                     self._perform_infinite_runout()
                 else:
-                    cleared = self._clear_spool_assignment()
+                    if self.shared_prep_load_sensor:
+                        cleared = False
+                    else:
+                        cleared = self._clear_spool_assignment()
                     cleared_spool_assignment = cleared_spool_assignment or cleared
                     self._perform_pause_runout()
             elif not prep_state:
                 # Filament is unloaded
-                cleared = self._clear_spool_assignment()
+                if self.shared_prep_load_sensor:
+                    cleared = False
+                else:
+                    cleared = self._clear_spool_assignment()
                 cleared_spool_assignment = cleared_spool_assignment or cleared
 
-        if not prep_state and not cleared_spool_assignment and self.spool_id:
+        if (
+            not prep_state
+            and not cleared_spool_assignment
+            and self.spool_id
+            and not self.shared_prep_load_sensor
+        ):
             cleared = self._clear_spool_assignment()
             cleared_spool_assignment = cleared_spool_assignment or cleared
 
