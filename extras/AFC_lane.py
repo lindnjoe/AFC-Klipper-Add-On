@@ -208,9 +208,21 @@ class AFCLane:
             prep_callback = self._shared_prep_load_callback if self.shared_prep_load_sensor else self.prep_callback
             buttons.register_buttons([self.prep], prep_callback)
 
+        self.load = config.get('load', None)                                    # MCU pin load trigger
+        normalized_prep = self._normalize_pin_name(self.prep)
+        normalized_load = self._normalize_pin_name(self.load)
+        self.shared_prep_load_sensor = config.getboolean("shared_prep_load_sensor", False)
+        if not self.shared_prep_load_sensor:
+            unit_prefix = self.unit.strip().upper() if self.unit else ""
+            if normalized_prep and normalized_load and normalized_prep == normalized_load:
+                self.shared_prep_load_sensor = True
+            elif unit_prefix.startswith("AMS") and normalized_prep and not normalized_load:
+                self.shared_prep_load_sensor = True
+
+        self.load_state = False
         if self.load is not None and not self.shared_prep_load_sensor:
             buttons.register_buttons([self.load], self.load_callback)
-        elif self.load is None:
+        elif self.load is None and not self.shared_prep_load_sensor:
             self.load_state = True
 
         self.espooler = AFC_assist.Espooler(self.name, config)
@@ -243,24 +255,21 @@ class AFCLane:
             self.fila_prep, self.prep_debounce_button = add_filament_switch(f"{self.name}_prep", self.prep, self.printer,
                                                                             show_sensor, enable_runout=self.enable_runout,
                                                                             debounce_delay=self.debounce_delay )
-            self.prep_debounce_button.button_action = self.handle_prep_runout
-            self.prep_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
-
-        if self.load is not None:
             if self.shared_prep_load_sensor:
                 self.fila_load = self.fila_prep
                 self.load_debounce_button = self.prep_debounce_button
-                if hasattr(self, "prep_debounce_button"):
-                    self.prep_debounce_button.button_action = self._shared_prep_load_runout
-            else:
-                show_sensor = True
-                if not self.enable_sensors_in_gui or (self.sensor_to_show is not None and 'load' not in self.sensor_to_show):
-                    show_sensor = False
-                self.fila_load, self.load_debounce_button = add_filament_switch(f"{self.name}_load", self.load, self.printer,
-                                                                                show_sensor, enable_runout=self.enable_runout,
-                                                                                debounce_delay=self.debounce_delay )
-                self.load_debounce_button.button_action = self.handle_load_runout
-                self.load_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
+            self.prep_debounce_button.button_action = self.handle_prep_runout
+            self.prep_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
+
+        if self.load is not None and not self.shared_prep_load_sensor:
+            show_sensor = True
+            if not self.enable_sensors_in_gui or (self.sensor_to_show is not None and 'load' not in self.sensor_to_show):
+                show_sensor = False
+            self.fila_load, self.load_debounce_button = add_filament_switch(f"{self.name}_load", self.load, self.printer,
+                                                                            show_sensor, enable_runout=self.enable_runout,
+                                                                            debounce_delay=self.debounce_delay )
+            self.load_debounce_button.button_action = self.handle_load_runout
+            self.load_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
 
         self.connect_done = False
         self.prep_active = False
@@ -556,17 +565,9 @@ class AFCLane:
             else:
                 return self.dist_hub_move_speed, self.dist_hub_move_accel
     def is_direct_hub(self):
-        """
-        Helper function to see if hub for lane is 'direct' or 'direct_load' hub.
-
-        :return boolean: True if hub for lane is 'direct' or 'direct_load'
-        """
         return self.hub and 'direct' in self.hub
-
+    
     def select_lane(self):
-        """
-        Helper function to select lane, calls unit lane selection function.
-        """
         self.unit_obj.select_lane( self )
 
     def move(self, distance, speed, accel, assist_active=False):
@@ -882,8 +883,6 @@ class AFCLane:
                 elif self.prep_state == True and self.load_state == True:
                     if self.shared_prep_load_sensor:
                         if self.status != AFCLaneState.LOADED:
-                            if self.spool_id and not self.tool_loaded:
-                                self._clear_spool_assignment()
                             self.status = AFCLaneState.LOADED
                             self.unit_obj.lane_loaded(self)
                             self.afc.spool._set_values(self)
@@ -907,7 +906,8 @@ class AFCLane:
 
         :param eventtime: Event time from the button press
         """
-        cleared_spool_assignment = False
+        if self.shared_prep_load_sensor:
+            self.load_state = prep_state
         # Call filament sensor callback so that state is registered
         try:
             self.prep_debounce_button._old_note_filament_present(is_filament_present=prep_state)
