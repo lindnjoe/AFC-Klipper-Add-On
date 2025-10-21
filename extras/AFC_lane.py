@@ -49,6 +49,7 @@ class AFCLaneState:
 
 class AFCLane:
     UPDATE_WEIGHT_DELAY = 10.0
+    SHARED_LOW_MIN_DURATION = 0.05
 
     def _normalize_pin_name(self, pin):
         if pin is None:
@@ -220,6 +221,7 @@ class AFCLane:
 
         self._shared_clear_deadline = self.reactor.NEVER
         self._shared_pending_clear = False
+        self._shared_low_time = None
         self._shared_clear_timer = self.reactor.register_timer(self._shared_sensor_clear_cb)
 
         self.filament_diameter  = config.getfloat("filament_diameter", 1.75)    # Diameter of filament being used
@@ -931,6 +933,72 @@ class AFCLane:
         self.handle_load_runout(eventtime, state)
 
 
+    def _shared_prep_load_callback(self, eventtime, state):
+        """Combined callback for lanes that share a prep/load sensor."""
+        self.load_callback(eventtime, state)
+        self.prep_callback(eventtime, state)
+
+    def _cancel_pending_shared_clear(self):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        self._shared_clear_deadline = self.reactor.NEVER
+        self._shared_pending_clear = False
+        self.reactor.update_timer(self._shared_clear_timer, self.reactor.NEVER)
+
+    def _schedule_shared_clear(self, eventtime):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        delay = max(self.debounce_delay, 0.2)
+        self._shared_pending_clear = True
+        self._shared_clear_deadline = eventtime + delay
+        self.reactor.update_timer(self._shared_clear_timer, self._shared_clear_deadline)
+
+    def _shared_sensor_clear_cb(self, eventtime):
+        if not self.shared_prep_load_sensor or not self._shared_pending_clear:
+            return self.reactor.NEVER
+        self._shared_clear_deadline = self.reactor.NEVER
+        self._shared_pending_clear = False
+        if self.prep_state or self.load_state:
+            return self.reactor.NEVER
+        if self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data:
+            self._clear_spool_assignment()
+        return self.reactor.NEVER
+
+    def _clear_spool_assignment(self, notify_unit=True):
+        self._cancel_pending_shared_clear()
+        had_values = bool(
+            self.spool_id
+            or self.tool_loaded
+            or self.loaded_to_hub
+            or self.td1_data
+        )
+
+        self.tool_loaded = False
+        self.status = AFCLaneState.NONE
+        self.loaded_to_hub = False
+        self.td1_data = {}
+        self._has_spool_assignment = False
+        self._shared_low_time = None
+        self.afc.spool.clear_values(self)
+        self.afc.spool.set_active_spool(None)
+        if notify_unit and self.unit_obj is not None:
+            self.unit_obj.lane_unloaded(self)
+
+        return had_values
+
+    def _shared_prep_load_runout(self, eventtime, state):
+        self.handle_prep_runout(eventtime, state)
+        if not state and (
+            self.spool_id
+            or self.tool_loaded
+            or self.loaded_to_hub
+            or self.td1_data
+            or self._has_spool_assignment
+        ):
+            self._schedule_shared_clear(eventtime)
+        self.handle_load_runout(eventtime, state)
+
+
     def load_callback(self, eventtime, state):
         self.load_state = state
         if self.printer.state_message == 'Printer is ready' and True == self._afc_prep_done and self.unit_obj.type == "HTLF":
@@ -981,6 +1049,9 @@ class AFCLane:
         self.afc.save_vars()
 
     def prep_callback(self, eventtime, state):
+        if self.shared_prep_load_sensor and not state:
+            self._shared_low_time = eventtime
+
         self.prep_state = state
         if self.shared_prep_load_sensor:
             self.load_state = state
@@ -1057,8 +1128,16 @@ class AFCLane:
 
                 elif self.prep_state == True and self.load_state == True:
                     if self.shared_prep_load_sensor:
+                        should_clear = False
                         if self._shared_pending_clear:
+                            should_clear = True
+                        elif self._shared_low_time is not None:
+                            low_duration = eventtime - self._shared_low_time
+                            if low_duration >= self.SHARED_LOW_MIN_DURATION:
+                                should_clear = True
+                        if should_clear:
                             self._clear_spool_assignment()
+                        self._shared_low_time = None
                         if self.status != AFCLaneState.LOADED:
                             self.status = AFCLaneState.LOADED
                             self.unit_obj.lane_loaded(self)
@@ -1072,6 +1151,10 @@ class AFCLane:
                         message += '\n    Once cleared try loading again'
                         self.afc.error.AFC_error(message, pause=False)
         self.prep_active = False
+        if self.shared_prep_load_sensor and state and self._shared_low_time is not None:
+            # Shared sensor returned high before a load event processed; clear tracked low timestamp
+            self._shared_low_time = None
+
         self.afc.save_vars()
 
     def handle_prep_runout(self, eventtime, prep_state):
