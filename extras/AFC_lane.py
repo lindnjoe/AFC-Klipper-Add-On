@@ -116,9 +116,7 @@ class AFCLane:
         # Overrides buffers set at the unit and extruder level
         self.buffer_name        = config.get("buffer", None)                            # Buffer name(AFC_buffer) that belongs to this stepper, overrides buffer that is set in extruder(AFC_extruder) or unit(AFC_BoxTurtle/NightOwl/etc) sections.
         self.unit               = unit.split(':')[0]
-        self._shared_prep_load_override = config.getboolean(
-            "shared_prep_load_sensor", None
-        )
+        self._shared_prep_load_override = config.getboolean("shared_prep_load_sensor", None)
         if self._shared_prep_load_override is None:
             unit_prefix = self.unit.strip().upper() if self.unit else ""
             if unit_prefix.startswith("AMS"):
@@ -186,6 +184,7 @@ class AFCLane:
         self.prep = config.get('prep', None)                                    # MCU pin for prep trigger
         if isinstance(self.prep, str) and self.prep.strip().lower() in ("", "none"):
             self.prep = None
+
         self.load = config.get('load', None)                                    # MCU pin load trigger
         if isinstance(self.load, str) and self.load.strip().lower() in ("", "none"):
             self.load = None
@@ -195,31 +194,21 @@ class AFCLane:
 
         self._normalized_prep_pin = self._normalize_pin_name(self.prep)
         self._normalized_load_pin = self._normalize_pin_name(self.load)
-        shared_detected = bool(
-            self._normalized_prep_pin
-            and self._normalized_prep_pin == self._normalized_load_pin
-        )
-        if self._shared_prep_load_override is None:
-            self.shared_prep_load_sensor = shared_detected
-        else:
+
+        shared_detected = bool(self._normalized_prep_pin and self._normalized_prep_pin == self._normalized_load_pin)
+        self.shared_prep_load_sensor = shared_detected
+        if not self.shared_prep_load_sensor:
+            unit_prefix = self.unit.strip().upper() if self.unit else ""
+            if unit_prefix.startswith("AMS") and self._normalized_prep_pin and not self._normalized_load_pin:
+                self.shared_prep_load_sensor = True
+
+        if self._shared_prep_load_override is not None:
             self.shared_prep_load_sensor = self._shared_prep_load_override
 
         if self.prep is not None:
-            prep_callback = self._shared_prep_load_callback if self.shared_prep_load_sensor else self.prep_callback
-            buttons.register_buttons([self.prep], prep_callback)
+            prep_cb = self._shared_prep_load_callback if self.shared_prep_load_sensor else self.prep_callback
+            buttons.register_buttons([self.prep], prep_cb)
 
-        self.load = config.get('load', None)                                    # MCU pin load trigger
-        normalized_prep = self._normalize_pin_name(self.prep)
-        normalized_load = self._normalize_pin_name(self.load)
-        self.shared_prep_load_sensor = config.getboolean("shared_prep_load_sensor", False)
-        if not self.shared_prep_load_sensor:
-            unit_prefix = self.unit.strip().upper() if self.unit else ""
-            if normalized_prep and normalized_load and normalized_prep == normalized_load:
-                self.shared_prep_load_sensor = True
-            elif unit_prefix.startswith("AMS") and normalized_prep and not normalized_load:
-                self.shared_prep_load_sensor = True
-
-        self.load_state = False
         if self.load is not None and not self.shared_prep_load_sensor:
             buttons.register_buttons([self.load], self.load_callback)
         elif self.load is None and not self.shared_prep_load_sensor:
@@ -229,9 +218,7 @@ class AFCLane:
         self.lane_load_count = None
 
         self._shared_clear_deadline = self.reactor.NEVER
-        self._shared_clear_timer = self.reactor.register_timer(
-            self._shared_sensor_clear_cb
-        )
+        self._shared_clear_timer = self.reactor.register_timer(self._shared_sensor_clear_cb)
 
         self.filament_diameter  = config.getfloat("filament_diameter", 1.75)    # Diameter of filament being used
         self.filament_density   = config.getfloat("filament_density", 1.24)     # Density of filament being used
@@ -258,7 +245,9 @@ class AFCLane:
             if self.shared_prep_load_sensor:
                 self.fila_load = self.fila_prep
                 self.load_debounce_button = self.prep_debounce_button
-            self.prep_debounce_button.button_action = self.handle_prep_runout
+                self.prep_debounce_button.button_action = self._shared_prep_load_runout
+            else:
+                self.prep_debounce_button.button_action = self.handle_prep_runout
             self.prep_debounce_button.debounce_delay = 0 # Delay will be set once klipper is ready
 
         if self.load is not None and not self.shared_prep_load_sensor:
@@ -756,6 +745,65 @@ class AFCLane:
             self.load_state = self.prep_state
 
 
+    def _shared_prep_load_callback(self, eventtime, state):
+        """Combined callback for lanes that share a prep/load sensor."""
+        self.load_callback(eventtime, state)
+        self.prep_callback(eventtime, state)
+
+    def _cancel_pending_shared_clear(self):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        self._shared_clear_deadline = self.reactor.NEVER
+        self.reactor.update_timer(self._shared_clear_timer, self.reactor.NEVER)
+
+    def _schedule_shared_clear(self, eventtime):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        delay = max(self.debounce_delay, 0.2)
+        self._shared_clear_deadline = eventtime + delay
+        self.reactor.update_timer(self._shared_clear_timer, self._shared_clear_deadline)
+
+    def _shared_sensor_clear_cb(self, eventtime):
+        if not self.shared_prep_load_sensor:
+            return self.reactor.NEVER
+        self._shared_clear_deadline = self.reactor.NEVER
+        if self.prep_state or self.load_state:
+            return self.reactor.NEVER
+        if self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data:
+            self._clear_spool_assignment()
+        return self.reactor.NEVER
+
+    def _clear_spool_assignment(self, notify_unit=True):
+        self._cancel_pending_shared_clear()
+        had_values = bool(
+            self.spool_id
+            or self.tool_loaded
+            or self.loaded_to_hub
+            or self.td1_data
+        )
+
+        self.tool_loaded = False
+        self.status = AFCLaneState.NONE
+        self.loaded_to_hub = False
+        self.td1_data = {}
+        self.afc.spool.clear_values(self)
+        self.afc.spool.set_active_spool(None)
+        if notify_unit and self.unit_obj is not None:
+            self.unit_obj.lane_unloaded(self)
+
+        return had_values
+
+    def _shared_prep_load_runout(self, eventtime, state):
+        if state:
+            self._cancel_pending_shared_clear()
+        self.handle_prep_runout(eventtime, state)
+        if not state and (
+            self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data
+        ):
+            self._schedule_shared_clear(eventtime)
+        self.handle_load_runout(eventtime, state)
+
+
     def load_callback(self, eventtime, state):
         self.load_state = state
         if self.printer.state_message == 'Printer is ready' and True == self._afc_prep_done and self.unit_obj.type == "HTLF":
@@ -906,6 +954,7 @@ class AFCLane:
 
         :param eventtime: Event time from the button press
         """
+        cleared_spool_assignment = False
         if self.shared_prep_load_sensor:
             self.load_state = prep_state
         # Call filament sensor callback so that state is registered
