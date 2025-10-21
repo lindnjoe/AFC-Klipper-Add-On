@@ -1178,7 +1178,23 @@ class AFCLane:
             self.prep_debounce_button._old_note_filament_present(eventtime, prep_state)
 
         if self.printer.state_message == 'Printer is ready' and True == self._afc_prep_done and self.status != AFCLaneState.TOOL_UNLOADING:
-            if prep_state == False and self.name == self.afc.current and self.afc.function.is_printing() and self.load_state and self.status != AFCLaneState.EJECTING:
+            lane_has_material = any(
+                (
+                    self.load_state,
+                    self.tool_loaded,
+                    self.loaded_to_hub,
+                    getattr(self, "_has_spool_assignment", False),
+                    bool(self.spool_id),
+                )
+            )
+
+            if (
+                prep_state == False
+                and self.name == self.afc.current
+                and self.afc.function.is_printing()
+                and self.status != AFCLaneState.EJECTING
+                and lane_has_material
+            ):
                 # Don't run if user disabled sensor in gui
                 if not self.fila_prep.runout_helper.sensor_enabled:
                     self.logger.warning("Prep runout has been detected, but pause and runout detection has been disabled")
