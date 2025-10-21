@@ -275,6 +275,19 @@ class AFCSpool:
         cur_lane.material = self.afc.default_material_type
         cur_lane.weight = 1000 # Defaulting weight to 1000 upon load
 
+        # Remember whichever spool is currently active so we can restore it after
+        # updating metadata for a different lane. When a user inserts filament into
+        # an idle lane we fetch spool information from Spoolman which toggles the
+        # active spool. This unintentionally disables weight tracking for the lane
+        # that's actually loaded in the toolhead until the next tool change. By
+        # capturing the active lane up-front we can re-apply it once we're done
+        # updating the inserted lane.
+        restore_active_spool_id = None
+        if self.afc.spoolman is not None:
+            active_lane = self.afc.function.get_current_lane_obj()
+            if active_lane is not None and active_lane is not cur_lane:
+                restore_active_spool_id = active_lane.spool_id
+
         if hasattr(cur_lane, "_has_spool_assignment"):
             cur_lane._has_spool_assignment = True
 
@@ -282,6 +295,9 @@ class AFCSpool:
             spool_id = self.next_spool_id
             self.next_spool_id = ''
             self.set_spoolID(cur_lane, spool_id)
+
+        if restore_active_spool_id is not None:
+            self.set_active_spool(restore_active_spool_id)
 
     def clear_values(self, cur_lane):
         """
