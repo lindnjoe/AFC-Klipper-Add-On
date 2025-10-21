@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2025-10-16]
+### Fixes
+- Fixed issue with debounce logic on latest version of Kalico.
+
+## [2025-10-12]
+### Fixes
+- Capitalized AFC_CALIBRATION help text
+- Removing returning TD-1 color as color in api endpoint, TD-1 color is still returned in td1_color variable per lane
+- Current toolchange will return zero if current toolchange is below zero(starts at -1 when first starting a print)
+- Added additional logic when parsing TD-1 scan_time to work with updated format in moonraker
+
+## [2025-10-10]
+### Added
+- Created a new folder for community-contributed mods and configurations at ``/community_mods/``
+- Added Blurolls AFC-X mcu board with a path of ``/community_mods/mcu/AFC-X.cfg``. [Customer image of board](https://ae-pic-a1.aliexpress-media.com/kf/A030fad34724c426ba8564ca98bb570dfQ.jpg_.webp) Colors do **NOT** match the product description on online retailers.
+
+## [2025-09-30]
+### Added
+- Allow `tool_stn_unload` to be `0` for toolheads with cutter above extruder.
+
+## [2025-09-26]
+### Added
+- Support to move filament to TD-1 device that is inline with PTFE tube to gather TD and color
+
+## [2025-09-27]
+### Fixes
+- Logging the same information multiple times to AFC.log file
+
+## [2025-09-07]
+### Added
+- Support to push lane information to moonrakers `machine/lane_data` endpoint so that third-parties can pull this information easily(eg. orcaslicer)
+
+### Fixes
+- The `AFC_LANE_RESET` macro will properly check for input instead of crashing Klipper.
+### Added
+- Added ability to auto level when `auto_level_macro` is defined with a valid leveling macro.
+
 ## [2025-09-05]
 ### Added
 - Check to verify that pin_tool_start/end is not set to `Unknown`, throws error if pins are set to `Unknown`.
@@ -76,14 +113,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixes
 - Race condition between klipper and moonraker when trying to get stats from moonraker database
 
+## [2025-07-03]
+### Added
+- `deadband` variable to `AFCExtruder` (configurable per extruder, default: 2°C). This sets the temperature deadband for extruder heaters, allowing more flexible temperature control during tool changes.
+- New lane status: `INFINITE_RUNOUT` in `AFCLaneState`. This status is used to indicate a lane that has triggered infinite spool/runout logic.
+- Infinite runout handling: When infinite spool is triggered, the target lane's status is set to `INFINITE_RUNOUT` and the toolchange logic now supports heating the next extruder and waiting for it to reach temperature before resuming.
+
+### Changed
+- Tool change logic (`CHANGE_TOOL`) now detects infinite runout state and, if present, heats the next extruder to the correct temperature (using the new `deadband` value) before proceeding.
+- Refactored extruder heating logic into a new `_heat_next_extruder` helper function, which sets the current extruder to 0°C and heats the next extruder as needed.
+- Improved temperature waiting logic with `_wait_for_temp_within_tolerance`, now supporting a default tolerance of 20°C and using the new `deadband` value for more precise control.
+
 ## [2025-06-30]
 ### Fixes
 - Issue #476 where turn off led macro didn't turn off LEDs while printing
 - TTC's that some users were having that was induced by commit `1201bcc`
 
+## [2025-06-29]
+### Added
+- `led_tool_loaded_idle` led status color. This is used when a lane is loaded to a tool but that tool is not active. Primary use, toolchangers.
+  - This is available to be set globally, per unit or per lane.
+- `custom_load_cmd` to AFC_lane. This offers flexiblilty for set ups that aren't using the standard AFC load sequence.
+  - Setting this will override the standard AFC load sequence.
+  - This will still check the toolhead presensor state to confirm load *pre extruder toolhead sensor required*
+- `custom_unload_cmd` to AFC_lane. This offers flexibility in how the system unloads
+  - This will override and bypass the standard AFC load sequence.
+  - There is no check for toolhead sensor after completion so it will assume the unload was successful.
+
+### Changed
+- The load sequence for the command `TOOL_LOAD` is now pulled out to it's own function for more flexiblility
+- The unload sequence for the command `TOOL_UNLOAD` is now pulled out to it's own function for more flexibility
+- The status of a tool loaded lane that is not the current extruder will now be set to `led_tool_loaded_idle` for a more clear led status.
+
+### Fixed
+- Inconsistencies in lane/extruder state after tool changes or buffer operations.
+- Errors when buffer or stepper objects were missing.
+
 ## [2025-06-28]
 ### Updated
 - The `install-afc.sh` script will now display the version when an update is completed.
+
+## [2025-06-26]
+### Added
+- `TOOL_SWAP` state and `tool_swap` method: Enables robust tool swapping between extruders.
+- `AFC_M104` and `AFC_M109` commands: Allow setting extruder temperature for a specific tool (e.g., `T0`, `T1`).
+  - `AFC_M109` now supports a `D` (deadband) parameter to allow faster tool changes or print starts when exact temperature isn't required.
+- Macro override logic: Safely renames built-in macros (e.g., `M104`, `M109`) with AFC-specific implementations.
+- `current` property: Provides a consistent interface for getting the currently loaded lane.
+- `get_lane_by_map` and `get_current_extruder` helpers: Simplify tool/lane mapping.
+- `_wait_for_temp_within_tolerance` helper: set and wait for temp with in range. to help with the "deadband" functionality
+- `temp_wait_tolerance` config option, this is used for functions that check and set temperatures. Goes under `[afc]` config section
+
+### Changed
+- Tool change and load/unload logic: Refined for multi-extruder systems with better tool selection, activation, and sync.
+- Temperature control: Now supports tool selection by name and improved lane-to-extruder mapping.
+- Lane and extruder state logic: Refactored for consistency across tool changes and buffer interactions.
+- Error handling: Clearer messages and logs for lane and tool operations.
+
+### Removed
+- Direct assignment to `self.current`: Replaced with controlled access via the `current` property.
+
+### Fixed
+- Inconsistencies in lane/extruder state after tool changes or buffer operations.
+- Errors when buffer or stepper objects were missing.
 
 ## [2025-06-23]
 ### Added
