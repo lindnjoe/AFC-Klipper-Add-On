@@ -400,6 +400,12 @@ class AFCLane:
         if add_to_other_obj:
             self.extruder_obj.lanes[self.name] = self
 
+        if (
+            self._shared_prep_load_override is None
+            and getattr(self.unit_obj, "type", "").upper() == "AMS"
+        ):
+            self._enable_shared_prep_load_sensor()
+
         # Use buffer defined in stepper and override buffers that maybe set at the UNIT or extruder levels
         self.buffer_obj = self.unit_obj.buffer_obj
         if self.buffer_name is not None:
@@ -660,6 +666,144 @@ class AFCLane:
             else:
                 self.logger.info(f"Cannot get TD-1 data for {self.name}, either toolhead is loaded or hub shows filament in path")
 
+    def _shared_prep_load_callback(self, eventtime, state):
+        """Callback used when prep and load sensors share the same physical input."""
+        self.load_callback(eventtime, state)
+        self.prep_callback(eventtime, state)
+
+    def _clear_spool_assignment(self):
+        """Reset stored spool metadata when filament leaves the lane."""
+        self._cancel_pending_shared_clear()
+        had_values = bool(
+            self.spool_id
+            or self.tool_loaded
+            or self.loaded_to_hub
+            or self.td1_data
+            or self.status not in (AFCLaneState.NONE,)
+        )
+
+        self.tool_loaded = False
+        self.status = AFCLaneState.NONE
+        self.loaded_to_hub = False
+        self.td1_data = {}
+
+        # Reset any cached spool metadata so Moonraker shows the lane as empty.
+        self.afc.spool.clear_values(self)
+        self.afc.spool.set_active_spool(None)
+        self.unit_obj.lane_unloaded(self)
+
+        return had_values
+
+    def _shared_prep_load_runout(self, eventtime, state):
+        """Runout handler when prep and load sensors are the same."""
+        if state:
+            self._cancel_pending_shared_clear()
+        self.handle_prep_runout(eventtime, state)
+        if not state and (
+            self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data
+        ):
+            self._schedule_shared_clear(eventtime)
+        self.handle_load_runout(eventtime, state)
+
+    def _cancel_pending_shared_clear(self):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        self._shared_clear_deadline = self.reactor.NEVER
+        self.reactor.update_timer(self._shared_clear_timer, self.reactor.NEVER)
+
+    def _schedule_shared_clear(self, eventtime):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        delay = max(self.debounce_delay, 0.2)
+        self._shared_clear_deadline = eventtime + delay
+        self.reactor.update_timer(self._shared_clear_timer, self._shared_clear_deadline)
+
+    def _shared_sensor_clear_cb(self, eventtime):
+        self._shared_clear_deadline = self.reactor.NEVER
+        if self.prep_state or self.load_state:
+            return self.reactor.NEVER
+        if self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data:
+            self._clear_spool_assignment()
+        return self.reactor.NEVER
+
+    def _enable_shared_prep_load_sensor(self):
+        """Force shared prep/load behavior after initialization."""
+        if self.shared_prep_load_sensor:
+            return
+
+        self.shared_prep_load_sensor = True
+        self._shared_prep_load_override = True
+
+        if hasattr(self, "prep_debounce_button"):
+            self.prep_debounce_button.button_action = self._shared_prep_load_runout
+            if getattr(self, "load_debounce_button", None) is None:
+                self.load_debounce_button = self.prep_debounce_button
+
+        if hasattr(self, "fila_prep") and getattr(self, "fila_load", None) is None:
+            self.fila_load = self.fila_prep
+
+        if self.prep_state:
+            self.load_state = self.prep_state
+
+
+    def _shared_prep_load_callback(self, eventtime, state):
+        """Combined callback for lanes that share a prep/load sensor."""
+        self.load_callback(eventtime, state)
+        self.prep_callback(eventtime, state)
+
+    def _cancel_pending_shared_clear(self):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        self._shared_clear_deadline = self.reactor.NEVER
+        self.reactor.update_timer(self._shared_clear_timer, self.reactor.NEVER)
+
+    def _schedule_shared_clear(self, eventtime):
+        if getattr(self, "_shared_clear_timer", None) is None:
+            return
+        delay = max(self.debounce_delay, 0.2)
+        self._shared_clear_deadline = eventtime + delay
+        self.reactor.update_timer(self._shared_clear_timer, self._shared_clear_deadline)
+
+    def _shared_sensor_clear_cb(self, eventtime):
+        if not self.shared_prep_load_sensor:
+            return self.reactor.NEVER
+        self._shared_clear_deadline = self.reactor.NEVER
+        if self.prep_state or self.load_state:
+            return self.reactor.NEVER
+        if self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data:
+            self._clear_spool_assignment()
+        return self.reactor.NEVER
+
+    def _clear_spool_assignment(self, notify_unit=True):
+        self._cancel_pending_shared_clear()
+        had_values = bool(
+            self.spool_id
+            or self.tool_loaded
+            or self.loaded_to_hub
+            or self.td1_data
+        )
+
+        self.tool_loaded = False
+        self.status = AFCLaneState.NONE
+        self.loaded_to_hub = False
+        self.td1_data = {}
+        self.afc.spool.clear_values(self)
+        self.afc.spool.set_active_spool(None)
+        if notify_unit and self.unit_obj is not None:
+            self.unit_obj.lane_unloaded(self)
+
+        return had_values
+
+    def _shared_prep_load_runout(self, eventtime, state):
+        if state:
+            self._cancel_pending_shared_clear()
+        self.handle_prep_runout(eventtime, state)
+        if not state and (
+            self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data
+        ):
+            self._schedule_shared_clear(eventtime)
+        self.handle_load_runout(eventtime, state)
+
 
     def _shared_prep_load_callback(self, eventtime, state):
         """Combined callback for lanes that share a prep/load sensor."""
@@ -738,10 +882,11 @@ class AFCLane:
         :param eventtime: Event time from the button press
         """
         # Call filament sensor callback so that state is registered
-        try:
-            self.load_debounce_button._old_note_filament_present(is_filament_present=load_state)
-        except:
-            self.load_debounce_button._old_note_filament_present(eventtime, load_state)
+        if not self.shared_prep_load_sensor:
+            try:
+                self.load_debounce_button._old_note_filament_present(is_filament_present=load_state)
+            except:
+                self.load_debounce_button._old_note_filament_present(eventtime, load_state)
 
         if self.printer.state_message == 'Printer is ready' and self.unit_obj.type == "HTLF":
             if load_state and not self.tool_loaded:
@@ -765,13 +910,7 @@ class AFCLane:
                     else:
                         self._perform_pause_runout()
                 elif self.status != "calibrating":
-                    self.tool_loaded = False
-                    self.afc.function.afc_led(self.led_not_ready, self.led_index)
-                    self.status = AFCLaneState.NONE
-                    self.loaded_to_hub = False
-                    self.td1_data = {}
-                    self.afc.spool.clear_values(self)
-                    self.afc.function.afc_led(self.afc.led_not_ready, self.led_index)
+                    self._clear_spool_assignment()
 
         self.afc.save_vars()
 
