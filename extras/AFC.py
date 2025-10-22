@@ -1944,66 +1944,34 @@ class afc:
         temp     = gcmd.get_float('S', 0.0)
         deadband = gcmd.get_float('D', None)
 
-        afc_extruder = None
         if toolnum is not None:
             map = "T{}".format(toolnum)
             lane = self.function.get_lane_by_map(map)
-            if lane is None:
+            if lane is not None:
+                extruder = lane.extruder_obj
+                self.logger.debug("Setting temperature for {} to {}".format(lane.extruder_obj, temp))
+                if extruder is None:
+                    self.logger.error("extruder not configured for T{}".format(toolnum))
+                    return
+            else:
                 self.logger.error("extruder not configured for T{}".format(toolnum))
                 return
-
-            afc_extruder = lane.extruder_obj
-            if afc_extruder is None:
-                self.logger.error("extruder not configured for T{}".format(toolnum))
-                return
-
-            tool_extruder = afc_extruder.toolhead_extruder
-            if tool_extruder is None:
-                self.logger.error("toolhead extruder missing for T{}".format(toolnum))
-                return
-
-            self.logger.debug("Setting temperature for {} to {}".format(afc_extruder, temp))
         else:
-            tool_extruder = self.toolhead.get_extruder()
-            if tool_extruder is None:
-                self.logger.error("Unable to resolve toolhead extruder for M109 command")
-                return
-
-            for extr in self.tools.values():
-                if extr.toolhead_extruder is tool_extruder:
-                    afc_extruder = extr
-                    break
+            extruder = self.toolhead.get_extruder()
 
         pheaters = self.printer.lookup_object('heaters')
-        heater = tool_extruder.get_heater()
+        heater = extruder.get_heater()
+        pheaters.set_temperature(heater, temp, False)  # Always set temp, don't wait yet
 
-        eventtime = self.reactor.monotonic()
-        current_temp = heater.get_temp(eventtime)[0]
+        # If deadband is specified, wait for temp within tolerance
+        if wait and deadband is not None and temp > 0:
+            self._wait_for_temp_within_tolerance(heater, temp, deadband)
+            return
 
-        wait_tolerance = None
-        if wait and temp > 0:
-            if deadband is not None:
-                wait_tolerance = deadband
-            elif afc_extruder is not None:
-                wait_tolerance = getattr(afc_extruder, "deadband", None)
-
-        use_tolerance_wait = (
-            wait and temp > 0 and wait_tolerance is not None and wait_tolerance > 0
-            and abs(current_temp - temp) > wait_tolerance
-        )
-
-        should_wait_default = False
-        if wait and not use_tolerance_wait:
-            if wait_tolerance is not None and wait_tolerance > 0:
-                should_wait_default = abs(current_temp - temp) > wait_tolerance
-            else:
-                default_tolerance = self.temp_wait_tolerance if self.temp_wait_tolerance is not None else 0.0
-                should_wait_default = abs(current_temp - temp) > default_tolerance
-
-        pheaters.set_temperature(heater, temp, should_wait_default)
-
-        if use_tolerance_wait:
-            self._wait_for_temp_within_tolerance(heater, temp, wait_tolerance)
+        # Default: wait if needed
+        current_temp = heater.get_temp(self.reactor.monotonic())[0]
+        should_wait = wait and abs(current_temp - temp) > self.temp_wait_tolerance
+        pheaters.set_temperature(heater, temp, should_wait)
         self.logger.debug("Done setting temp")
 
     def _heat_next_extruder(self, wait=True):
