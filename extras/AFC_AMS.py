@@ -188,9 +188,7 @@ class afcAMS(afcUnit):
 
         self._virtual_tool_switch_created = True
         self.logger.info(
-            "Registered virtual AMS filament sensor '%s' using pin %s",
-            base_pin,
-            virtual_pin,
+            f"Registered virtual AMS filament sensor '{base_pin}' using pin {virtual_pin}"
         )
 
     def _get_virtual_tool_pin(self) -> str | None:
