@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import traceback
+from textwrap import dedent
 from typing import Dict
 
 from configparser import Error as ConfigError
@@ -11,8 +12,7 @@ try:  # pragma: no cover - defensive guard for runtime import errors
     from extras.AFC_unit import afcUnit
 except Exception as exc:  # pragma: no cover - defensive guard
     raise ConfigError(
-        "Error when trying to import AFC_unit
-{trace}".format(
+        "Error when trying to import AFC_unit\n{trace}".format(
             trace=traceback.format_exc()
         )
     ) from exc
@@ -21,8 +21,7 @@ try:  # pragma: no cover - defensive guard for runtime import errors
     from extras.AFC_lane import AFCLaneState
 except Exception as exc:  # pragma: no cover - defensive guard
     raise ConfigError(
-        "Error when trying to import AFC_lane
-{trace}".format(
+        "Error when trying to import AFC_lane\n{trace}".format(
             trace=traceback.format_exc()
         )
     ) from exc
@@ -62,37 +61,34 @@ class afcAMS(afcUnit):
             lane.load_state = False
             lane.status = AFCLaneState.NONE
 
-        first_leg = '<span class=warning--text>|</span><span class=error--text>_</span>'
-        second_leg = first_leg + '<span class=warning--text>|</span>'
-        self.logo = (
-            '<span class=success--text>R  _____     ____
-'
-            'E /      \  |  </span><span class=info--text>o</span><span class=success--text> | 
-'
-            'A |       |/ ___/ 
-'
-            'D |_________/     
-'
-            'Y {first}{second} {first}{second}
-'
-            '  {name}
-'
+        first_leg = (
+            "<span class=warning--text>|</span>"
+            "<span class=error--text>_</span>"
+        )
+        second_leg = f"{first_leg}<span class=warning--text>|</span>"
+        self.logo = dedent(
+            """\
+            <span class=success--text>R  _____     ____
+            E /      \\  |  </span><span class=info--text>o</span><span class=success--text> |
+            A |       |/ ___/
+            D |_________/
+            Y {first}{second} {first}{second}
+              {name}
+            </span>
+            """
         ).format(first=first_leg, second=second_leg, name=self.name)
 
-        self.logo_error = (
-            '<span class=error--text>E  _ _   _ _
-'
-            'R |_|_|_|_|_|
-'
-            'R |         \____
-'
-            'O |              \ 
-'
-            'R |          |\ <span class=secondary--text>X</span> |\n'
-            '! \_________/ |___|</span>
-'
-            '  {name}
-'
+        self.logo_error = dedent(
+            """\
+            <span class=error--text>E  _ _   _ _
+            R |_|_|_|_|_|
+            R |         \\____
+            O |              \\
+            R |          |\\ <span class=secondary--text>X</span> |
+            ! \\_________/ |___|
+              {name}
+            </span>
+            """
         ).format(name=self.name)
 
     def system_Test(self, cur_lane, delay, assignTcmd, enable_movement):
@@ -137,9 +133,8 @@ class afcAMS(afcUnit):
                         msg += '<span class=primary--text> in ToolHead</span>'
                         if cur_lane.extruder_obj.tool_start == "buffer":
                             msg += (
-                                '<span class=warning--text>
- Ram sensor enabled, '
-                                'confirm tool is loaded</span>'
+                                '<span class=warning--text>'
+                                ' Ram sensor enabled, confirm tool is loaded</span>'
                             )
                         if self.afc.function.get_current_lane() == cur_lane.name:
                             self.afc.spool.set_active_spool(cur_lane.spool_id)
@@ -149,10 +144,8 @@ class afcAMS(afcUnit):
                     elif tool_ready:
                         msg += (
                             '<span class=error--text> error in ToolHead. '
-                            '
-Lane identified as loaded '
-                            '
- but not identified as loaded in extruder</span>'
+                            'Lane identified as loaded '
+                            'but not identified as loaded in extruder</span>'
                         )
                         succeeded = False
 
