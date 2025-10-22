@@ -60,6 +60,7 @@ class afcAMS(afcUnit):
             lane.prep_state = False
             lane.load_state = False
             lane.status = AFCLaneState.NONE
+            lane.ams_share_prep_load = getattr(lane, "load", None) is None
 
         first_leg = (
             "<span class=warning--text>|</span>"
@@ -166,6 +167,43 @@ class afcAMS(afcUnit):
         self.oams = self.printer.lookup_object("oams " + self.oams_name, None)
         self.reactor.update_timer(self.timer, self.reactor.NOW)
 
+    def _update_shared_lane(self, lane, lane_val, eventtime):
+        """Synchronise shared prep/load sensor lanes without triggering errors."""
+
+        if lane_val == self._last_lane_states.get(lane.name):
+            return
+
+        if lane_val:
+            lane.load_state = False
+            try:
+                lane.prep_callback(eventtime, True)
+            finally:
+                lane.load_callback(eventtime, True)
+
+            if (
+                lane.prep_state
+                and lane.load_state
+                and lane.printer.state_message == "Printer is ready"
+                and getattr(lane, "_afc_prep_done", False)
+            ):
+                lane.status = AFCLaneState.LOADED
+                lane.unit_obj.lane_loaded(lane)
+                lane.afc.spool._set_values(lane)
+                lane._prep_capture_td1()
+        else:
+            lane.load_callback(eventtime, False)
+            lane.prep_callback(eventtime, False)
+
+            lane.tool_loaded = False
+            lane.loaded_to_hub = False
+            lane.status = AFCLaneState.NONE
+            lane.unit_obj.lane_unloaded(lane)
+            lane.td1_data = {}
+            lane.afc.spool.clear_values(lane)
+
+        lane.afc.save_vars()
+        self._last_lane_states[lane.name] = lane_val
+
     def _sync_event(self, eventtime):
         """Poll OpenAMS for state updates and propagate to lanes/hubs."""
 
@@ -185,7 +223,9 @@ class afcAMS(afcUnit):
                     continue
 
                 lane_val = bool(lane_values[idx])
-                if lane_val != self._last_lane_states.get(lane.name):
+                if getattr(lane, "ams_share_prep_load", False):
+                    self._update_shared_lane(lane, lane_val, eventtime)
+                elif lane_val != self._last_lane_states.get(lane.name):
                     lane.load_callback(eventtime, lane_val)
                     lane.prep_callback(eventtime, lane_val)
                     self._last_lane_states[lane.name] = lane_val
