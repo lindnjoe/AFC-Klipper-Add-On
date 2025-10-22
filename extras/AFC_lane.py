@@ -669,6 +669,18 @@ class AFCLane:
             else:
                 self.logger.info(f"Cannot get TD-1 data for {self.name}, either toolhead is loaded or hub shows filament in path")
 
+    def _lane_has_material(self):
+        """Return True if the lane still has filament present or cached spool metadata."""
+        return any(
+            (
+                self.load_state,
+                self.tool_loaded,
+                self.loaded_to_hub,
+                getattr(self, "_has_spool_assignment", False),
+                bool(self.spool_id),
+            )
+        )
+
     def _shared_prep_load_callback(self, eventtime, state):
         """Callback used when prep and load sensors share the same physical input."""
         self.load_callback(eventtime, state)
@@ -702,9 +714,7 @@ class AFCLane:
         if state:
             self._cancel_pending_shared_clear()
         self.handle_prep_runout(eventtime, state)
-        if not state and (
-            self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data
-        ):
+        if not state and self._lane_has_material():
             self._schedule_shared_clear(eventtime)
         self.handle_load_runout(eventtime, state)
 
@@ -801,9 +811,7 @@ class AFCLane:
         if state:
             self._cancel_pending_shared_clear()
         self.handle_prep_runout(eventtime, state)
-        if not state and (
-            self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data
-        ):
+        if not state and self._lane_has_material():
             self._schedule_shared_clear(eventtime)
         self.handle_load_runout(eventtime, state)
 
@@ -861,9 +869,7 @@ class AFCLane:
 
     def _shared_prep_load_runout(self, eventtime, state):
         self.handle_prep_runout(eventtime, state)
-        if not state and (
-            self.spool_id or self.tool_loaded or self.loaded_to_hub or self.td1_data
-        ):
+        if not state and self._lane_has_material():
             self._schedule_shared_clear(eventtime)
         self.handle_load_runout(eventtime, state)
 
@@ -922,13 +928,7 @@ class AFCLane:
 
     def _shared_prep_load_runout(self, eventtime, state):
         self.handle_prep_runout(eventtime, state)
-        if not state and (
-            self.spool_id
-            or self.tool_loaded
-            or self.loaded_to_hub
-            or self.td1_data
-            or self._has_spool_assignment
-        ):
+        if not state and self._lane_has_material():
             self._schedule_shared_clear(eventtime)
         self.handle_load_runout(eventtime, state)
 
@@ -988,13 +988,7 @@ class AFCLane:
 
     def _shared_prep_load_runout(self, eventtime, state):
         self.handle_prep_runout(eventtime, state)
-        if not state and (
-            self.spool_id
-            or self.tool_loaded
-            or self.loaded_to_hub
-            or self.td1_data
-            or self._has_spool_assignment
-        ):
+        if not state and self._lane_has_material():
             self._schedule_shared_clear(eventtime)
         self.handle_load_runout(eventtime, state)
 
@@ -1178,7 +1172,13 @@ class AFCLane:
             self.prep_debounce_button._old_note_filament_present(eventtime, prep_state)
 
         if self.printer.state_message == 'Printer is ready' and True == self._afc_prep_done and self.status != AFCLaneState.TOOL_UNLOADING:
-            if prep_state == False and self.name == self.afc.current and self.afc.function.is_printing() and self.load_state and self.status != AFCLaneState.EJECTING:
+            if (
+                prep_state == False
+                and self.name == self.afc.current
+                and self.afc.function.is_printing()
+                and self.status != AFCLaneState.EJECTING
+                and self._lane_has_material()
+            ):
                 # Don't run if user disabled sensor in gui
                 if not self.fila_prep.runout_helper.sensor_enabled:
                     self.logger.warning("Prep runout has been detected, but pause and runout detection has been disabled")
@@ -1469,6 +1469,9 @@ class AFCLane:
         if not (self._is_normal_printing_state() and self.afc.function.is_printing()):
             return
 
+        if not self._lane_has_material():
+            return
+
         # Check upstream sensors: prep, load, hub
         prep_ok = self.prep_state
         load_ok = self.load_state
@@ -1494,6 +1497,9 @@ class AFCLane:
         """
         # Only trigger runout logic if in a normal printing state AND printer is actively printing
         if not (self._is_normal_printing_state() and self.afc.function.is_printing()):
+            return
+
+        if not self._lane_has_material():
             return
 
         # Check upstream sensors: prep, load
