@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import traceback
+from pathlib import Path
 from textwrap import dedent
-from typing import Dict
+from typing import Dict, Optional
 
-from configparser import Error as ConfigError
+from configparser import ConfigParser, Error as ConfigError
 
 try:  # pragma: no cover - defensive guard for runtime import errors
     from extras.AFC_unit import afcUnit
@@ -22,6 +23,15 @@ try:  # pragma: no cover - defensive guard for runtime import errors
 except Exception as exc:  # pragma: no cover - defensive guard
     raise ConfigError(
         "Error when trying to import AFC_lane\n{trace}".format(
+            trace=traceback.format_exc()
+        )
+    ) from exc
+
+try:  # pragma: no cover - defensive guard for runtime import errors
+    from extras.AFC_utils import add_filament_switch
+except Exception as exc:  # pragma: no cover - defensive guard
+    raise ConfigError(
+        "Error when trying to import AFC_utils\n{trace}".format(
             trace=traceback.format_exc()
         )
     ) from exc
@@ -48,11 +58,13 @@ class afcAMS(afcUnit):
         # Track previous sensor state to only forward changes
         self._last_lane_states: Dict[str, bool] = {}
         self._last_hub_states: Dict[str, bool] = {}
+        self._virtual_tool_switch: Optional[str] = None
         self.oams = None
 
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
         super().handle_connect()
+        self._ensure_virtual_tool_sensor()
 
         # AMS lanes report their state via OpenAMS so default them until the
         # first poll comes back.
@@ -91,6 +103,78 @@ class afcAMS(afcUnit):
             </span>
             """
         ).format(name=self.name)
+
+    def _ensure_virtual_tool_sensor(self):
+        """Create a virtual AMS tool sensor when configured for this unit."""
+
+        if self._virtual_tool_switch is not None:
+            return
+
+        extruder_name = getattr(self, "extruder", None)
+        if not extruder_name:
+            return
+
+        cfg_dir = getattr(self.afc, "cfgloc", None)
+        if not cfg_dir:
+            return
+
+        cfg_path = Path(cfg_dir) / "AFC-hardware.cfg"
+        if not cfg_path.exists():
+            return
+
+        parser = ConfigParser()
+        parser.optionxform = str
+
+        try:
+            with cfg_path.open("r", encoding="utf-8") as cfg_file:
+                parser.read_file(cfg_file)
+        except Exception:
+            return
+
+        section = f"AFC_extruder {extruder_name}"
+        if not parser.has_section(section):
+            return
+
+        tool_pin = parser.get(section, "pin_tool_start", fallback=None)
+        if tool_pin is None:
+            return
+
+        tool_pin = tool_pin.strip()
+        if not tool_pin or tool_pin.lower() == "none":
+            return
+
+        if not tool_pin.startswith("AMS_extruder"):
+            return
+
+        if self.printer.lookup_object(f"filament_switch_sensor {tool_pin}", None):
+            self._virtual_tool_switch = tool_pin
+            return
+
+        pins = self.printer.lookup_object("pins")
+        if not getattr(self.afc, "_virtual_ams_chip_registered", False):
+            try:
+                pins.register_chip("afc_virtual_ams", self.afc)
+            except Exception:
+                pass
+            else:
+                self.afc._virtual_ams_chip_registered = True
+
+        try:
+            add_filament_switch(
+                tool_pin,
+                f"afc_virtual_ams:{tool_pin}",
+                self.printer,
+                show_sensor=self.afc.enable_sensors_in_gui,
+            )
+        except Exception:
+            return
+
+        self._virtual_tool_switch = tool_pin
+        self.logger.info(
+            "Registered virtual AMS filament sensor '%s' for unit %s",
+            tool_pin,
+            self.name,
+        )
 
     def system_Test(self, cur_lane, delay, assignTcmd, enable_movement):
         """Validate AMS lane state without attempting any motion."""
