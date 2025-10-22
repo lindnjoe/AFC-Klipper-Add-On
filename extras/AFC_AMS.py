@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import traceback
+from pathlib import Path
 from textwrap import dedent
 from typing import Dict
 
-from configparser import Error as ConfigError
+from configparser import ConfigParser, Error as ConfigError
 
 try:  # pragma: no cover - defensive guard for runtime import errors
     from extras.AFC_unit import afcUnit
@@ -26,14 +27,71 @@ except Exception as exc:  # pragma: no cover - defensive guard
         )
     ) from exc
 
+try:  # pragma: no cover - defensive guard for runtime import errors
+    from extras.AFC_utils import add_filament_switch
+except Exception as exc:  # pragma: no cover - defensive guard
+    raise ConfigError(
+        "Error when trying to import AFC_utils\n{trace}".format(
+            trace=traceback.format_exc()
+        )
+    ) from exc
+
 
 SYNC_INTERVAL = 2.0
+
+
+def _normalize_ams_tool_pin(config) -> str | None:
+    """Ensure the assigned extruder uses the virtual bypass chip."""
+
+    try:
+        extruder_name = config.get("extruder", None, note_valid=False)
+    except Exception:
+        extruder_name = None
+
+    if not extruder_name:
+        return None
+
+    parser = getattr(config, "fileconfig", None)
+    if parser is None:
+        return None
+
+    section = f"AFC_extruder {extruder_name}"
+    if not parser.has_section(section):
+        return None
+
+    try:
+        raw_value = parser.get(section, "pin_tool_start")
+    except Exception:
+        return None
+
+    if raw_value is None:
+        return None
+
+    pin_value = raw_value.strip()
+    if not pin_value or pin_value.lower() == "none":
+        return None
+
+    if pin_value.startswith("afc_virtual_bypass:"):
+        base_pin = pin_value.split(":", 1)[1].strip()
+        if base_pin.startswith("AMS_"):
+            return base_pin
+        return None
+
+    if not pin_value.startswith("AMS_"):
+        return None
+
+    parser.set(section, "pin_tool_start", f"afc_virtual_bypass:{pin_value}")
+    return pin_value
 
 
 class afcAMS(afcUnit):
     """AFC unit subclass that synchronises state with OpenAMS."""
 
     def __init__(self, config):
+        initial_virtual_tool_pin = getattr(
+            config, "_afc_ams_virtual_tool_pin", None
+        )
+
         super().__init__(config)
         self.type = "AMS"
 
@@ -48,11 +106,14 @@ class afcAMS(afcUnit):
         # Track previous sensor state to only forward changes
         self._last_lane_states: Dict[str, bool] = {}
         self._last_hub_states: Dict[str, bool] = {}
+        self._virtual_tool_switch_created = False
+        self._cached_virtual_tool_pin: str | None = initial_virtual_tool_pin
         self.oams = None
 
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
         super().handle_connect()
+        self._ensure_virtual_tool_sensor()
 
         # AMS lanes report their state via OpenAMS so default them until the
         # first poll comes back.
@@ -91,6 +152,100 @@ class afcAMS(afcUnit):
             </span>
             """
         ).format(name=self.name)
+
+    def _ensure_virtual_tool_sensor(self):
+        """Create a virtual AMS tool sensor when configured for this unit."""
+
+        if self._virtual_tool_switch_created:
+            return
+
+        base_pin = self._get_virtual_tool_pin()
+        if base_pin is None:
+            return
+
+        try:
+            self.printer.lookup_object(f"filament_switch_sensor {base_pin}")
+        except Exception:
+            sensor_exists = False
+        else:
+            sensor_exists = True
+
+        if sensor_exists:
+            self._virtual_tool_switch_created = True
+            return
+
+        virtual_pin = f"afc_virtual_bypass:{base_pin}"
+
+        try:
+            add_filament_switch(
+                base_pin,
+                virtual_pin,
+                self.printer,
+                show_sensor=self.afc.enable_sensors_in_gui,
+            )
+        except Exception:
+            return
+
+        self._virtual_tool_switch_created = True
+        self.logger.info(
+            f"Registered virtual AMS filament sensor '{base_pin}' using pin {virtual_pin}"
+        )
+
+    def _get_virtual_tool_pin(self) -> str | None:
+        """Return the AMS pin name tied to this unit's extruder, if any."""
+
+        if self._cached_virtual_tool_pin is not None:
+            return self._cached_virtual_tool_pin
+
+        extruder_name = getattr(self, "extruder", None)
+        if not extruder_name:
+            self._cached_virtual_tool_pin = None
+            return None
+
+        cfg_dir = getattr(self.afc, "cfgloc", None)
+        if not cfg_dir:
+            self._cached_virtual_tool_pin = None
+            return None
+
+        cfg_path = Path(cfg_dir) / "AFC-hardware.cfg"
+        if not cfg_path.exists():
+            self._cached_virtual_tool_pin = None
+            return None
+
+        parser = ConfigParser()
+        parser.optionxform = str
+
+        try:
+            with cfg_path.open("r", encoding="utf-8") as cfg_file:
+                parser.read_file(cfg_file)
+        except Exception:
+            self._cached_virtual_tool_pin = None
+            return None
+
+        section = f"AFC_extruder {extruder_name}"
+        if not parser.has_section(section):
+            self._cached_virtual_tool_pin = None
+            return None
+
+        tool_pin = parser.get(section, "pin_tool_start", fallback=None)
+        if tool_pin is None:
+            self._cached_virtual_tool_pin = None
+            return None
+
+        tool_pin = tool_pin.strip()
+        if not tool_pin or tool_pin.lower() == "none":
+            self._cached_virtual_tool_pin = None
+            return None
+
+        if tool_pin.startswith("afc_virtual_bypass:"):
+            tool_pin = tool_pin.split(":", 1)[1].strip()
+
+        if not tool_pin.startswith("AMS_"):
+            self._cached_virtual_tool_pin = None
+            return None
+
+        self._cached_virtual_tool_pin = tool_pin
+        return tool_pin
 
     def system_Test(self, cur_lane, delay, assignTcmd, enable_movement):
         """Validate AMS lane state without attempting any motion."""
@@ -249,4 +404,7 @@ class afcAMS(afcUnit):
 
 
 def load_config_prefix(config):
+    base_pin = _normalize_ams_tool_pin(config)
+    if base_pin is not None:
+        setattr(config, "_afc_ams_virtual_tool_pin", base_pin)
     return afcAMS(config)
