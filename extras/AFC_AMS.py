@@ -123,7 +123,7 @@ except Exception as exc:  # pragma: no cover - defensive guard
     ) from exc
 
 try:  # pragma: no cover - defensive guard for runtime import errors
-    from extras.AFC_lane import AFCLaneState
+    from extras.AFC_lane import AFCLane, AFCLaneState
     from extras.AFC_utils import add_filament_switch
     import extras.AFC_extruder as _afc_extruder_mod
 except Exception as exc:  # pragma: no cover - defensive guard
@@ -132,6 +132,9 @@ except Exception as exc:  # pragma: no cover - defensive guard
             trace=traceback.format_exc()
         )
     ) from exc
+
+
+_ORIGINAL_LANE_PRE_SENSOR = getattr(AFCLane, "get_toolhead_pre_sensor_state", None)
 
 
 SYNC_INTERVAL = 2.0
@@ -374,6 +377,54 @@ class afcAMS(afcUnit):
 
         return lane_extruder == extruder_name
 
+    def _lane_reports_tool_filament(self, lane) -> Optional[bool]:
+        """Return the best-known tool filament state for a lane."""
+
+        if lane is None:
+            return None
+
+        state = getattr(lane, "tool_loaded", None)
+        if state is None:
+            state = getattr(lane, "load_state", None)
+
+        if state is None:
+            status = getattr(lane, "status", None)
+            if status in (AFCLaneState.TOOLED, AFCLaneState.LOADED):
+                state = True
+
+        if not state:
+            extruder = getattr(lane, "extruder_obj", None)
+            lane_name = getattr(lane, "name", None)
+            if extruder is not None and lane_name and getattr(extruder, "lane_loaded", None) == lane_name:
+                state = True
+
+        if not state:
+            oams = getattr(self, "oams", None)
+            lane_index = getattr(lane, "index", None)
+            current_spool = getattr(oams, "current_spool", None)
+            if (
+                oams is not None
+                and lane_index is not None
+                and current_spool is not None
+                and isinstance(current_spool, int)
+            ):
+                try:
+                    lane_offset = int(lane_index) - 1
+                except Exception:
+                    lane_offset = None
+                if lane_offset is not None and lane_offset == current_spool:
+                    state = True
+
+        if state is None:
+            lane_name = getattr(lane, "name", None)
+            if lane_name is not None and lane_name in self._last_lane_states:
+                state = self._last_lane_states[lane_name]
+
+        if state is None:
+            return None
+
+        return bool(state)
+
     def _set_virtual_tool_sensor_state(
         self, filament_present: bool, eventtime: float
     ) -> None:
@@ -398,7 +449,7 @@ class afcAMS(afcUnit):
         if extruder is not None:
             extruder.tool_start_state = filament_present
 
-        self._last_virtual_tool_state = filament_present
+        self._last_virtual_tool_state = bool(filament_present)
 
     def lane_tool_loaded(self, lane):
         """Update the virtual tool sensor when a lane loads into the tool."""
@@ -428,7 +479,10 @@ class afcAMS(afcUnit):
         if not self._lane_matches_extruder(lane):
             return
 
-        desired_state = bool(getattr(lane, "load_state", False))
+        desired_state = self._lane_reports_tool_filament(lane)
+        if desired_state is None:
+            desired_state = False
+
         if desired_state == self._last_virtual_tool_state:
             return
 
@@ -447,12 +501,12 @@ class afcAMS(afcUnit):
         if lane_name:
             lane = self.lanes.get(lane_name)
             if lane is not None and self._lane_matches_extruder(lane):
-                desired_state = bool(getattr(lane, "load_state", False))
+                desired_state = self._lane_reports_tool_filament(lane)
 
         if desired_state is None:
             for lane in self.lanes.values():
                 if self._lane_matches_extruder(lane):
-                    desired_state = bool(getattr(lane, "load_state", False))
+                    desired_state = self._lane_reports_tool_filament(lane)
                     break
 
         if desired_state is None or desired_state == self._last_virtual_tool_state:
@@ -754,3 +808,63 @@ class afcAMS(afcUnit):
 
 def load_config_prefix(config):
     return afcAMS(config)
+
+
+def _patch_lane_pre_sensor_for_ams() -> None:
+    """Patch AFCLane.get_toolhead_pre_sensor_state for AMS virtual sensors."""
+
+    if _ORIGINAL_LANE_PRE_SENSOR is None:
+        return
+
+    if getattr(AFCLane, "_ams_pre_sensor_patched", False):
+        return
+
+    def _ams_get_toolhead_pre_sensor_state(self, *args, **kwargs):
+        unit = getattr(self, "unit_obj", None)
+        if not isinstance(unit, afcAMS):
+            return _ORIGINAL_LANE_PRE_SENSOR(self, *args, **kwargs)
+
+        reactor = getattr(unit, "reactor", None)
+        eventtime = None
+        if reactor is not None:
+            try:
+                eventtime = reactor.monotonic()
+            except Exception:
+                eventtime = None
+
+        if eventtime is not None:
+            try:
+                unit._sync_event(eventtime)
+            except Exception:
+                pass
+        else:
+            eventtime = 0.0
+
+        try:
+            unit._sync_virtual_tool_sensor(eventtime, self.name)
+        except Exception:
+            pass
+
+        result = _ORIGINAL_LANE_PRE_SENSOR(self, *args, **kwargs)
+
+        if result:
+            return bool(result)
+
+        desired_state = unit._lane_reports_tool_filament(self)
+        if desired_state is None:
+            desired_state = False
+
+        if desired_state:
+            try:
+                unit._set_virtual_tool_sensor_state(desired_state, eventtime)
+            except Exception:
+                pass
+            return True
+
+        return bool(result)
+
+    AFCLane.get_toolhead_pre_sensor_state = _ams_get_toolhead_pre_sensor_state
+    AFCLane._ams_pre_sensor_patched = True
+
+
+_patch_lane_pre_sensor_for_ams()
