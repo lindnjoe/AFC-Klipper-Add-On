@@ -1959,6 +1959,11 @@ class afc:
         else:
             extruder = self.toolhead.get_extruder()
 
+        if deadband is None and extruder is not None:
+            extruder_deadband = getattr(extruder, "deadband", None)
+            if extruder_deadband is not None and extruder_deadband > 0:
+                deadband = extruder_deadband
+
         pheaters = self.printer.lookup_object('heaters')
         heater = extruder.get_heater()
         pheaters.set_temperature(heater, temp, False)  # Always set temp, don't wait yet
