@@ -2029,8 +2029,8 @@ class afc:
         if tolerance is None or target_temp <= 0:
             return
 
-        min_temp = target_temp - tolerance
-        max_temp = target_temp + tolerance
+        min_temp = target_temp - tolerance/2
+        max_temp = target_temp + tolerance/2
 
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
