@@ -187,12 +187,15 @@ def _patch_extruder_for_virtual_ams() -> None:
         enable_runout = getattr(self, "enable_runout", False)
         runout_cb = getattr(self, "handle_start_runout", None)
 
+        # OpenAMS is responsible for dispatching runout events for AMS tool
+        # start sensors, so keep the virtual Klipper sensor purely for state
+        # reporting and disable the local runout callback wiring.
         virtual = _VirtualFilamentSensor(
             self.printer,
             normalized,
             show_in_gui=show_sensor,
-            runout_cb=runout_cb,
-            enable_runout=enable_runout,
+            runout_cb=None,
+            enable_runout=False,
         )
 
         self.tool_start = pin_value
@@ -354,6 +357,11 @@ class afcAMS(afcUnit):
         helper = getattr(sensor, "runout_helper", None)
         if helper is None:
             return False
+
+        # Ensure OpenAMS owns the runout handling by disabling any
+        # automatically wired callbacks on the virtual sensor helper.
+        helper.runout_callback = None
+        helper.sensor_enabled = False
 
         filament_present = getattr(helper, "filament_present", None)
         if filament_present is not None:
@@ -938,3 +946,4 @@ def _patch_lane_pre_sensor_for_ams() -> None:
 
 
 _patch_lane_pre_sensor_for_ams()
+
