@@ -47,6 +47,8 @@ class AFCLaneState:
     CALIBRATING      = "Calibrating"
     INFINITE_RUNOUT  = "Infinite Runout"
 
+VALID_DIRECT_HUB = ['direct', 'direct_load']
+
 class AFCLane:
     UPDATE_WEIGHT_DELAY = 10.0
     def __init__(self, config):
@@ -487,13 +489,14 @@ class AFCLane:
                 return self.short_moves_speed, self.short_moves_accel
             else:
                 return self.dist_hub_move_speed, self.dist_hub_move_accel
+
     def is_direct_hub(self):
         """
         Helper function to see if hub for lane is 'direct' or 'direct_load' hub.
 
         :return boolean: True if hub for lane is 'direct' or 'direct_load'
         """
-        return self.hub and 'direct' in self.hub
+        return self.hub in VALID_DIRECT_HUB
 
     def select_lane(self):
         """
@@ -610,7 +613,7 @@ class AFCLane:
 
     def load_callback(self, eventtime, state):
         self.load_state = state
-        if self.printer.state_message == 'Printer is ready' and True == self._afc_prep_done and self.unit_obj.type == "HTLF":
+        if self.printer.state_message == 'Printer is ready' and self.unit_obj.type == "HTLF":
             self.prep_state = state
 
     def handle_load_runout(self, eventtime, load_state):
@@ -630,17 +633,20 @@ class AFCLane:
         except:
             self.load_debounce_button._old_note_filament_present(eventtime, load_state)
 
-        if self.printer.state_message == 'Printer is ready' and self.unit_obj.type == "HTLF":
-            if load_state and not self.tool_loaded:
+        if (self.printer.state_message == 'Printer is ready' and
+            self.unit_obj.type == "HTLF" and
+            True == self._afc_prep_done):
+            if load_state:
                 self.status = AFCLaneState.LOADED
                 self.unit_obj.lane_loaded(self)
                 self.afc.spool._set_values(self)
                 # Check if user wants to get TD-1 data when loading
-                self._prep_capture_td1()
+                if not self.tool_loaded:
+                    self._prep_capture_td1()
+
                 if self.hub == 'direct_load':
                     self.afc.afcDeltaTime.set_start_time()
                     self.afc.TOOL_LOAD(self)
-                    self.material = self.afc.default_material_type
             else:
                 # Don't run if user disabled sensor in gui
                 if not self.fila_load.runout_helper.sensor_enabled and self.afc.function.is_printing():
@@ -671,7 +677,11 @@ class AFCLane:
         if self.prep_active:
             return
 
-        if self.printer.state_message == 'Printer is ready' and self.is_direct_hub() and not self.afc.function.is_homed():
+        if (self.printer.state_message == 'Printer is ready' and
+            True == self._afc_prep_done and
+            self.is_direct_hub() and
+            not self.afc.auto_home and
+            not self.afc.function.is_homed()):
             self.afc.error.AFC_error("Please home printer before directly loading to toolhead", False)
             return False
 
