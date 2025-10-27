@@ -72,6 +72,14 @@ printf "
               \e[49m                 \e[49;38;5;53m▀▀\e[49m     \e[49;38;5;53m▀▀▀\e[49m \e[49;38;5;53m▀▀▀\e[49m  \e[49;38;5;53m▀▀▀\e[49m \e[49;38;5;53m▀▀▀\e[49m     \e[49;38;5;53m▀▀▀\e[49m                \e[m
 ";
 printf "                                    NightOwl by mjonuschat\n"
+    elif [ "$installation_type" == "AMS" ]; then
+printf "                 █████╗ ███╗   ███╗███████╗\n"
+printf "                ██╔══██╗████╗ ████║██╔════╝\n"
+printf "                ███████║██╔████╔██║█████╗  \n"
+printf "                ██╔══██║██║╚██╔╝██║██╔══╝  \n"
+printf "                ██║  ██║██║ ╚═╝ ██║███████╗\n"
+printf "                ╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝\n"
+printf "\n                          AMS Integration by Armored Turtle\n"
     elif [ "$installation_type" == "HTLF" ]; then
 printf "
                           \e[49m         \e[38;5;0;49m▄▄▄▄\e[38;5;232;48;5;0m▄▄▄▄▄▄▄▄\e[38;5;0;49m▄▄▄\e[49m             \e[m
@@ -140,6 +148,11 @@ fi
       elif [ "$installation_type" == "NightOwl" ]; then
         boxturtle_name="NightOwl_2"
         printf "1. NightOwl Name: %s \n" "$boxturtle_name"
+      elif [ "$installation_type" == "AMS" ]; then
+        if [ "$turtle_renamed" != "True" ]; then
+          boxturtle_name="AMS_2"
+        fi
+        printf "1. AMS Name: %s \n" "$boxturtle_name"
       elif [ "$installation_type" == "HTLF" ]; then
         if [ "$turtle_renamed" != "True" ]; then
           boxturtle_name="HTLF_1"
@@ -179,6 +192,10 @@ fi
 
         # Set the installation type to the current option
         installation_type="${installation_options[$counter]}"
+
+        if [ "$installation_type" == "AMS" ] && [ "$turtle_renamed" != "True" ]; then
+          boxturtle_name="AMS_2"
+        fi
 
         # Update the message
         message="Installation Type: $installation_type"

@@ -6,11 +6,26 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 name_unit() {
-  while true; do
-    read -p "Enter name for unit (Default: Turtle_1): " boxturtle_name
-    boxturtle_name=${boxturtle_name:-Turtle_1}
+  local prompt default_name
+  if [ "$installation_type" == "AMS" ]; then
+    prompt="Enter name for unit (Default: AMS_1): "
+    default_name="AMS_1"
+  else
+    prompt="Enter name for unit (Default: Turtle_1): "
+    default_name="Turtle_1"
+  fi
 
-    if [[ "$boxturtle_name" =~ ^[a-zA-Z0-9_-]+$ ]] && [[ ${#boxturtle_name} -le 24 ]]; then
+  while true; do
+    read -p "$prompt" boxturtle_name
+    boxturtle_name=${boxturtle_name:-$default_name}
+
+    if [ "$installation_type" == "AMS" ]; then
+      if [[ "$boxturtle_name" =~ ^AMS_[A-Za-z0-9_-]+$ ]] && [[ ${#boxturtle_name} -le 24 ]]; then
+        break
+      else
+        echo "Invalid input. AMS unit names must start with AMS_ and be no more than 24 characters long."
+      fi
+    elif [[ "$boxturtle_name" =~ ^[a-zA-Z0-9_-]+$ ]] && [[ ${#boxturtle_name} -le 24 ]]; then
       break
     else
       echo "Invalid input. The unit name must consist of only a-z, A-Z, 0-9, -, and _ and be no more than 24 characters long."
@@ -41,6 +56,17 @@ name_additional_unit() {
         break
       else
         echo "Invalid input. The unit name must consist of only a-z, A-Z, 0-9, -, and _ and be no more than 24 characters long."
+      fi
+    done
+  elif [ "$installation_type" == "AMS" ]; then
+    while true; do
+      read -p "Enter name for unit (Default: AMS_2): " boxturtle_name
+      boxturtle_name=${boxturtle_name:-AMS_2}
+
+      if [[ "$boxturtle_name" =~ ^AMS_[A-Za-z0-9_-]+$ ]] && [[ ${#boxturtle_name} -le 24 ]]; then
+        break
+      else
+        echo "Invalid input. AMS unit names must start with AMS_ and be no more than 24 characters long."
       fi
     done
   elif [ "$installation_type" == "QuattroBox" ]; then
@@ -117,6 +143,9 @@ install_additional_unit() {
     cp "${afc_path}"/config/mcu/AFC_Lite.cfg "${afc_config_dir}"/mcu/AFC_"${boxturtle_name}"_mcu.cfg
     sed -i "s/include mcu\/AFC_Lite.cfg/include mcu\/AFC_${boxturtle_name}_mcu.cfg/g" "${afc_config_dir}"/AFC_"${boxturtle_name}".cfg
     # If we are installing a NightOwl, then copy these files over.
+  elif [ "$installation_type" == "AMS" ]; then
+    cp "${afc_path}/templates/AFC_AMS1.cfg" "${afc_config_dir}/AFC_${boxturtle_name}.cfg"
+    sed -i "s/AMS_1/${boxturtle_name}/g" "${afc_config_dir}/AFC_${boxturtle_name}.cfg"
   elif [ "$installation_type" == "NightOwl" ]; then
     cp "${afc_path}/templates/AFC_NightOwl_1.cfg" "${afc_config_dir}/AFC_${boxturtle_name}.cfg"
   elif [ "$installation_type" == "HTLF" ]; then
