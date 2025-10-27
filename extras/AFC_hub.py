@@ -172,3 +172,4 @@ class afc_hub:
 
 def load_config_prefix(config):
     return afc_hub(config)
+
