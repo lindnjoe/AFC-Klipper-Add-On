@@ -543,8 +543,6 @@ class afcAMS(afcUnit):
         if new_state and not force:
             if canonical_lane and self._lane_tool_latches.get(canonical_lane) is False:
                 return
-            if lane_obj is not None and self._lane_tool_latches_by_lane.get(lane_obj) is False:
-                return
 
         sensor = self._virtual_tool_sensor
         helper = getattr(sensor, "runout_helper", None)
@@ -567,10 +565,6 @@ class afcAMS(afcUnit):
         if canonical_lane:
             self._lane_tool_latches[canonical_lane] = new_state
             self._lane_feed_activity[canonical_lane] = new_state
-
-        if lane_obj is not None:
-            self._lane_tool_latches_by_lane[lane_obj] = new_state
-            self._lane_feed_activity_by_lane[lane_obj] = new_state
 
     def lane_tool_loaded(self, lane):
         """Update the virtual tool sensor when a lane loads into the tool."""
@@ -1127,8 +1121,6 @@ class afcAMS(afcUnit):
                         canonical_lane = self._canonical_lane_name(active_lane_name)
                         if canonical_lane:
                             self._lane_feed_activity[canonical_lane] = True
-                        if active_lane_obj is not None:
-                            self._lane_feed_activity_by_lane[active_lane_obj] = True
                 self._last_encoder_clicks = encoder_clicks
             elif encoder_clicks is None:
                 self._last_encoder_clicks = None
@@ -1356,10 +1348,6 @@ class afcAMS(afcUnit):
                     if canonical_lane:
                         force_update = (
                             self._lane_tool_latches.get(canonical_lane) is not False
-                        )
-                    if force_update and lane in self._lane_tool_latches_by_lane:
-                        force_update = (
-                            self._lane_tool_latches_by_lane.get(lane) is not False
                         )
                     self._set_virtual_tool_sensor_state(
                         True,
@@ -1984,5 +1972,7 @@ def _patch_lane_pre_sensor_for_ams() -> None:
     AFCLane.get_toolhead_pre_sensor_state = _ams_get_toolhead_pre_sensor_state
     AFCLane._ams_pre_sensor_patched = True
 
+
+_patch_lane_pre_sensor_for_ams()
 
 _patch_lane_pre_sensor_for_ams()
