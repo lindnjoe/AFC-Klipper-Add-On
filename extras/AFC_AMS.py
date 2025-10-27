@@ -134,7 +134,55 @@ except Exception as exc:  # pragma: no cover - defensive guard
     ) from exc
 
 
+try:  # pragma: no cover - optional at config parse time
+    from extras.ams_integration import AMSHardwareService, AMSRunoutCoordinator
+except Exception:  # pragma: no cover - integration may be absent during import
+    AMSHardwareService = None
+    AMSRunoutCoordinator = None
+
+
 _ORIGINAL_LANE_PRE_SENSOR = getattr(AFCLane, "get_toolhead_pre_sensor_state", None)
+
+
+def _normalize_extruder_name(name: Optional[str]) -> Optional[str]:
+    """Return a case-insensitive token for comparing extruder aliases."""
+
+    if not name or not isinstance(name, str):
+        return None
+
+    normalized = name.strip()
+    if not normalized:
+        return None
+
+    lowered = normalized.lower()
+    if lowered.startswith("ams_"):
+        lowered = lowered[4:]
+
+    return lowered or None
+
+
+def _normalize_ams_pin_value(pin_value) -> Optional[str]:
+    """Return the cleaned AMS_* token stripped of comments and modifiers."""
+
+    if not isinstance(pin_value, str):
+        return None
+
+    cleaned = pin_value.strip()
+    if not cleaned:
+        return None
+
+    # Remove any inline comments commonly used to preserve original pins.
+    for comment_char in ("#", ";"):
+        idx = cleaned.find(comment_char)
+        if idx != -1:
+            cleaned = cleaned[:idx].strip()
+    if not cleaned:
+        return None
+
+    while cleaned and cleaned[0] in "!^":
+        cleaned = cleaned[1:]
+
+    return cleaned or None
 
 
 SYNC_INTERVAL = 2.0
@@ -167,14 +215,12 @@ def _patch_extruder_for_virtual_ams() -> None:
         except Exception:
             pin_value = None
 
-        normalized = pin_value.strip() if isinstance(pin_value, str) else None
+        normalized = _normalize_ams_pin_value(pin_value)
         proxy_config = config
 
         if normalized:
-            stripped = normalized.lstrip("!^")
-            if stripped.upper().startswith("AMS_"):
+            if normalized.upper().startswith("AMS_"):
                 proxy_config = _ProxyConfig(config)
-                normalized = stripped
             else:
                 normalized = None
 
@@ -186,6 +232,8 @@ def _patch_extruder_for_virtual_ams() -> None:
         show_sensor = getattr(self, "enable_sensors_in_gui", True)
         enable_runout = getattr(self, "enable_runout", False)
         runout_cb = getattr(self, "handle_start_runout", None)
+
+        setattr(self, "_ams_virtual_tool_name", normalized)
 
         # OpenAMS is responsible for dispatching runout events for AMS tool
         # start sensors, so keep the virtual Klipper sensor purely for state
@@ -233,9 +281,19 @@ class afcAMS(afcUnit):
         self._virtual_tool_sensor = None
         self._last_virtual_tool_state: Optional[bool] = None
         self._lane_tool_latches: Dict[str, bool] = {}
+        self._lane_tool_latches_by_lane: Dict[object, bool] = {}
         self._lane_feed_activity: Dict[str, bool] = {}
+        self._lane_feed_activity_by_lane: Dict[object, bool] = {}
         self._last_encoder_clicks: Optional[int] = None
         self.oams = None
+        self.hardware_service = None
+
+        if AMSRunoutCoordinator is not None:
+            self.hardware_service = AMSRunoutCoordinator.register_afc_unit(self)
+        elif AMSHardwareService is not None:
+            self.hardware_service = AMSHardwareService.for_printer(
+                self.printer, self.oams_name, self.logger
+            )
 
         self._register_sync_dispatcher()
 
@@ -294,17 +352,14 @@ class afcAMS(afcUnit):
             return False
 
         tool_pin = getattr(extruder, "tool_start", None)
-        if not isinstance(tool_pin, str):
-            return False
+        normalized = _normalize_ams_pin_value(tool_pin)
+        if normalized is None:
+            normalized = getattr(extruder, "_ams_virtual_tool_name", None)
 
-        normalized = tool_pin.strip()
         if not normalized or normalized.lower() in {"buffer", "none", "unknown"}:
             return False
 
         original_pin = tool_pin
-        while normalized and normalized[0] in "!^":
-            normalized = normalized[1:]
-
         if not normalized.upper().startswith("AMS_"):
             return False
 
@@ -372,21 +427,83 @@ class afcAMS(afcUnit):
 
         extruder.tool_start = original_pin
         self._virtual_tool_sensor = sensor
+
+        # Maintain legacy filament sensor aliases so existing macros keep
+        # functioning even though the physical switch has been replaced by an
+        # OpenAMS-provided virtual sensor.
+        alias_token = None
+        try:
+            alias_token = f"{extruder.name}_tool_start"
+        except Exception:
+            alias_token = None
+
+        if alias_token:
+            alias_object = f"filament_switch_sensor {alias_token}"
+            objects = getattr(self.printer, "objects", None)
+            if isinstance(objects, dict):
+                previous = objects.get(alias_object)
+                if previous is None or previous is sensor:
+                    objects[alias_object] = sensor
+
+            try:
+                gcode = self.printer.lookup_object("gcode")
+            except Exception:
+                gcode = None
+
+            if gcode is not None:
+                for command, handler, desc in (
+                    (
+                        "QUERY_FILAMENT_SENSOR",
+                        sensor.cmd_QUERY_FILAMENT_SENSOR,
+                        sensor.QUERY_HELP,
+                    ),
+                    (
+                        "SET_FILAMENT_SENSOR",
+                        sensor.cmd_SET_FILAMENT_SENSOR,
+                        sensor.SET_HELP,
+                    ),
+                ):
+                    try:
+                        gcode.register_mux_command(
+                            command,
+                            "SENSOR",
+                            alias_token,
+                            handler,
+                            desc=desc,
+                        )
+                    except Exception:
+                        pass
+
         return True
 
     def _lane_matches_extruder(self, lane) -> bool:
         """Return True if the lane is mapped to this AMS unit's extruder."""
 
         extruder_name = getattr(self, "extruder", None)
+        unit_extruder_obj = getattr(self, "extruder_obj", None)
         if not extruder_name:
             return False
 
         lane_extruder = getattr(lane, "extruder_name", None)
         if lane_extruder is None:
-            extruder_obj = getattr(lane, "extruder_obj", None)
-            lane_extruder = getattr(extruder_obj, "name", None)
+            lane_extruder_obj = getattr(lane, "extruder_obj", None)
+            lane_extruder = getattr(lane_extruder_obj, "name", None)
+        else:
+            lane_extruder_obj = getattr(lane, "extruder_obj", None)
 
-        return lane_extruder == extruder_name
+        if unit_extruder_obj is not None and lane_extruder_obj is unit_extruder_obj:
+            return True
+
+        if lane_extruder == extruder_name:
+            return True
+
+        normalized_lane = _normalize_extruder_name(lane_extruder)
+        normalized_unit = _normalize_extruder_name(extruder_name)
+
+        if normalized_lane and normalized_unit and normalized_lane == normalized_unit:
+            return True
+
+        return False
 
     def _lane_reports_tool_filament(self, lane) -> Optional[bool]:
         """Return the best-known tool filament state for a lane."""
@@ -394,66 +511,38 @@ class afcAMS(afcUnit):
         if lane is None:
             return None
 
-        lane_name = getattr(lane, "name", None)
-        status = getattr(lane, "status", None)
-        extruder = getattr(lane, "extruder_obj", None)
-        extruder_lane = getattr(extruder, "lane_loaded", None)
-        latched = self._lane_tool_latches.get(lane_name) if lane_name else None
-        feed_active = self._lane_feed_activity.get(lane_name) if lane_name else None
+        load_state = getattr(lane, "load_state", None)
+        if load_state is not None:
+            return bool(load_state)
 
         if getattr(lane, "tool_loaded", False):
-            return True
-
-        positive_states = {
-            AFCLaneState.TOOLED,
-            AFCLaneState.TOOL_LOADED,
-        }
-
-        if status in positive_states:
-            return True
-
-        if feed_active and status == AFCLaneState.TOOL_LOADING:
-            if getattr(lane, "load_state", False):
-                return True
-
-        if latched:
-            if not extruder_lane or extruder_lane == lane_name:
-                return True
-
-        negative_states = {
-            AFCLaneState.NONE,
-            AFCLaneState.ERROR,
-            AFCLaneState.HUB_LOADING,
-            AFCLaneState.EJECTING,
-            AFCLaneState.CALIBRATING,
-            AFCLaneState.INFINITE_RUNOUT,
-            AFCLaneState.TOOL_UNLOADING,
-        }
-
-        if status in negative_states:
-            if lane_name:
-                self._lane_feed_activity[lane_name] = False
-            return False
-
-        if extruder_lane and lane_name and extruder_lane != lane_name:
-            self._lane_feed_activity[lane_name] = False
-            return False
-
-        if latched is False:
-            return False
-
-        if feed_active and status == AFCLaneState.LOADED:
             return True
 
         return None
 
     def _set_virtual_tool_sensor_state(
-        self, filament_present: bool, eventtime: float, lane_name: Optional[str] = None
+        self,
+        filament_present: bool,
+        eventtime: float,
+        lane_name: Optional[str] = None,
+        *,
+        force: bool = False,
+        lane_obj=None,
     ) -> None:
         """Update the cached virtual sensor and extruder state."""
 
         if not self._ensure_virtual_tool_sensor():
             return
+
+        new_state = bool(filament_present)
+
+        canonical_lane = self._canonical_lane_name(lane_name)
+        if canonical_lane is None and lane_obj is not None:
+            canonical_lane = self._canonical_lane_name(getattr(lane_obj, "name", None))
+
+        if new_state and not force:
+            if canonical_lane and self._lane_tool_latches.get(canonical_lane) is False:
+                return
 
         sensor = self._virtual_tool_sensor
         helper = getattr(sensor, "runout_helper", None)
@@ -471,14 +560,11 @@ class afcAMS(afcUnit):
         if extruder is not None:
             extruder.tool_start_state = filament_present
 
-        self._last_virtual_tool_state = bool(filament_present)
+        self._last_virtual_tool_state = new_state
 
-        if lane_name:
-            self._lane_tool_latches[lane_name] = bool(filament_present)
-            if filament_present:
-                self._lane_feed_activity[lane_name] = True
-            else:
-                self._lane_feed_activity[lane_name] = False
+        if canonical_lane:
+            self._lane_tool_latches[canonical_lane] = new_state
+            self._lane_feed_activity[canonical_lane] = new_state
 
     def lane_tool_loaded(self, lane):
         """Update the virtual tool sensor when a lane loads into the tool."""
@@ -490,7 +576,9 @@ class afcAMS(afcUnit):
 
         eventtime = self.reactor.monotonic()
         lane_name = getattr(lane, "name", None)
-        self._set_virtual_tool_sensor_state(True, eventtime, lane_name)
+        self._set_virtual_tool_sensor_state(
+            True, eventtime, lane_name, force=True, lane_obj=lane
+        )
 
     def lane_tool_unloaded(self, lane):
         """Update the virtual tool sensor when a lane unloads from the tool."""
@@ -502,7 +590,9 @@ class afcAMS(afcUnit):
 
         eventtime = self.reactor.monotonic()
         lane_name = getattr(lane, "name", None)
-        self._set_virtual_tool_sensor_state(False, eventtime, lane_name)
+        self._set_virtual_tool_sensor_state(
+            False, eventtime, lane_name, lane_obj=lane
+        )
 
     def _mirror_lane_to_virtual_sensor(self, lane, eventtime: float) -> None:
         """Mirror a lane's load state into the AMS virtual tool sensor."""
@@ -518,7 +608,9 @@ class afcAMS(afcUnit):
             return
 
         lane_name = getattr(lane, "name", None)
-        self._set_virtual_tool_sensor_state(desired_state, eventtime, lane_name)
+        self._set_virtual_tool_sensor_state(
+            desired_state, eventtime, lane_name, lane_obj=lane
+        )
 
     def _sync_virtual_tool_sensor(
         self, eventtime: float, lane_name: Optional[str] = None
@@ -530,6 +622,7 @@ class afcAMS(afcUnit):
 
         desired_state: Optional[bool] = None
         desired_lane: Optional[str] = None
+        desired_lane_obj = None
 
         if lane_name:
             lane = self.lanes.get(lane_name)
@@ -538,6 +631,7 @@ class afcAMS(afcUnit):
                 if result is not None:
                     desired_state = result
                     desired_lane = getattr(lane, "name", None)
+                    desired_lane_obj = lane
 
         if desired_state is None:
             pending_false = None
@@ -553,18 +647,21 @@ class afcAMS(afcUnit):
                 if result:
                     desired_state = True
                     desired_lane = lane_id
+                    desired_lane_obj = lane
                     break
 
                 if pending_false is None:
-                    pending_false = (False, lane_id)
+                    pending_false = (False, lane_id, lane)
 
             if desired_state is None and pending_false is not None:
-                desired_state, desired_lane = pending_false
+                desired_state, desired_lane, desired_lane_obj = pending_false
 
         if desired_state is None or desired_state == self._last_virtual_tool_state:
             return
 
-        self._set_virtual_tool_sensor_state(desired_state, eventtime, desired_lane)
+        self._set_virtual_tool_sensor_state(
+            desired_state, eventtime, desired_lane, lane_obj=desired_lane_obj
+        )
 
     cmd_SYNC_TOOL_SENSOR_help = (
         "Synchronise the AMS virtual tool-start sensor with the assigned lane."
@@ -591,6 +688,23 @@ class afcAMS(afcUnit):
         parts = normalized.replace("_", " ").replace("-", " ").split()
         return any(part.lower() == self.name.lower() for part in parts)
 
+    def _normalize_group_name(self, group: Optional[str]) -> Optional[str]:
+        """Return a trimmed filament group token for alias comparison."""
+
+        if not group or not isinstance(group, str):
+            return None
+
+        normalized = group.strip()
+        if not normalized:
+            return None
+
+        # Filament group identifiers are often prefixed (e.g. "Group T4"), so
+        # prefer the final token which corresponds to the configured AFC map.
+        if " " in normalized:
+            normalized = normalized.split()[-1]
+
+        return normalized
+
     def _resolve_lane_alias(self, identifier: Optional[str]) -> Optional[str]:
         """Map common aliases (fps names, case variants) to lane objects."""
 
@@ -606,6 +720,7 @@ class afcAMS(afcUnit):
             return lane.name
 
         lowered = lookup.lower()
+        normalized_lookup = self._normalize_group_name(lookup)
         for lane in self.lanes.values():
             if lane.name.lower() == lowered:
                 return lane.name
@@ -614,7 +729,31 @@ class afcAMS(afcUnit):
             if isinstance(lane_map, str) and lane_map.lower() == lowered:
                 return lane.name
 
+            canonical_map = self._normalize_group_name(lane_map)
+            if (
+                canonical_map is not None
+                and normalized_lookup is not None
+                and canonical_map.lower() == normalized_lookup.lower()
+            ):
+                return lane.name
+
         return None
+
+    def _canonical_lane_name(self, lane_name: Optional[str]) -> Optional[str]:
+        """Return a consistent lane identifier for latch/feed tracking."""
+
+        if lane_name is None:
+            return None
+
+        lookup = lane_name.strip() if isinstance(lane_name, str) else str(lane_name).strip()
+        if not lookup:
+            return None
+
+        resolved = self._resolve_lane_alias(lookup)
+        if resolved:
+            return resolved
+
+        return lookup
 
     def cmd_SYNC_TOOL_SENSOR(self, gcmd):
         lane_name = gcmd.get("LANE", None)
@@ -768,7 +907,20 @@ class afcAMS(afcUnit):
     def handle_ready(self):
         """Resolve the OpenAMS object once Klippy is ready."""
 
-        self.oams = self.printer.lookup_object("oams " + self.oams_name, None)
+        if self.hardware_service is not None:
+            self.oams = self.hardware_service.resolve_controller()
+        else:
+            self.oams = self.printer.lookup_object("oams " + self.oams_name, None)
+            if AMSHardwareService is not None and self.oams is not None:
+                try:
+                    self.hardware_service = AMSHardwareService.for_printer(
+                        self.printer, self.oams_name, self.logger
+                    )
+                    self.hardware_service.attach_controller(self.oams)
+                except Exception:
+                    self.logger.exception(
+                        "Failed to attach AMSHardwareService for %s", self.oams_name
+                    )
         self.reactor.update_timer(self.timer, self.reactor.NOW)
 
     def _update_shared_lane(self, lane, lane_val, eventtime):
@@ -812,23 +964,144 @@ class afcAMS(afcUnit):
         lane.afc.save_vars()
         self._last_lane_states[lane.name] = lane_val
 
+    def _apply_lane_sensor_state(self, lane, lane_val, eventtime):
+        """Apply a boolean lane sensor value using existing AFC callbacks."""
+
+        try:
+            share = getattr(lane, "ams_share_prep_load", False)
+        except Exception:
+            share = False
+
+        if share:
+            self._update_shared_lane(lane, lane_val, eventtime)
+            return
+
+        previous = self._last_lane_states.get(getattr(lane, "name", ""))
+
+        if previous is not None and bool(previous) == bool(lane_val):
+            return
+
+        try:
+            lane.load_callback(eventtime, lane_val)
+        except TypeError:
+            lane.load_callback(eventtime, load_state=lane_val)
+        except Exception:
+            self.logger.exception("Failed to update load sensor for lane %s", lane)
+
+        try:
+            lane.prep_callback(eventtime, lane_val)
+        except TypeError:
+            lane.prep_callback(eventtime, prep_state=lane_val)
+        except Exception:
+            self.logger.exception("Failed to update prep sensor for lane %s", lane)
+
+        self._mirror_lane_to_virtual_sensor(lane, eventtime)
+        lane_name = getattr(lane, "name", None)
+        if lane_name:
+            self._last_lane_states[lane_name] = bool(lane_val)
+
+    def _apply_lane_sensor_state(self, lane, lane_val, eventtime):
+        """Apply a boolean lane sensor value using existing AFC callbacks."""
+
+        try:
+            share = getattr(lane, "ams_share_prep_load", False)
+        except Exception:
+            share = False
+
+        if share:
+            self._update_shared_lane(lane, lane_val, eventtime)
+            return
+
+        previous = self._last_lane_states.get(getattr(lane, "name", ""))
+
+        if previous is not None and bool(previous) == bool(lane_val):
+            return
+
+        try:
+            lane.load_callback(eventtime, lane_val)
+        except TypeError:
+            lane.load_callback(eventtime, load_state=lane_val)
+        except Exception:
+            self.logger.exception("Failed to update load sensor for lane %s", lane)
+
+        try:
+            lane.prep_callback(eventtime, lane_val)
+        except TypeError:
+            lane.prep_callback(eventtime, prep_state=lane_val)
+        except Exception:
+            self.logger.exception("Failed to update prep sensor for lane %s", lane)
+
+        self._mirror_lane_to_virtual_sensor(lane, eventtime)
+        lane_name = getattr(lane, "name", None)
+        if lane_name:
+            self._last_lane_states[lane_name] = bool(lane_val)
+
+    def _apply_lane_sensor_state(self, lane, lane_val, eventtime):
+        """Apply a boolean lane sensor value using existing AFC callbacks."""
+
+        try:
+            share = getattr(lane, "ams_share_prep_load", False)
+        except Exception:
+            share = False
+
+        if share:
+            self._update_shared_lane(lane, lane_val, eventtime)
+            return
+
+        previous = self._last_lane_states.get(getattr(lane, "name", ""))
+
+        if previous is not None and bool(previous) == bool(lane_val):
+            return
+
+        try:
+            lane.load_callback(eventtime, lane_val)
+        except TypeError:
+            lane.load_callback(eventtime, load_state=lane_val)
+        except Exception:
+            self.logger.exception("Failed to update load sensor for lane %s", lane)
+
+        try:
+            lane.prep_callback(eventtime, lane_val)
+        except TypeError:
+            lane.prep_callback(eventtime, prep_state=lane_val)
+        except Exception:
+            self.logger.exception("Failed to update prep sensor for lane %s", lane)
+
+        self._mirror_lane_to_virtual_sensor(lane, eventtime)
+        lane_name = getattr(lane, "name", None)
+        if lane_name:
+            self._last_lane_states[lane_name] = bool(lane_val)
+
     def _sync_event(self, eventtime):
         """Poll OpenAMS for state updates and propagate to lanes/hubs."""
 
         try:
-            if self.oams is None:
+            status = None
+            if self.hardware_service is not None:
+                status = self.hardware_service.poll_status()
+                if status is None:
+                    self.oams = self.hardware_service.resolve_controller()
+            elif self.oams is not None:
+                status = {
+                    "encoder_clicks": getattr(self.oams, "encoder_clicks", None),
+                    "f1s_hes_value": getattr(self.oams, "f1s_hes_value", None),
+                    "hub_hes_value": getattr(self.oams, "hub_hes_value", None),
+                }
+
+            if not status:
                 return eventtime + self.interval
 
-            encoder_clicks = getattr(self.oams, "encoder_clicks", None)
+            encoder_clicks = status.get("encoder_clicks")
             try:
                 encoder_clicks = int(encoder_clicks)
             except Exception:
                 encoder_clicks = None
 
-            lane_values = getattr(self.oams, "f1s_hes_value", None)
-            hub_values = getattr(self.oams, "hub_hes_value", None)
+            lane_values = status.get("f1s_hes_value")
+            hub_values = status.get("hub_hes_value")
 
             active_lane_name = None
+            active_lane_obj = None
             if encoder_clicks is not None:
                 last_clicks = self._last_encoder_clicks
                 if last_clicks is not None and encoder_clicks != last_clicks:
@@ -837,13 +1110,17 @@ class afcAMS(afcUnit):
                         lane = self.lanes.get(current_loading)
                         if lane is not None and self._lane_matches_extruder(lane):
                             active_lane_name = getattr(lane, "name", None)
+                            active_lane_obj = lane
                     if active_lane_name is None:
                         for lane in self.lanes.values():
                             if self._lane_matches_extruder(lane) and getattr(lane, "status", None) == AFCLaneState.TOOL_LOADING:
                                 active_lane_name = getattr(lane, "name", None)
+                                active_lane_obj = lane
                                 break
                     if active_lane_name:
-                        self._lane_feed_activity[active_lane_name] = True
+                        canonical_lane = self._canonical_lane_name(active_lane_name)
+                        if canonical_lane:
+                            self._lane_feed_activity[canonical_lane] = True
                 self._last_encoder_clicks = encoder_clicks
             elif encoder_clicks is None:
                 self._last_encoder_clicks = None
@@ -865,6 +1142,21 @@ class afcAMS(afcUnit):
                     self._mirror_lane_to_virtual_sensor(lane, eventtime)
                     self._last_lane_states[lane.name] = lane_val
 
+                if self.hardware_service is not None:
+                    hub_state = None
+                    if hub_values is not None and idx < len(hub_values):
+                        hub_state = bool(hub_values[idx])
+                    tool_state = self._lane_reports_tool_filament(lane)
+                    self.hardware_service.update_lane_snapshot(
+                        self.oams_name,
+                        lane.name,
+                        lane_val,
+                        hub_state,
+                        eventtime,
+                        spool_index=idx,
+                        tool_state=tool_state,
+                    )
+
                 hub = getattr(lane, "hub_obj", None)
                 if hub is None or hub_values is None or idx >= len(hub_values):
                     continue
@@ -882,6 +1174,737 @@ class afcAMS(afcUnit):
             pass
 
         return eventtime + self.interval
+
+    def _lane_for_spool_index(self, spool_index: Optional[int]):
+        if spool_index is None:
+            return None
+        for lane in self.lanes.values():
+            try:
+                idx = int(getattr(lane, "index", 0)) - 1
+            except Exception:
+                idx = -1
+            if idx == spool_index:
+                return lane
+        return None
+
+    def _resolve_lane_reference(self, lane_name: Optional[str]):
+        """Return a lane object by name (or alias), case-insensitively."""
+
+        if not lane_name:
+            return None
+
+        # Allow callers to pass aliases such as FPS names or filament group
+        # identifiers by normalising them back to the canonical lane name.
+        resolved_name = self._resolve_lane_alias(lane_name)
+        if resolved_name:
+            lane = self.lanes.get(resolved_name)
+            if lane is not None:
+                return lane
+        else:
+            resolved_name = lane_name
+
+        lane = self.lanes.get(resolved_name)
+        if lane is not None:
+            return lane
+
+        lowered = resolved_name.lower()
+        for candidate_name, candidate in self.lanes.items():
+            if candidate_name.lower() == lowered:
+                return candidate
+        return None
+
+    def handle_runout_detected(
+        self,
+        spool_index: Optional[int],
+        monitor=None,
+        *,
+        lane_name: Optional[str] = None,
+    ) -> None:
+        """Handle runout notifications coming from OpenAMS monitors."""
+
+        lane = None
+        if lane_name:
+            lane = self.lanes.get(lane_name)
+            if lane is None:
+                lowered = lane_name.lower()
+                lane = next(
+                    (
+                        candidate
+                        for name, candidate in self.lanes.items()
+                        if name.lower() == lowered
+                    ),
+                    None,
+                )
+        if lane is None:
+            lane = self._lane_for_spool_index(spool_index)
+        if lane is None:
+            return
+
+        eventtime = self.reactor.monotonic()
+        try:
+            lane.handle_load_runout(eventtime, False)
+        except TypeError:
+            lane.handle_load_runout(eventtime, load_state=False)
+        except AttributeError:
+            self.logger.warning(
+                "Lane %s is missing load runout handler for AMS integration", lane
+            )
+
+    def handle_openams_lane_tool_state(
+        self,
+        lane_name: str,
+        loaded: bool,
+        *,
+        spool_index: Optional[int] = None,
+        eventtime: Optional[float] = None,
+    ) -> bool:
+        """Update lane/tool state in response to OpenAMS hardware events."""
+
+        lane = self._resolve_lane_reference(lane_name)
+        if lane is None:
+            self.logger.warning(
+                "OpenAMS reported lane %s but AFC unit %s cannot resolve it",
+                lane_name,
+                self.name,
+            )
+            return False
+
+        if eventtime is None:
+            try:
+                eventtime = self.reactor.monotonic()
+            except Exception:
+                eventtime = 0.0
+
+        lane_state = bool(loaded)
+        try:
+            self._apply_lane_sensor_state(lane, lane_state, eventtime)
+        except Exception:
+            self.logger.exception(
+                "Failed to mirror OpenAMS lane sensor state for %s", lane.name
+            )
+
+        if self.hardware_service is not None:
+            hub_state = getattr(lane, "loaded_to_hub", None)
+            tool_state = getattr(lane, "tool_loaded", None)
+            mapped_spool = spool_index
+            if mapped_spool is None:
+                try:
+                    mapped_spool = int(getattr(lane, "index", 0)) - 1
+                except Exception:
+                    mapped_spool = None
+            try:
+                self.hardware_service.update_lane_snapshot(
+                    self.oams_name,
+                    lane.name,
+                    lane_state,
+                    hub_state if hub_state is not None else None,
+                    eventtime,
+                    spool_index=mapped_spool,
+                    tool_state=tool_state if tool_state is not None else lane_state,
+                )
+            except Exception:
+                self.logger.exception(
+                    "Failed to update shared lane snapshot for %s", lane.name
+                )
+
+        afc_function = getattr(self.afc, "function", None)
+
+        if lane_state:
+            if afc_function is not None:
+                try:
+                    afc_function.unset_lane_loaded()
+                except Exception:
+                    self.logger.exception("Failed to unset previously loaded lane")
+            try:
+                lane.set_loaded()
+            except Exception:
+                self.logger.exception("Failed to mark lane %s as loaded", lane.name)
+            try:
+                lane.sync_to_extruder()
+            except Exception:
+                self.logger.exception("Failed to sync lane %s to extruder", lane.name)
+            if afc_function is not None:
+                try:
+                    afc_function.handle_activate_extruder()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to activate extruder after loading lane %s",
+                        lane.name,
+                    )
+            try:
+                self.afc.save_vars()
+            except Exception:
+                self.logger.exception("Failed to persist AFC state after lane load")
+            try:
+                self.select_lane(lane)
+            except Exception:
+                self.logger.debug(
+                    "Unable to select lane %s during OpenAMS load", lane.name
+                )
+            if self._lane_matches_extruder(lane):
+                try:
+                    canonical_lane = self._canonical_lane_name(lane.name)
+                    force_update = True
+                    if canonical_lane:
+                        force_update = (
+                            self._lane_tool_latches.get(canonical_lane) is not False
+                        )
+                    self._set_virtual_tool_sensor_state(
+                        True,
+                        eventtime,
+                        lane.name,
+                        force=force_update,
+                        lane_obj=lane,
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Failed to mirror tool sensor state for loaded lane %s",
+                        lane.name,
+                    )
+            return True
+
+        current_lane = None
+        if afc_function is not None:
+            try:
+                current_lane = afc_function.get_current_lane_obj()
+            except Exception:
+                current_lane = None
+
+        if current_lane is lane and afc_function is not None:
+            try:
+                afc_function.unset_lane_loaded()
+            except Exception:
+                self.logger.exception(
+                    "Failed to unset currently loaded lane %s", lane.name
+                )
+            return True
+
+        if getattr(lane, "tool_loaded", False):
+            try:
+                lane.unsync_to_extruder()
+            except Exception:
+                self.logger.exception(
+                    "Failed to unsync lane %s from extruder", lane.name
+                )
+            try:
+                lane.set_unloaded()
+            except Exception:
+                self.logger.exception("Failed to mark lane %s as unloaded", lane.name)
+            try:
+                self.afc.save_vars()
+            except Exception:
+                self.logger.exception(
+                    "Failed to persist AFC state after unloading lane %s",
+                    lane.name,
+                )
+        if self._lane_matches_extruder(lane):
+            try:
+                self._set_virtual_tool_sensor_state(
+                    False, eventtime, lane.name, lane_obj=lane
+                )
+            except Exception:
+                self.logger.exception(
+                    "Failed to mirror tool sensor state for unloaded lane %s",
+                    lane.name,
+                )
+        return True
+
+    def check_runout(self, lane=None):
+        if lane is None:
+            return False
+        if getattr(lane, "unit_obj", None) is not self:
+            return False
+        try:
+            is_printing = self.afc.function.is_printing()
+        except Exception:
+            is_printing = False
+        return bool(is_printing)
+
+    def _lane_for_spool_index(self, spool_index: Optional[int]):
+        if spool_index is None:
+            return None
+        for lane in self.lanes.values():
+            try:
+                idx = int(getattr(lane, "index", 0)) - 1
+            except Exception:
+                idx = -1
+            if idx == spool_index:
+                return lane
+        return None
+
+    def _resolve_lane_reference(self, lane_name: Optional[str]):
+        """Return a lane object by name (or alias), case-insensitively."""
+
+        if not lane_name:
+            return None
+
+        resolved_name = self._resolve_lane_alias(lane_name)
+        if resolved_name:
+            lane = self.lanes.get(resolved_name)
+            if lane is not None:
+                return lane
+        else:
+            resolved_name = lane_name
+
+        lane = self.lanes.get(resolved_name)
+        if lane is not None:
+            return lane
+
+        lowered = resolved_name.lower()
+        for candidate_name, candidate in self.lanes.items():
+            if candidate_name.lower() == lowered:
+                return candidate
+        return None
+
+    def handle_runout_detected(
+        self,
+        spool_index: Optional[int],
+        monitor=None,
+        *,
+        lane_name: Optional[str] = None,
+    ) -> None:
+        """Handle runout notifications coming from OpenAMS monitors."""
+
+        lane = None
+        if lane_name:
+            lane = self.lanes.get(lane_name)
+            if lane is None:
+                lowered = lane_name.lower()
+                lane = next(
+                    (
+                        candidate
+                        for name, candidate in self.lanes.items()
+                        if name.lower() == lowered
+                    ),
+                    None,
+                )
+        if lane is None:
+            lane = self._lane_for_spool_index(spool_index)
+        if lane is None:
+            return
+
+        eventtime = self.reactor.monotonic()
+        try:
+            lane.handle_load_runout(eventtime, False)
+        except TypeError:
+            lane.handle_load_runout(eventtime, load_state=False)
+        except AttributeError:
+            self.logger.warning(
+                "Lane %s is missing load runout handler for AMS integration", lane
+            )
+
+    def handle_openams_lane_tool_state(
+        self,
+        lane_name: str,
+        loaded: bool,
+        *,
+        spool_index: Optional[int] = None,
+        eventtime: Optional[float] = None,
+    ) -> bool:
+        """Update lane/tool state in response to OpenAMS hardware events."""
+
+        lane = self._resolve_lane_reference(lane_name)
+        if lane is None:
+            self.logger.warning(
+                "OpenAMS reported lane %s but AFC unit %s cannot resolve it",
+                lane_name,
+                self.name,
+            )
+            return False
+
+        if eventtime is None:
+            try:
+                eventtime = self.reactor.monotonic()
+            except Exception:
+                eventtime = 0.0
+
+        lane_state = bool(loaded)
+        try:
+            self._apply_lane_sensor_state(lane, lane_state, eventtime)
+        except Exception:
+            self.logger.exception(
+                "Failed to mirror OpenAMS lane sensor state for %s", lane.name
+            )
+
+        if self.hardware_service is not None:
+            hub_state = getattr(lane, "loaded_to_hub", None)
+            tool_state = getattr(lane, "tool_loaded", None)
+            mapped_spool = spool_index
+            if mapped_spool is None:
+                try:
+                    mapped_spool = int(getattr(lane, "index", 0)) - 1
+                except Exception:
+                    mapped_spool = None
+            try:
+                self.hardware_service.update_lane_snapshot(
+                    self.oams_name,
+                    lane.name,
+                    lane_state,
+                    hub_state if hub_state is not None else None,
+                    eventtime,
+                    spool_index=mapped_spool,
+                    tool_state=tool_state if tool_state is not None else lane_state,
+                )
+            except Exception:
+                self.logger.exception(
+                    "Failed to update shared lane snapshot for %s", lane.name
+                )
+
+        afc_function = getattr(self.afc, "function", None)
+
+        if lane_state:
+            if afc_function is not None:
+                try:
+                    afc_function.unset_lane_loaded()
+                except Exception:
+                    self.logger.exception("Failed to unset previously loaded lane")
+            try:
+                lane.set_loaded()
+            except Exception:
+                self.logger.exception("Failed to mark lane %s as loaded", lane.name)
+            try:
+                lane.sync_to_extruder()
+            except Exception:
+                self.logger.exception("Failed to sync lane %s to extruder", lane.name)
+            if afc_function is not None:
+                try:
+                    afc_function.handle_activate_extruder()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to activate extruder after loading lane %s",
+                        lane.name,
+                    )
+            try:
+                self.afc.save_vars()
+            except Exception:
+                self.logger.exception("Failed to persist AFC state after lane load")
+            try:
+                self.select_lane(lane)
+            except Exception:
+                self.logger.debug(
+                    "Unable to select lane %s during OpenAMS load", lane.name
+                )
+            return True
+
+        current_lane = None
+        if afc_function is not None:
+            try:
+                current_lane = afc_function.get_current_lane_obj()
+            except Exception:
+                current_lane = None
+
+        if current_lane is lane and afc_function is not None:
+            try:
+                afc_function.unset_lane_loaded()
+            except Exception:
+                self.logger.exception(
+                    "Failed to unset currently loaded lane %s", lane.name
+                )
+            return True
+
+        if getattr(lane, "tool_loaded", False):
+            try:
+                lane.unsync_to_extruder()
+            except Exception:
+                self.logger.exception(
+                    "Failed to unsync lane %s from extruder", lane.name
+                )
+            try:
+                lane.set_unloaded()
+            except Exception:
+                self.logger.exception("Failed to mark lane %s as unloaded", lane.name)
+            try:
+                self.afc.save_vars()
+            except Exception:
+                self.logger.exception(
+                    "Failed to persist AFC state after unloading lane %s",
+                    lane.name,
+                )
+        return True
+
+    def check_runout(self, lane=None):
+        if lane is None:
+            return False
+        if getattr(lane, "unit_obj", None) is not self:
+            return False
+        try:
+            is_printing = self.afc.function.is_printing()
+        except Exception:
+            is_printing = False
+        return bool(is_printing)
+
+    def _lane_for_spool_index(self, spool_index: Optional[int]):
+        if spool_index is None:
+            return None
+        for lane in self.lanes.values():
+            try:
+                idx = int(getattr(lane, "index", 0)) - 1
+            except Exception:
+                idx = -1
+            if idx == spool_index:
+                return lane
+        return None
+
+    def _resolve_lane_reference(self, lane_name: Optional[str]):
+        """Return a lane object by name (or alias), case-insensitively."""
+
+        if not lane_name:
+            return None
+
+        resolved_name = self._resolve_lane_alias(lane_name)
+        if resolved_name:
+            lane = self.lanes.get(resolved_name)
+            if lane is not None:
+                return lane
+        else:
+            resolved_name = lane_name
+
+        lane = self.lanes.get(resolved_name)
+        if lane is not None:
+            return lane
+
+        lowered = resolved_name.lower()
+        for candidate_name, candidate in self.lanes.items():
+            if candidate_name.lower() == lowered:
+                return candidate
+        return None
+
+    def handle_runout_detected(
+        self,
+        spool_index: Optional[int],
+        monitor=None,
+        *,
+        lane_name: Optional[str] = None,
+    ) -> None:
+        """Handle runout notifications coming from OpenAMS monitors."""
+
+        lane = None
+        if lane_name:
+            lane = self.lanes.get(lane_name)
+            if lane is None:
+                lowered = lane_name.lower()
+                lane = next(
+                    (
+                        candidate
+                        for name, candidate in self.lanes.items()
+                        if name.lower() == lowered
+                    ),
+                    None,
+                )
+        if lane is None:
+            lane = self._lane_for_spool_index(spool_index)
+        if lane is None:
+            return
+
+        eventtime = self.reactor.monotonic()
+        try:
+            lane.handle_load_runout(eventtime, False)
+        except TypeError:
+            lane.handle_load_runout(eventtime, load_state=False)
+        except AttributeError:
+            self.logger.warning(
+                "Lane %s is missing load runout handler for AMS integration", lane
+            )
+
+    def handle_openams_lane_tool_state(
+        self,
+        lane_name: str,
+        loaded: bool,
+        *,
+        spool_index: Optional[int] = None,
+        eventtime: Optional[float] = None,
+    ) -> bool:
+        """Update lane/tool state in response to OpenAMS hardware events."""
+
+        lane = self._resolve_lane_reference(lane_name)
+        if lane is None:
+            self.logger.warning(
+                "OpenAMS reported lane %s but AFC unit %s cannot resolve it",
+                lane_name,
+                self.name,
+            )
+            return False
+
+        if eventtime is None:
+            try:
+                eventtime = self.reactor.monotonic()
+            except Exception:
+                eventtime = 0.0
+
+        lane_state = bool(loaded)
+        try:
+            self._apply_lane_sensor_state(lane, lane_state, eventtime)
+        except Exception:
+            self.logger.exception(
+                "Failed to mirror OpenAMS lane sensor state for %s", lane.name
+            )
+
+        if self.hardware_service is not None:
+            hub_state = getattr(lane, "loaded_to_hub", None)
+            tool_state = getattr(lane, "tool_loaded", None)
+            mapped_spool = spool_index
+            if mapped_spool is None:
+                try:
+                    mapped_spool = int(getattr(lane, "index", 0)) - 1
+                except Exception:
+                    mapped_spool = None
+            try:
+                self.hardware_service.update_lane_snapshot(
+                    self.oams_name,
+                    lane.name,
+                    lane_state,
+                    hub_state if hub_state is not None else None,
+                    eventtime,
+                    spool_index=mapped_spool,
+                    tool_state=tool_state if tool_state is not None else lane_state,
+                )
+            except Exception:
+                self.logger.exception(
+                    "Failed to update shared lane snapshot for %s", lane.name
+                )
+
+        afc_function = getattr(self.afc, "function", None)
+
+        if lane_state:
+            if afc_function is not None:
+                try:
+                    afc_function.unset_lane_loaded()
+                except Exception:
+                    self.logger.exception("Failed to unset previously loaded lane")
+            try:
+                lane.set_loaded()
+            except Exception:
+                self.logger.exception("Failed to mark lane %s as loaded", lane.name)
+            try:
+                lane.sync_to_extruder()
+            except Exception:
+                self.logger.exception("Failed to sync lane %s to extruder", lane.name)
+            if afc_function is not None:
+                try:
+                    afc_function.handle_activate_extruder()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to activate extruder after loading lane %s",
+                        lane.name,
+                    )
+            try:
+                self.afc.save_vars()
+            except Exception:
+                self.logger.exception("Failed to persist AFC state after lane load")
+            try:
+                self.select_lane(lane)
+            except Exception:
+                self.logger.debug(
+                    "Unable to select lane %s during OpenAMS load", lane.name
+                )
+            return True
+
+        current_lane = None
+        if afc_function is not None:
+            try:
+                current_lane = afc_function.get_current_lane_obj()
+            except Exception:
+                current_lane = None
+
+        if current_lane is lane and afc_function is not None:
+            try:
+                afc_function.unset_lane_loaded()
+            except Exception:
+                self.logger.exception(
+                    "Failed to unset currently loaded lane %s", lane.name
+                )
+            return True
+
+        if getattr(lane, "tool_loaded", False):
+            try:
+                lane.unsync_to_extruder()
+            except Exception:
+                self.logger.exception(
+                    "Failed to unsync lane %s from extruder", lane.name
+                )
+            try:
+                lane.set_unloaded()
+            except Exception:
+                self.logger.exception("Failed to mark lane %s as unloaded", lane.name)
+            try:
+                self.afc.save_vars()
+            except Exception:
+                self.logger.exception(
+                    "Failed to persist AFC state after unloading lane %s",
+                    lane.name,
+                )
+        return True
+
+    def check_runout(self, lane=None):
+        if lane is None:
+            return False
+        if getattr(lane, "unit_obj", None) is not self:
+            return False
+        try:
+            is_printing = self.afc.function.is_printing()
+        except Exception:
+            is_printing = False
+        return bool(is_printing)
+
+    def _lane_for_spool_index(self, spool_index: Optional[int]):
+        if spool_index is None:
+            return None
+        for lane in self.lanes.values():
+            try:
+                idx = int(getattr(lane, "index", 0)) - 1
+            except Exception:
+                idx = -1
+            if idx == spool_index:
+                return lane
+        return None
+
+    def handle_runout_detected(
+        self,
+        spool_index: Optional[int],
+        monitor=None,
+        *,
+        lane_name: Optional[str] = None,
+    ) -> None:
+        """Handle runout notifications coming from OpenAMS monitors."""
+
+        lane = None
+        if lane_name:
+            lane = self.lanes.get(lane_name)
+            if lane is None:
+                lowered = lane_name.lower()
+                lane = next(
+                    (
+                        candidate
+                        for name, candidate in self.lanes.items()
+                        if name.lower() == lowered
+                    ),
+                    None,
+                )
+        if lane is None:
+            lane = self._lane_for_spool_index(spool_index)
+        if lane is None:
+            return
+
+        eventtime = self.reactor.monotonic()
+        try:
+            lane.handle_load_runout(eventtime, False)
+        except TypeError:
+            lane.handle_load_runout(eventtime, load_state=False)
+        except AttributeError:
+            self.logger.warning(
+                "Lane %s is missing load runout handler for AMS integration", lane
+            )
+
+    def check_runout(self, lane=None):
+        if lane is None:
+            return False
+        if getattr(lane, "unit_obj", None) is not self:
+            return False
+        try:
+            is_printing = self.afc.function.is_printing()
+        except Exception:
+            is_printing = False
+        return bool(is_printing)
 
 
 def load_config_prefix(config):
@@ -934,7 +1957,12 @@ def _patch_lane_pre_sensor_for_ams() -> None:
 
         if desired_state:
             try:
-                unit._set_virtual_tool_sensor_state(desired_state, eventtime)
+                unit._set_virtual_tool_sensor_state(
+                    desired_state,
+                    eventtime,
+                    getattr(self, "name", None),
+                    lane_obj=self,
+                )
             except Exception:
                 pass
             return True
@@ -946,3 +1974,5 @@ def _patch_lane_pre_sensor_for_ams() -> None:
 
 
 _patch_lane_pre_sensor_for_ams()
+
+
