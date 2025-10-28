@@ -273,7 +273,7 @@ class afcAMS(afcUnit):
 
         self.reactor = self.printer.get_reactor()
         self.timer = self.reactor.register_timer(self._sync_event)
-        self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
         # Track previous sensor state to only forward changes
         self._last_lane_states: Dict[str, bool] = {}
@@ -904,7 +904,7 @@ class afcAMS(afcUnit):
         cur_lane.set_afc_prep_done()
         return succeeded
 
-    def handle_ready(self):
+    def handle_connect(self):
         """Resolve the OpenAMS object once Klippy is ready."""
 
         if self.hardware_service is not None:
