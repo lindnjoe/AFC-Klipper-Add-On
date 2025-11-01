@@ -365,7 +365,7 @@ class afcAMS(afcUnit):
             group_buttons.append((button_label, command, button_style))
 
             index += 1
-            if index % 2 == 0:
+            if index % 4 == 0:
                 buttons.append(list(group_buttons))
                 group_buttons = []
 
@@ -410,7 +410,7 @@ class afcAMS(afcUnit):
             group_buttons.append((button_label, command, button_style))
 
             index += 1
-            if index % 2 == 0:
+            if index % 4 == 0:
                 buttons.append(list(group_buttons))
                 group_buttons = []
 
