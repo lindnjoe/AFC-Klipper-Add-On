@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import traceback
 from textwrap import dedent
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from types import MethodType
 
 from configparser import Error as ConfigError
@@ -279,6 +280,7 @@ class afcAMS(afcUnit):
         self._last_encoder_clicks: Optional[int] = None
         self._last_hub_hes_string: Optional[str] = None
         self._last_ptfe_string: Optional[str] = None
+        self._last_lane_ptfe_lengths: Dict[str, float] = {}
         self.oams = None
         self.hardware_service = None
 
@@ -288,6 +290,14 @@ class afcAMS(afcUnit):
             self.hardware_service = AMSHardwareService.for_printer(
                 self.printer, self.oams_name, self.logger
             )
+
+        self.gcode.register_mux_command(
+            "AFC_OAMS_CALIBRATE_HUB_HES_ALL",
+            "UNIT",
+            self.name,
+            self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL,
+            desc=self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL_help,
+        )
 
         self._register_sync_dispatcher()
         self._register_ptfe_calibration_dispatcher()
@@ -377,12 +387,110 @@ class afcAMS(afcUnit):
         if group_buttons:
             buttons.append(list(group_buttons))
 
-        if index == 0:
+        total_buttons = sum(len(group) for group in buttons)
+        if total_buttons == 0:
             text = "No lanes are loaded, please load before calibration"
+            all_lanes = None
+        else:
+            all_lanes = [
+                (
+                    "All lanes",
+                    f"AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT={self.name}",
+                    "default",
+                )
+            ]
 
         back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
 
-        prompt.create_custom_p(title, text, None, True, buttons, back)
+        prompt.create_custom_p(title, text, all_lanes, True, buttons, back)
+
+    cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL_help = (
+        "calibrate the OpenAMS HUB HES value for all loaded lanes in the unit"
+    )
+
+    def cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL(self, gcmd):
+        """Iterate HUB HES calibration across every loaded OpenAMS lane."""
+
+        prompt = AFCprompt(gcmd, self.logger)
+        prompt.p_end()
+
+        active_lane = getattr(self.afc, "current", None)
+        active_lane_obj = None
+        active_lane_name = None
+
+        if active_lane is not None:
+            if hasattr(active_lane, "unit_obj"):
+                active_lane_obj = active_lane
+                active_lane_name = getattr(active_lane_obj, "name", str(active_lane_obj))
+            else:
+                active_lane_name = str(active_lane)
+                afc_lanes = getattr(self.afc, "lanes", None)
+                if isinstance(afc_lanes, dict):
+                    active_lane_obj = afc_lanes.get(active_lane_name)
+
+        if (
+            active_lane_obj is not None
+            and getattr(active_lane_obj, "unit_obj", None) is self
+            and getattr(active_lane_obj, "tool_loaded", False)
+        ):
+            lane_label = active_lane_name or getattr(active_lane_obj, "name", "current lane")
+            gcmd.respond_info(
+                "Cannot calibrate all OpenAMS lanes while {} is active on this unit. "
+                "Please unload the current tool and try again.".format(lane_label)
+            )
+            return
+
+        calibrations: List[Tuple[object, str]] = []
+        skipped: List[str] = []
+
+        for lane in self.lanes.values():
+            if not getattr(lane, "load_state", False):
+                continue
+
+            command = self._format_hub_hes_calibration_command(lane)
+            if not command:
+                lane_name = getattr(lane, "name", str(lane))
+                skipped.append(lane_name)
+                continue
+
+            calibrations.append((lane, command))
+
+        if not calibrations:
+            gcmd.respond_info(
+                "No loaded OpenAMS lanes were found to calibrate HUB HES values."
+            )
+            return
+
+        successful = 0
+
+        for lane, command in calibrations:
+            lane_name = getattr(lane, "name", str(lane))
+            gcmd.respond_info(
+                f"Running HUB HES calibration for {lane_name} with '{command}'."
+            )
+            try:
+                self.gcode.run_script_from_command(command)
+            except Exception:
+                self.logger.exception(
+                    "Failed to execute OpenAMS HUB HES calibration for lane %s", lane
+                )
+                gcmd.respond_info(
+                    f"Failed to execute HUB HES calibration for {lane_name}. See logs."
+                )
+                continue
+
+            successful += 1
+
+        gcmd.respond_info(
+            f"Completed HUB HES calibration for {successful} OpenAMS lane(s)."
+        )
+
+        if skipped:
+            skipped_lanes = ", ".join(skipped)
+            gcmd.respond_info(
+                "Skipped HUB HES calibration for lanes lacking OpenAMS mapping: "
+                f"{skipped_lanes}."
+            )
 
     def _get_openams_index(self):
         oams_name = getattr(self, "oams_name", None)
@@ -683,6 +791,41 @@ class afcAMS(afcUnit):
                 formatted.append(f"{number:.6f}".rstrip("0").rstrip("."))
         return ", ".join(formatted) if formatted else None
 
+    def _persist_lane_ptfe_length(self, lane, new_length) -> bool:
+        """Persist a calibrated PTFE length to the lane's hub configuration."""
+
+        if lane is None:
+            return False
+
+        hub = getattr(lane, "hub_obj", None)
+        if hub is None:
+            return False
+
+        try:
+            numeric_length = float(new_length)
+        except (TypeError, ValueError):
+            return False
+
+        if not math.isfinite(numeric_length) or numeric_length <= 0.0:
+            return False
+
+        lane_key = getattr(lane, "name", None) or str(lane)
+        tolerance = 1e-3
+        last_saved = self._last_lane_ptfe_lengths.get(lane_key)
+        if last_saved is not None and abs(last_saved - numeric_length) <= tolerance:
+            return False
+
+        try:
+            hub.afc_unload_bowden_length = numeric_length
+        except Exception:
+            self.logger.exception(
+                "Failed to update hub bowden lengths for lane %s", lane_key
+            )
+
+        self._last_lane_ptfe_lengths[lane_key] = numeric_length
+
+        return True
+
     def _rewrite_oams_config_file(
         self, section_name: str, key: str, value: str, msg: str
     ) -> bool:
@@ -690,64 +833,75 @@ class afcAMS(afcUnit):
         if not config_dir:
             return False
 
-        config_path = os.path.join(config_dir, "oamsc.cfg")
-        if not os.path.isfile(config_path):
-            return False
-
         try:
-            with open(config_path, "r", encoding="utf-8") as cfg_file:
-                lines = cfg_file.readlines()
+            config_files = sorted(
+                os.path.join(config_dir, filename)
+                for filename in os.listdir(config_dir)
+                if filename.lower().endswith(".cfg")
+            )
         except Exception:
             return False
 
         header = f"[{section_name}]".strip().lower()
         key_pattern = re.compile(rf"\s*{re.escape(key)}\s*:")
 
-        in_section = False
-        updated = False
-        output_lines = []
+        for config_path in config_files:
+            if not os.path.isfile(config_path):
+                continue
 
-        for raw_line in lines:
-            line = raw_line.rstrip("\n")
-            stripped = line.strip()
+            try:
+                with open(config_path, "r", encoding="utf-8") as cfg_file:
+                    lines = cfg_file.readlines()
+            except Exception:
+                continue
 
-            if stripped.startswith("[") and stripped.endswith("]"):
-                if in_section and not updated:
-                    output_lines.append(f"{key}:{value}")
+            in_section = False
+            updated = False
+            output_lines = []
+
+            for raw_line in lines:
+                line = raw_line.rstrip("\n")
+                stripped = line.strip()
+
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    if in_section and not updated:
+                        output_lines.append(f"{key}:{value}")
+                        updated = True
+                    in_section = stripped.lower() == header
+                    output_lines.append(line)
+                    continue
+
+                if in_section and key_pattern.match(line):
+                    comment = ""
+                    if "#" in line:
+                        comment_index = line.index("#")
+                        comment = line[comment_index:].strip()
+                    new_line = f"{key}:{value}"
+                    if comment:
+                        new_line = f"{new_line} {comment}"
+                    output_lines.append(new_line)
                     updated = True
-                in_section = stripped.lower() == header
+                    continue
+
                 output_lines.append(line)
-                continue
 
-            if in_section and key_pattern.match(line):
-                comment = ""
-                if "#" in line:
-                    comment_index = line.index("#")
-                    comment = line[comment_index:].strip()
-                new_line = f"{key}:{value}"
-                if comment:
-                    new_line = f"{new_line} {comment}"
-                output_lines.append(new_line)
+            if in_section and not updated:
+                output_lines.append(f"{key}:{value}")
                 updated = True
+
+            if not updated:
                 continue
 
-            output_lines.append(line)
+            try:
+                with open(config_path, "w", encoding="utf-8") as cfg_file:
+                    cfg_file.write("\n".join(output_lines) + "\n")
+            except Exception:
+                continue
 
-        if in_section and not updated:
-            output_lines.append(f"{key}:{value}")
-            updated = True
+            self.logger.info(msg)
+            return True
 
-        if not updated:
-            return False
-
-        try:
-            with open(config_path, "w", encoding="utf-8") as cfg_file:
-                cfg_file.write("\n".join(output_lines) + "\n")
-        except Exception:
-            return False
-
-        self.logger.info(msg)
-        return True
+        return False
 
     def _write_openams_config_value(self, key, value, previous_string=None):
         if not value:
@@ -795,6 +949,17 @@ class afcAMS(afcUnit):
                 )
             if formatted:
                 self._last_ptfe_string = formatted
+            for lane in self.lanes.values():
+                spool_index = self._get_openams_spool_index(lane)
+                if spool_index is None:
+                    continue
+                try:
+                    lane_value = ptfe_values[spool_index]
+                except (IndexError, TypeError):
+                    continue
+                if lane_value is None:
+                    continue
+                self._persist_lane_ptfe_length(lane, lane_value)
 
     cmd_UNIT_BOW_CALIBRATION_help = (
         "open prompt to calibrate OpenAMS PTFE lengths"
@@ -810,7 +975,7 @@ class afcAMS(afcUnit):
         title = f"OAMS PTFE Calibration {self.name}"
         text = (
             "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
-            "Results will be saved to oamsc.cfg when values change. "
+            "Results will be save to your cfg when values change. "
             "Command: OAMS_CALIBRATE_PTFE_LENGTH"
         ).format(self.name)
 
@@ -1430,6 +1595,16 @@ class afcAMS(afcUnit):
         raw_command = f"OAMS_CALIBRATE_PTFE_LENGTH OAMS={oams_index} SPOOL={spool_index}"
         captured_messages = self._run_command_with_capture(raw_command)
         captured_values = self._extract_ptfe_length_from_messages(captured_messages)
+        lane_length_value = None
+        lane_persisted = False
+        if lane is not None and captured_values:
+            if 0 <= spool_index < len(captured_values):
+                lane_length_value = captured_values[spool_index]
+            elif len(captured_values) == 1:
+                lane_length_value = captured_values[0]
+            if lane_length_value is not None:
+                lane_persisted = self._persist_lane_ptfe_length(lane, lane_length_value)
+
         formatted_capture = None
         if captured_values:
             formatted_capture = self._format_numeric_values(captured_values)
@@ -1444,8 +1619,17 @@ class afcAMS(afcUnit):
             self._last_ptfe_string = formatted_capture
             lane_suffix = f" for {lane_name}" if lane_name else ""
             gcmd.respond_info(
-                f"Stored OpenAMS PTFE length {formatted_capture}{lane_suffix} in oamsc.cfg."
+                f"Stored OpenAMS PTFE length {formatted_capture}{lane_suffix} in your cfg."
             )
+            if lane_persisted and lane_length_value is not None:
+                hub_name = getattr(getattr(lane, "hub_obj", None), "name", None)
+                target_name = hub_name or lane_name or "hub"
+                formatted_lane = self._format_numeric_values([lane_length_value]) or str(
+                    lane_length_value
+                )
+                gcmd.respond_info(
+                    f"Updated hub bowden lengths to {formatted_lane}mm for {target_name}."
+                )
             return
 
         if self._last_ptfe_string:
@@ -1459,6 +1643,16 @@ class afcAMS(afcUnit):
                 "Completed {} but no PTFE length was reported. Check OpenAMS status logs.".format(
                     raw_command
                 )
+            )
+
+        if lane_persisted and lane_length_value is not None and not formatted_capture:
+            hub_name = getattr(getattr(lane, "hub_obj", None), "name", None)
+            target_name = hub_name or lane_name or "hub"
+            formatted_lane = self._format_numeric_values([lane_length_value]) or str(
+                lane_length_value
+            )
+            gcmd.respond_info(
+                f"Updated hub bowden lengths to {formatted_lane}mm for {target_name}."
             )
 
     @classmethod
