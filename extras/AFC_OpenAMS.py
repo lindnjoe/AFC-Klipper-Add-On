@@ -302,6 +302,9 @@ class afcAMS(afcUnit):
             desc=self.cmd_AFC_OAMS_CALIBRATE_PTFE_help,
         )
 
+        self._last_openams_config_values: Dict[Tuple[str, str], str] = {}
+        self._last_lane_config_values: Dict[Tuple[str, str], str] = {}
+
     cmd_UNIT_CALIBRATION_help = (
         "open prompt to calibrate OpenAMS HUB HES or PTFE length values"
     )
@@ -814,6 +817,11 @@ class afcAMS(afcUnit):
         if not formatted_value:
             formatted_value = str(value)
 
+        cache_key = (section_name, key)
+        last_value = self._last_lane_config_values.get(cache_key)
+        if last_value == formatted_value:
+            return
+
         msg = f"\n{lane} {key}: New: {formatted_value}"
 
         config_writer = getattr(afc_function, "ConfigRewrite", None)
@@ -822,6 +830,7 @@ class afcAMS(afcUnit):
 
         try:
             config_writer(section_name, key, formatted_value, msg)
+            self._last_lane_config_values[cache_key] = formatted_value
         except Exception:
             lane_name = getattr(lane, "name", lane)
             self.logger.exception(
@@ -829,8 +838,9 @@ class afcAMS(afcUnit):
             )
 
     def _write_openams_config_value(self, key, value):
-        if not value:
+        if value is None:
             return
+        string_value = str(value)
         afc_function = getattr(self.afc, "function", None)
         if afc_function is None:
             return
@@ -849,14 +859,20 @@ class afcAMS(afcUnit):
             else:
                 return
 
-        msg = f"\n{self.name} {key}: New: {value}"
+        cache_key = (section_name, key)
+        last_value = self._last_openams_config_values.get(cache_key)
+        if last_value == string_value:
+            return
+
+        msg = f"\n{self.name} {key}: New: {string_value}"
 
         config_writer = getattr(afc_function, "ConfigRewrite", None)
         if not callable(config_writer):
             return
 
         try:
-            config_writer(section_name, key, value, msg)
+            config_writer(section_name, key, string_value, msg)
+            self._last_openams_config_values[cache_key] = string_value
         except Exception:
             self.logger.exception(
                 "Failed to persist %s to oams config for unit %s", key, self.name
