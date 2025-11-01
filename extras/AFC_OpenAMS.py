@@ -815,9 +815,6 @@ class afcAMS(afcUnit):
         if last_saved is not None and abs(last_saved - numeric_length) <= tolerance:
             return False
 
-        previous_unload = getattr(hub, "afc_unload_bowden_length", None)
-        previous_bowden = getattr(hub, "afc_bowden_length", None)
-
         try:
             hub.afc_unload_bowden_length = numeric_length
             if hasattr(hub, "afc_bowden_length"):
@@ -827,47 +824,9 @@ class afcAMS(afcUnit):
                 "Failed to update hub bowden lengths for lane %s", lane_key
             )
 
-        hub_fullname = getattr(hub, "fullname", None)
-        afc_function = getattr(self.afc, "function", None)
-        config_writer = getattr(afc_function, "ConfigRewrite", None)
+        self._last_lane_ptfe_lengths[lane_key] = numeric_length
 
-        formatted_new = self._format_numeric_values([numeric_length]) or str(
-            numeric_length
-        )
-        unload_msg = f"\n afc_unload_bowden_length: New: {formatted_new}"
-        if previous_unload is not None:
-            formatted_previous_unload = self._format_numeric_values(
-                [previous_unload]
-            )
-            if formatted_previous_unload:
-                unload_msg += f" Old: {formatted_previous_unload}"
-
-        bowden_msg = f"\n afc_bowden_length: New: {formatted_new}"
-        if previous_bowden is not None:
-            formatted_previous_bowden = self._format_numeric_values([previous_bowden])
-            if formatted_previous_bowden:
-                bowden_msg += f" Old: {formatted_previous_bowden}"
-
-        persisted = False
-        if callable(config_writer) and hub_fullname:
-            try:
-                config_writer(hub_fullname, "afc_bowden_length", numeric_length, bowden_msg)
-                config_writer(
-                    hub_fullname,
-                    "afc_unload_bowden_length",
-                    numeric_length,
-                    unload_msg,
-                )
-                persisted = True
-            except Exception:
-                self.logger.exception(
-                    "Failed to persist PTFE length for lane %s", lane_key
-                )
-
-        if persisted:
-            self._last_lane_ptfe_lengths[lane_key] = numeric_length
-
-        return persisted
+        return True
 
     def _rewrite_oams_config_file(
         self, section_name: str, key: str, value: str, msg: str
@@ -1018,7 +977,7 @@ class afcAMS(afcUnit):
         title = f"OAMS PTFE Calibration {self.name}"
         text = (
             "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
-            "Results will be saved to oamsc.cfg when values change. "
+            "Results will be saved to your cfg when values change. "
             "Command: OAMS_CALIBRATE_PTFE_LENGTH"
         ).format(self.name)
 
@@ -1662,7 +1621,7 @@ class afcAMS(afcUnit):
             self._last_ptfe_string = formatted_capture
             lane_suffix = f" for {lane_name}" if lane_name else ""
             gcmd.respond_info(
-                f"Stored OpenAMS PTFE length {formatted_capture}{lane_suffix} in oamsc.cfg."
+                f"Stored OpenAMS PTFE length {formatted_capture}{lane_suffix} in your cfg."
             )
             if lane_persisted and lane_length_value is not None:
                 hub_name = getattr(getattr(lane, "hub_obj", None), "name", None)
@@ -1671,7 +1630,7 @@ class afcAMS(afcUnit):
                     lane_length_value
                 )
                 gcmd.respond_info(
-                    f"Saved bowden lengths of {formatted_lane}mm for {target_name} in configuration."
+                    f"Updated hub bowden lengths to {formatted_lane}mm for {target_name}."
                 )
             return
 
@@ -1695,7 +1654,7 @@ class afcAMS(afcUnit):
                 lane_length_value
             )
             gcmd.respond_info(
-                f"Saved bowden lengths of {formatted_lane}mm for {target_name} in configuration."
+                f"Updated hub bowden lengths to {formatted_lane}mm for {target_name}."
             )
 
     @classmethod
