@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import traceback
 from textwrap import dedent
@@ -698,6 +699,72 @@ class afcAMS(afcUnit):
                 formatted.append(f"{number:.6f}".rstrip("0").rstrip("."))
         return ", ".join(formatted) if formatted else None
 
+    def _rewrite_oams_config_file(
+        self, section_name: str, key: str, value: str, msg: str
+    ) -> bool:
+        config_dir = getattr(self.afc, "cfgloc", None)
+        if not config_dir:
+            return False
+
+        config_path = os.path.join(config_dir, "oamsc.cfg")
+        if not os.path.isfile(config_path):
+            return False
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as cfg_file:
+                lines = cfg_file.readlines()
+        except Exception:
+            return False
+
+        header = f"[{section_name}]".strip().lower()
+        key_pattern = re.compile(rf"\s*{re.escape(key)}\s*:")
+
+        in_section = False
+        updated = False
+        output_lines = []
+
+        for raw_line in lines:
+            line = raw_line.rstrip("\n")
+            stripped = line.strip()
+
+            if stripped.startswith("[") and stripped.endswith("]"):
+                if in_section and not updated:
+                    output_lines.append(f"{key}:{value}")
+                    updated = True
+                in_section = stripped.lower() == header
+                output_lines.append(line)
+                continue
+
+            if in_section and key_pattern.match(line):
+                comment = ""
+                if "#" in line:
+                    comment_index = line.index("#")
+                    comment = line[comment_index:].strip()
+                new_line = f"{key}:{value}"
+                if comment:
+                    new_line = f"{new_line} {comment}"
+                output_lines.append(new_line)
+                updated = True
+                continue
+
+            output_lines.append(line)
+
+        if in_section and not updated:
+            output_lines.append(f"{key}:{value}")
+            updated = True
+
+        if not updated:
+            return False
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as cfg_file:
+                cfg_file.write("\n".join(output_lines) + "\n")
+        except Exception:
+            return False
+
+        self.logger.info(msg)
+        return True
+
     def _write_openams_config_value(self, key, value, previous_string=None):
         if not value:
             return
@@ -705,12 +772,18 @@ class afcAMS(afcUnit):
         afc_function = getattr(self.afc, "function", None)
         if not section_name or afc_function is None:
             return
-        config_writer = getattr(afc_function, "ConfigRewrite", None)
-        if not callable(config_writer):
-            return
+
         msg = f"\n{self.name} {key}: New: {value}"
         if previous_string:
             msg += f" Old: {previous_string}"
+
+        if self._rewrite_oams_config_file(section_name, key, value, msg):
+            return
+
+        config_writer = getattr(afc_function, "ConfigRewrite", None)
+        if not callable(config_writer):
+            return
+
         try:
             config_writer(section_name, key, value, msg)
         except Exception:
