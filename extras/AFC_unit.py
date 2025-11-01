@@ -228,11 +228,12 @@ class afcUnit:
         prompt = AFCprompt(gcmd, self.logger)
         buttons = []
         title = '{} Calibration'.format(self.name)
-        text = 'Select to calibrate the distance from extruder to hub or bowden length'
         # Selection buttons
         if self._is_openams_unit():
+            text = 'Select to calibrate the hub_hes value or oams ptfe length.'
             lane_button_label = "Calibrate Lane HUB HES"
         else:
+            text = 'Select to calibrate the distance from extruder to hub or bowden length'
             lane_button_label = "Calibrate Lanes"
 
         buttons.append((lane_button_label, "UNIT_LANE_CALIBRATION UNIT={}".format(self.name), "primary"))
