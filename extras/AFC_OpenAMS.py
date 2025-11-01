@@ -24,6 +24,8 @@ try: from extras.AFC_lane import AFCLane, AFCLaneState
 except: raise ConfigError(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.format_exc()))
 try: from extras.AFC_utils import add_filament_switch
 except: raise ConfigError(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.format_exc()))
+try: from extras.AFC_respond import AFCprompt
+except: raise ConfigError(ERROR_STR.format(import_lib="AFC_respond", trace=traceback.format_exc()))
 try: import extras.AFC_extruder as _afc_extruder_mod
 except: raise ConfigError(ERROR_STR.format(import_lib="AFC_extruder", trace=traceback.format_exc()))
 
@@ -272,6 +274,8 @@ class afcAMS(afcUnit):
         self._last_encoder_clicks: Optional[int] = None
         self.oams = None
         self.hardware_service = None
+        self._last_hub_hes_string: Optional[str] = None
+        self._last_ptfe_string: Optional[str] = None
 
         if AMSRunoutCoordinator is not None:
             self.hardware_service = AMSRunoutCoordinator.register_afc_unit(self)
@@ -281,6 +285,403 @@ class afcAMS(afcUnit):
             )
 
         self._register_sync_dispatcher()
+
+    cmd_UNIT_CALIBRATION_help = (
+        "open prompt to calibrate OpenAMS HUB HES or PTFE length values"
+    )
+
+    def cmd_UNIT_CALIBRATION(self, gcmd):
+        """Open the OpenAMS calibration prompt with customised buttons."""
+
+        prompt = AFCprompt(gcmd, self.logger)
+        buttons = []
+        title = f"{self.name} Calibration"
+        text = "Select to calibrate the hub_hes value or oams ptfe length."
+
+        buttons.append(
+            (
+                "Calibrate Lane HUB HES",
+                "UNIT_LANE_CALIBRATION UNIT={}".format(self.name),
+                "primary",
+            )
+        )
+
+        direct_hubs = any(lane.is_direct_hub() for lane in self.afc.lanes.values())
+        lanes_loaded = any(
+            lane.load_state and not lane.is_direct_hub()
+            for lane in self.afc.lanes.values()
+        )
+
+        if not direct_hubs or lanes_loaded:
+            buttons.append(
+                (
+                    "Calibrate OAMS PTFE Length",
+                    "UNIT_BOW_CALIBRATION UNIT={}".format(self.name),
+                    "secondary",
+                )
+            )
+
+        if self.afc.td1_defined:
+            buttons.append(
+                (
+                    "Calibrate TD-1 Length",
+                    "AFC_UNIT_TD_ONE_CALIBRATION UNIT={}".format(self.name),
+                    "primary",
+                )
+            )
+
+        back = [("Back to unit selection", "AFC_CALIBRATION", "info")]
+
+        prompt.create_custom_p(title, text, buttons, True, None, back)
+
+    cmd_UNIT_LANE_CALIBRATION_help = (
+        "open prompt to calibrate OpenAMS hub_hes values for each lane"
+    )
+
+    def cmd_UNIT_LANE_CALIBRATION(self, gcmd):
+        """Prompt for calibrating HUB HES values via OpenAMS macros."""
+
+        prompt = AFCprompt(gcmd, self.logger)
+        buttons = []
+        group_buttons = []
+        index = 0
+        title = f"{self.name} Lane Calibration"
+        text = (
+            "Select a loaded lane from {} to calibrate HUB HES using OpenAMS. "
+            "Command: OAMS_CALIBRATE_HUB_HES"
+        ).format(self.name)
+
+        for lane in self.lanes.values():
+            if not lane.load_state:
+                continue
+
+            command = self._format_hub_hes_calibration_command(lane)
+            if not command:
+                continue
+
+            button_label = "{}".format(lane)
+            button_style = "primary" if index % 2 == 0 else "secondary"
+            group_buttons.append((button_label, command, button_style))
+
+            index += 1
+            if index % 2 == 0:
+                buttons.append(list(group_buttons))
+                group_buttons = []
+
+        if group_buttons:
+            buttons.append(list(group_buttons))
+
+        if index == 0:
+            text = "No lanes are loaded, please load before calibration"
+
+        back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
+
+        prompt.create_custom_p(title, text, None, True, buttons, back)
+
+    cmd_UNIT_BOW_CALIBRATION_help = (
+        "open prompt to calibrate OpenAMS PTFE lengths"
+    )
+
+    def cmd_UNIT_BOW_CALIBRATION(self, gcmd):
+        """Prompt for calibrating PTFE length for OpenAMS lanes."""
+
+        prompt = AFCprompt(gcmd, self.logger)
+        buttons = []
+        group_buttons = []
+        index = 0
+        title = f"OAMS PTFE Calibration {self.name}"
+        text = (
+            "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
+            "Command: OAMS_CALIBRATE_PTFE_LENGTH"
+        ).format(self.name)
+
+        for lane in self.lanes.values():
+            if not lane.load_state:
+                continue
+
+            command = self._format_ptfe_length_calibration_command(lane)
+            if not command:
+                continue
+
+            button_label = "{}".format(lane)
+            button_style = "primary" if index % 2 == 0 else "secondary"
+            group_buttons.append((button_label, command, button_style))
+
+            index += 1
+            if index % 2 == 0:
+                buttons.append(list(group_buttons))
+                group_buttons = []
+
+        if group_buttons:
+            buttons.append(list(group_buttons))
+
+        if index == 0:
+            text = "No lanes are loaded, please load before calibration"
+
+        back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
+
+        prompt.create_custom_p(title, text, None, True, buttons, back)
+
+    def _get_openams_index(self):
+        oams_name = getattr(self, "oams_name", None)
+        if not oams_name:
+            return None
+
+        match = re.search(r"(\d+)$", str(oams_name))
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _get_openams_spool_index(self, lane):
+        try:
+            index = int(getattr(lane, "index", 0)) - 1
+        except (TypeError, ValueError):
+            return None
+
+        return index if index >= 0 else None
+
+    def _format_openams_calibration_command(self, base_command, lane):
+        oams_index = self._get_openams_index()
+        spool_index = self._get_openams_spool_index(lane)
+
+        if oams_index is None or spool_index is None:
+            lane_name = getattr(lane, "name", lane)
+            self.logger.warning(
+                "Unable to format OpenAMS calibration command for lane %s on unit %s",
+                lane_name,
+                self.name,
+            )
+            return None
+
+        return f"{base_command} OAMS={oams_index} SPOOL={spool_index}"
+
+    def _format_hub_hes_calibration_command(self, lane):
+        return self._format_openams_calibration_command("OAMS_CALIBRATE_HUB_HES", lane)
+
+    def _format_ptfe_length_calibration_command(self, lane):
+        return self._format_openams_calibration_command("OAMS_CALIBRATE_PTFE_LENGTH", lane)
+
+    def _values_look_binary(self, values):
+        if not values:
+            return False
+        tolerance = 1e-3
+        for value in values:
+            if value is None:
+                continue
+            if abs(value) <= tolerance or abs(value - 1.0) <= tolerance:
+                continue
+            return False
+        return True
+
+    def _normalize_numeric_sequence(self, raw_values):
+        if raw_values is None:
+            return None
+        if isinstance(raw_values, (int, float)):
+            return (float(raw_values),)
+        if isinstance(raw_values, str):
+            candidate = raw_values.strip()
+            if not candidate:
+                return None
+            if "," in candidate:
+                parts = [part.strip() for part in candidate.split(",")]
+                numbers = []
+                for part in parts:
+                    if not part:
+                        continue
+                    try:
+                        numbers.append(float(part))
+                    except (TypeError, ValueError):
+                        return None
+                return tuple(numbers) if numbers else None
+            try:
+                return (float(candidate),)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(raw_values, (list, tuple)):
+            numbers = []
+            for item in raw_values:
+                normalized = self._normalize_numeric_sequence(item)
+                if not normalized:
+                    continue
+                numbers.extend(normalized)
+            return tuple(numbers) if numbers else None
+        if isinstance(raw_values, dict):
+            items = []
+            numeric_keys = True
+            keys = list(raw_values.keys())
+            for key in keys:
+                try:
+                    int(key)
+                except (TypeError, ValueError):
+                    numeric_keys = False
+                    break
+            if numeric_keys:
+                for key in sorted(keys, key=lambda item: int(item)):
+                    items.append(raw_values[key])
+            else:
+                items.extend(raw_values.values())
+            numbers = []
+            for item in items:
+                normalized = self._normalize_numeric_sequence(item)
+                if not normalized:
+                    continue
+                numbers.extend(normalized)
+            return tuple(numbers) if numbers else None
+        return None
+
+    def _extract_hub_hes_calibration_values(self, status):
+        candidates = []
+        if status:
+            for key in ("hub_hes_on", "hub_hes_value", "hub_hes_values"):
+                value = status.get(key)
+                if value is not None:
+                    candidates.append(value)
+            calibration = status.get("calibration")
+            if isinstance(calibration, dict):
+                for key in ("hub_hes_on", "hub_hes_value", "hub_hes_values"):
+                    value = calibration.get(key)
+                    if value is not None:
+                        candidates.append(value)
+
+        controller = None
+        if self.hardware_service is not None:
+            try:
+                controller = self.hardware_service.resolve_controller()
+            except Exception:
+                controller = None
+        if controller is None:
+            controller = self.oams
+
+        if controller is not None:
+            for attr in ("hub_hes_on", "hub_hes_value", "hub_hes_values"):
+                try:
+                    value = getattr(controller, attr)
+                except Exception:
+                    value = None
+                if value is not None:
+                    candidates.append(value)
+
+        for candidate in candidates:
+            normalized = self._normalize_numeric_sequence(candidate)
+            if not normalized:
+                continue
+            if self._values_look_binary(normalized):
+                continue
+            return normalized
+        return None
+
+    def _extract_ptfe_calibration_values(self, status):
+        candidates = []
+        if status:
+            for key in (
+                "ptfe_length",
+                "ptfe_lengths",
+                "ptfe_length_value",
+                "ptfe_length_values",
+            ):
+                value = status.get(key)
+                if value is not None:
+                    candidates.append(value)
+            calibration = status.get("calibration")
+            if isinstance(calibration, dict):
+                for key in ("ptfe_length", "ptfe_lengths"):
+                    value = calibration.get(key)
+                    if value is not None:
+                        candidates.append(value)
+
+        controller = None
+        if self.hardware_service is not None:
+            try:
+                controller = self.hardware_service.resolve_controller()
+            except Exception:
+                controller = None
+        if controller is None:
+            controller = self.oams
+
+        if controller is not None:
+            for attr in ("ptfe_length", "ptfe_lengths", "bowden_length"):
+                try:
+                    value = getattr(controller, attr)
+                except Exception:
+                    value = None
+                if value is not None:
+                    candidates.append(value)
+
+        for candidate in candidates:
+            normalized = self._normalize_numeric_sequence(candidate)
+            if not normalized:
+                continue
+            if self._values_look_binary(normalized):
+                continue
+            return normalized
+        return None
+
+    def _format_numeric_values(self, values):
+        if not values:
+            return None
+        if not isinstance(values, (list, tuple)):
+            values = (values,)
+        formatted = []
+        for value in values:
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if abs(number - round(number)) <= 1e-6:
+                formatted.append(str(int(round(number))))
+            else:
+                formatted.append(f"{number:.6f}".rstrip("0").rstrip("."))
+        return ", ".join(formatted) if formatted else None
+
+    def _write_openams_config_value(self, key, value, previous_string=None):
+        if not value:
+            return
+        section_name = f"oams {self.oams_name}" if self.oams_name else None
+        afc_function = getattr(self.afc, "function", None)
+        if not section_name or afc_function is None:
+            return
+        config_writer = getattr(afc_function, "ConfigRewrite", None)
+        if not callable(config_writer):
+            return
+        msg = f"\n{self.name} {key}: New: {value}"
+        if previous_string:
+            msg += f" Old: {previous_string}"
+        try:
+            config_writer(section_name, key, value, msg)
+        except Exception:
+            self.logger.exception(
+                "Failed to persist %s to oams config for unit %s", key, self.name
+            )
+
+    def _persist_openams_calibration_results(self, status):
+        hub_values = self._extract_hub_hes_calibration_values(status)
+        if hub_values:
+            formatted = self._format_numeric_values(hub_values)
+            if formatted:
+                if self._last_hub_hes_string is None:
+                    self._last_hub_hes_string = formatted
+                elif formatted != self._last_hub_hes_string:
+                    self._write_openams_config_value(
+                        "hub_hes_on", formatted, previous_string=self._last_hub_hes_string
+                    )
+                    self._last_hub_hes_string = formatted
+
+        ptfe_values = self._extract_ptfe_calibration_values(status)
+        if ptfe_values:
+            formatted = self._format_numeric_values(ptfe_values)
+            if formatted:
+                if self._last_ptfe_string is None:
+                    self._last_ptfe_string = formatted
+                elif formatted != self._last_ptfe_string:
+                    self._write_openams_config_value(
+                        "ptfe_length", formatted, previous_string=self._last_ptfe_string
+                    )
+                    self._last_ptfe_string = formatted
 
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
@@ -1002,6 +1403,13 @@ class afcAMS(afcUnit):
 
             if not status:
                 return eventtime + self.interval
+
+            try:
+                self._persist_openams_calibration_results(status)
+            except Exception:
+                self.logger.exception(
+                    "Failed to persist OpenAMS calibration data for %s", self.name
+                )
 
             encoder_clicks = status.get("encoder_clicks")
             try:
