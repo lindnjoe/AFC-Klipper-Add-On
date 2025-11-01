@@ -12,7 +12,7 @@ import os
 import re
 import traceback
 from textwrap import dedent
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from types import MethodType
 
 from configparser import Error as ConfigError
@@ -1400,8 +1400,6 @@ class afcAMS(afcUnit):
         lane = self._lane_for_spool_index(spool_index)
         lane_name = getattr(lane, "name", None)
         raw_command = f"OAMS_CALIBRATE_PTFE_LENGTH OAMS={oams_index} SPOOL={spool_index}"
-        previous_length = self._last_ptfe_string
-
         captured_messages: List[str] = []
         respond_info = getattr(self.gcode, "respond_info", None)
         original_attribute = _MISSING
@@ -1431,53 +1429,33 @@ class afcAMS(afcUnit):
                 else:
                     self.gcode.respond_info = original_attribute
 
-        updated_length, status = self._force_sync_ptfe_calibration(previous_length)
+        captured_values = self._extract_ptfe_length_from_messages(captured_messages)
+        formatted_capture = None
+        if captured_values:
+            formatted_capture = self._format_numeric_values(captured_values)
 
-        if (
-            not updated_length or updated_length == previous_length
-        ) and captured_messages:
-            captured_values = self._extract_ptfe_length_from_messages(captured_messages)
-            if captured_values:
-                formatted_capture = self._format_numeric_values(captured_values)
-                if formatted_capture and formatted_capture != self._last_ptfe_string:
-                    self._write_openams_config_value(
-                        "ptfe_length",
-                        formatted_capture,
-                        previous_string=self._last_ptfe_string,
-                    )
-                if formatted_capture:
-                    self._last_ptfe_string = formatted_capture
-                    updated_length = formatted_capture
-                    status = status or {}
-
-        if updated_length and updated_length != previous_length:
+        if formatted_capture:
+            if formatted_capture != self._last_ptfe_string:
+                self._write_openams_config_value(
+                    "ptfe_length",
+                    formatted_capture,
+                    previous_string=self._last_ptfe_string,
+                )
+            self._last_ptfe_string = formatted_capture
             if lane_name:
                 gcmd.respond_info(
-                    f"Stored OpenAMS PTFE length {updated_length} for {lane_name} in oamsc.cfg."
+                    f"Stored OpenAMS PTFE length {formatted_capture} for {lane_name} in oamsc.cfg."
                 )
             else:
                 gcmd.respond_info(
-                    f"Stored OpenAMS PTFE length {updated_length} in oamsc.cfg."
+                    f"Stored OpenAMS PTFE length {formatted_capture} in oamsc.cfg."
                 )
             return
 
-        measured = None
-        if status:
-            try:
-                values = self._extract_ptfe_calibration_values(status)
-            except Exception:
-                values = None
-            if values:
-                measured = self._format_numeric_values(values)
-        if measured is None and captured_messages:
-            captured_values = self._extract_ptfe_length_from_messages(captured_messages)
-            if captured_values:
-                measured = self._format_numeric_values(captured_values)
-
-        if measured:
+        if self._last_ptfe_string:
             gcmd.respond_info(
-                "Completed {}. Latest reported PTFE length: {}.".format(
-                    raw_command, measured
+                "Completed {}. Latest known PTFE length: {}.".format(
+                    raw_command, self._last_ptfe_string
                 )
             )
         else:
@@ -1486,94 +1464,6 @@ class afcAMS(afcUnit):
                     raw_command
                 )
             )
-
-    def _force_sync_ptfe_calibration(
-        self, previous_length: Optional[str]
-    ) -> Tuple[Optional[str], Optional[Dict[str, object]]]:
-        """Poll OpenAMS immediately so new PTFE data is persisted."""
-
-        status_snapshot: Optional[Dict[str, object]] = None
-
-        eventtime = None
-        try:
-            eventtime = self.reactor.monotonic()
-        except Exception:
-            eventtime = None
-
-        if eventtime is not None:
-            try:
-                self._sync_event(eventtime)
-            except Exception:
-                self.logger.debug(
-                    "Immediate OpenAMS sync after PTFE calibration failed",
-                    exc_info=True,
-                )
-
-        if self._last_ptfe_string and self._last_ptfe_string != previous_length:
-            return self._last_ptfe_string, status_snapshot
-
-        if self.hardware_service is not None:
-            try:
-                status_snapshot = self.hardware_service.poll_status()
-            except Exception:
-                status_snapshot = None
-
-            if not status_snapshot:
-                status_snapshot = self.hardware_service.latest_status()
-
-        controller = None
-        if not status_snapshot and self.hardware_service is not None:
-            try:
-                controller = self.hardware_service.resolve_controller()
-            except Exception:
-                controller = None
-
-        if controller is None:
-            controller = self.oams
-
-        if controller is not None:
-            try:
-                if eventtime is None:
-                    eventtime = self.reactor.monotonic()
-            except Exception:
-                eventtime = 0.0
-
-            snapshot = None
-            try:
-                snapshot = controller.get_status(eventtime)
-            except Exception:
-                snapshot = None
-
-            status_snapshot = status_snapshot or snapshot or {}
-
-            ptfe_keys = (
-                "ptfe_length",
-                "ptfe_lengths",
-                "ptfe_length_value",
-                "ptfe_length_values",
-                "ptfe_length_mm",
-                "ptfe_lengths_mm",
-                "bowden_length",
-                "bowden_lengths",
-            )
-
-            for attr in ptfe_keys:
-                try:
-                    value = getattr(controller, attr)
-                except Exception:
-                    value = None
-                if value is not None and attr not in status_snapshot:
-                    status_snapshot[attr] = value
-
-        if status_snapshot:
-            try:
-                self._persist_openams_calibration_results(status_snapshot)
-            except Exception:
-                self.logger.exception(
-                    "Failed to persist OpenAMS PTFE calibration results immediately"
-                )
-
-        return self._last_ptfe_string, status_snapshot
 
     @classmethod
     def _dispatch_sync_tool_sensor(cls, gcmd):
