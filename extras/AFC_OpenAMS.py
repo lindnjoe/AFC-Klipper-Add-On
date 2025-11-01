@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import re
 import traceback
@@ -276,9 +275,6 @@ class afcAMS(afcUnit):
         self._lane_feed_activity: Dict[str, bool] = {}
         self._lane_feed_activity_by_lane: Dict[object, bool] = {}
         self._last_encoder_clicks: Optional[int] = None
-        self._last_hub_hes_string: Optional[str] = None
-        self._last_ptfe_string: Optional[str] = None
-        self._last_lane_ptfe_lengths: Dict[str, float] = {}
         self.oams = None
         self.hardware_service = None
 
@@ -802,31 +798,37 @@ class afcAMS(afcUnit):
                 formatted.append(f"{number:.6f}".rstrip("0").rstrip("."))
         return ", ".join(formatted) if formatted else None
 
-    def _persist_lane_ptfe_length(self, lane, new_length) -> bool:
-        """Record the latest calibrated PTFE length for a lane."""
+    def _write_lane_config_value(self, lane, key, value):
+        if lane is None or value is None:
+            return
 
-        if lane is None:
-            return False
+        afc_function = getattr(self.afc, "function", None)
+        if afc_function is None:
+            return
+
+        section_name = getattr(lane, "fullname", None)
+        if not section_name:
+            return
+
+        formatted_value = self._format_numeric_values((value,))
+        if not formatted_value:
+            formatted_value = str(value)
+
+        msg = f"\n{lane} {key}: New: {formatted_value}"
+
+        config_writer = getattr(afc_function, "ConfigRewrite", None)
+        if not callable(config_writer):
+            return
 
         try:
-            numeric_length = float(new_length)
-        except (TypeError, ValueError):
-            return False
+            config_writer(section_name, key, formatted_value, msg)
+        except Exception:
+            lane_name = getattr(lane, "name", lane)
+            self.logger.exception(
+                "Failed to persist %s to lane config for %s", key, lane_name
+            )
 
-        if not math.isfinite(numeric_length) or numeric_length <= 0.0:
-            return False
-
-        lane_key = getattr(lane, "name", None) or str(lane)
-        tolerance = 1e-3
-        last_saved = self._last_lane_ptfe_lengths.get(lane_key)
-        if last_saved is not None and abs(last_saved - numeric_length) <= tolerance:
-            return False
-
-        self._last_lane_ptfe_lengths[lane_key] = numeric_length
-
-        return True
-
-    def _write_openams_config_value(self, key, value, previous_string=None):
+    def _write_openams_config_value(self, key, value):
         if not value:
             return
         afc_function = getattr(self.afc, "function", None)
@@ -848,8 +850,6 @@ class afcAMS(afcUnit):
                 return
 
         msg = f"\n{self.name} {key}: New: {value}"
-        if previous_string:
-            msg += f" Old: {previous_string}"
 
         config_writer = getattr(afc_function, "ConfigRewrite", None)
         if not callable(config_writer):
@@ -866,33 +866,14 @@ class afcAMS(afcUnit):
         hub_values = self._extract_hub_hes_calibration_values(status)
         if hub_values:
             formatted = self._format_numeric_values(hub_values)
-            if formatted and formatted != self._last_hub_hes_string:
-                self._write_openams_config_value(
-                    "hub_hes_on", formatted, previous_string=self._last_hub_hes_string
-                )
             if formatted:
-                self._last_hub_hes_string = formatted
+                self._write_openams_config_value("hub_hes_on", formatted)
 
         ptfe_values = self._extract_ptfe_calibration_values(status)
         if ptfe_values:
             formatted = self._format_numeric_values(ptfe_values)
-            if formatted and formatted != self._last_ptfe_string:
-                self._write_openams_config_value(
-                    "ptfe_length", formatted, previous_string=self._last_ptfe_string
-                )
             if formatted:
-                self._last_ptfe_string = formatted
-            for lane in self.lanes.values():
-                spool_index = self._get_openams_spool_index(lane)
-                if spool_index is None:
-                    continue
-                try:
-                    lane_value = ptfe_values[spool_index]
-                except (IndexError, TypeError):
-                    continue
-                if lane_value is None:
-                    continue
-                self._persist_lane_ptfe_length(lane, lane_value)
+                self._write_openams_config_value("ptfe_length", formatted)
 
     cmd_UNIT_BOW_CALIBRATION_help = (
         "open prompt to calibrate OpenAMS PTFE lengths"
@@ -1492,39 +1473,36 @@ class afcAMS(afcUnit):
                 lane_length_value = captured_values[spool_index]
             elif len(captured_values) == 1:
                 lane_length_value = captured_values[0]
-            if lane_length_value is not None:
-                self._persist_lane_ptfe_length(lane, lane_length_value)
 
         formatted_capture = None
         if captured_values:
             formatted_capture = self._format_numeric_values(captured_values)
+            if formatted_capture:
+                self._write_openams_config_value("ptfe_length", formatted_capture)
 
-        if formatted_capture:
-            if formatted_capture != self._last_ptfe_string:
-                self._write_openams_config_value(
-                    "ptfe_length",
-                    formatted_capture,
-                    previous_string=self._last_ptfe_string,
-                )
-            self._last_ptfe_string = formatted_capture
+        lane_value_str = None
+        if lane is not None and lane_length_value is not None:
+            self._write_lane_config_value(lane, "ptfe_length", lane_length_value)
+            lane_value_str = self._format_numeric_values((lane_length_value,))
+
+        if lane_value_str:
             lane_suffix = f" for {lane_name}" if lane_name else ""
             gcmd.respond_info(
-                f"Stored OpenAMS PTFE length {formatted_capture}{lane_suffix} in your cfg."
+                f"Stored OpenAMS PTFE length {lane_value_str}{lane_suffix} in your cfg."
             )
             return
 
-        if self._last_ptfe_string:
+        if formatted_capture:
             gcmd.respond_info(
-                "Completed {}. Latest known PTFE length: {}.".format(
-                    raw_command, self._last_ptfe_string
-                )
+                f"Stored OpenAMS PTFE length {formatted_capture} in your cfg."
             )
-        else:
-            gcmd.respond_info(
-                "Completed {} but no PTFE length was reported. Check OpenAMS status logs.".format(
-                    raw_command
-                )
+            return
+
+        gcmd.respond_info(
+            "Completed {} but no PTFE length was reported. Check OpenAMS status logs.".format(
+                raw_command
             )
+        )
 
     cmd_AFC_OAMS_CALIBRATE_PTFE_help = (
         "calibrate the OpenAMS PTFE length for the specified lane and save the result"
