@@ -392,6 +392,7 @@ class afcAMS(afcUnit):
         title = f"OAMS PTFE Calibration {self.name}"
         text = (
             "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
+            "Results will be saved to oamsc.cfg when values change. "
             "Command: OAMS_CALIBRATE_PTFE_LENGTH"
         ).format(self.name)
 
@@ -575,22 +576,34 @@ class afcAMS(afcUnit):
 
     def _extract_ptfe_calibration_values(self, status):
         candidates = []
+        ptfe_keys = (
+            "ptfe_length",
+            "ptfe_lengths",
+            "ptfe_length_value",
+            "ptfe_length_values",
+            "ptfe_length_mm",
+            "ptfe_lengths_mm",
+            "bowden_length",
+            "bowden_lengths",
+        )
+
         if status:
-            for key in (
-                "ptfe_length",
-                "ptfe_lengths",
-                "ptfe_length_value",
-                "ptfe_length_values",
-            ):
+            for key in ptfe_keys:
                 value = status.get(key)
                 if value is not None:
                     candidates.append(value)
             calibration = status.get("calibration")
             if isinstance(calibration, dict):
-                for key in ("ptfe_length", "ptfe_lengths"):
+                for key in ptfe_keys:
                     value = calibration.get(key)
                     if value is not None:
                         candidates.append(value)
+                nested = calibration.get("values")
+                if isinstance(nested, dict):
+                    for key in ptfe_keys:
+                        value = nested.get(key)
+                        if value is not None:
+                            candidates.append(value)
 
         controller = None
         if self.hardware_service is not None:
@@ -602,7 +615,7 @@ class afcAMS(afcUnit):
             controller = self.oams
 
         if controller is not None:
-            for attr in ("ptfe_length", "ptfe_lengths", "bowden_length"):
+            for attr in ptfe_keys:
                 try:
                     value = getattr(controller, attr)
                 except Exception:
