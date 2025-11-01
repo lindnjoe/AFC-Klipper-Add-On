@@ -12,7 +12,8 @@ import os
 import re
 import traceback
 from textwrap import dedent
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+from types import MethodType
 
 from configparser import Error as ConfigError
 try: from extras.AFC_utils import ERROR_STR
@@ -37,6 +38,7 @@ except Exception:  # pragma: no cover - integration may be absent during import
     AMSRunoutCoordinator = None
 
 SYNC_INTERVAL = 2.0
+_MISSING = object()
 _ORIGINAL_LANE_PRE_SENSOR = getattr(AFCLane, "get_toolhead_pre_sensor_state", None)
 
 class _VirtualRunoutHelper:
@@ -685,6 +687,27 @@ class afcAMS(afcUnit):
                 continue
             return normalized
         return None
+
+    def _extract_ptfe_length_from_messages(self, messages: List[str]) -> Optional[List[float]]:
+        if not messages:
+            return None
+
+        pattern = re.compile(
+            r"(?:ptfe|bowden)[^0-9\-]*(-?[0-9]+(?:\.[0-9]+)?)",
+            re.IGNORECASE,
+        )
+
+        extracted: List[float] = []
+        for message in messages:
+            if not isinstance(message, str):
+                continue
+            for match in pattern.finditer(message):
+                try:
+                    extracted.append(float(match.group(1)))
+                except (TypeError, ValueError):
+                    continue
+
+        return extracted or None
 
     def _format_numeric_values(self, values):
         if not values:
@@ -1379,9 +1402,53 @@ class afcAMS(afcUnit):
         raw_command = f"OAMS_CALIBRATE_PTFE_LENGTH OAMS={oams_index} SPOOL={spool_index}"
         previous_length = self._last_ptfe_string
 
-        self.gcode.run_script_from_command(raw_command)
+        captured_messages: List[str] = []
+        respond_info = getattr(self.gcode, "respond_info", None)
+        original_attribute = _MISSING
+
+        if callable(respond_info):
+            try:
+                original_attribute = self.gcode.__dict__["respond_info"]
+            except (AttributeError, KeyError):
+                original_attribute = _MISSING
+
+            def _capture_messages(this, message, *args, **kwargs):
+                if isinstance(message, str):
+                    captured_messages.append(message)
+                return respond_info(message, *args, **kwargs)
+
+            self.gcode.respond_info = MethodType(_capture_messages, self.gcode)
+
+        try:
+            self.gcode.run_script_from_command(raw_command)
+        finally:
+            if callable(respond_info):
+                if original_attribute is _MISSING:
+                    try:
+                        delattr(self.gcode, "respond_info")
+                    except AttributeError:
+                        pass
+                else:
+                    self.gcode.respond_info = original_attribute
 
         updated_length, status = self._force_sync_ptfe_calibration(previous_length)
+
+        if (
+            not updated_length or updated_length == previous_length
+        ) and captured_messages:
+            captured_values = self._extract_ptfe_length_from_messages(captured_messages)
+            if captured_values:
+                formatted_capture = self._format_numeric_values(captured_values)
+                if formatted_capture and formatted_capture != self._last_ptfe_string:
+                    self._write_openams_config_value(
+                        "ptfe_length",
+                        formatted_capture,
+                        previous_string=self._last_ptfe_string,
+                    )
+                if formatted_capture:
+                    self._last_ptfe_string = formatted_capture
+                    updated_length = formatted_capture
+                    status = status or {}
 
         if updated_length and updated_length != previous_length:
             if lane_name:
@@ -1402,6 +1469,10 @@ class afcAMS(afcUnit):
                 values = None
             if values:
                 measured = self._format_numeric_values(values)
+        if measured is None and captured_messages:
+            captured_values = self._extract_ptfe_length_from_messages(captured_messages)
+            if captured_values:
+                measured = self._format_numeric_values(captured_values)
 
         if measured:
             gcmd.respond_info(
