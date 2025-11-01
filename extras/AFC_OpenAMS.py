@@ -977,7 +977,7 @@ class afcAMS(afcUnit):
         title = f"OAMS PTFE Calibration {self.name}"
         text = (
             "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
-            "Results will be saved to your cfg when values change. "
+            "Results will be save to your cfg when values change. "
             "Command: OAMS_CALIBRATE_PTFE_LENGTH"
         ).format(self.name)
 
