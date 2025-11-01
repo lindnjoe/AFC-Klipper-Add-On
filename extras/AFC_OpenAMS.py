@@ -826,97 +826,30 @@ class afcAMS(afcUnit):
 
         return True
 
-    def _rewrite_oams_config_file(
-        self, section_name: str, key: str, value: str, msg: str
-    ) -> bool:
-        config_dir = getattr(self.afc, "cfgloc", None)
-        if not config_dir:
-            return False
-
-        try:
-            config_files = sorted(
-                os.path.join(config_dir, filename)
-                for filename in os.listdir(config_dir)
-                if filename.lower().endswith(".cfg")
-            )
-        except Exception:
-            return False
-
-        header = f"[{section_name}]".strip().lower()
-        key_pattern = re.compile(rf"\s*{re.escape(key)}\s*:")
-
-        for config_path in config_files:
-            if not os.path.isfile(config_path):
-                continue
-
-            try:
-                with open(config_path, "r", encoding="utf-8") as cfg_file:
-                    lines = cfg_file.readlines()
-            except Exception:
-                continue
-
-            in_section = False
-            updated = False
-            output_lines = []
-
-            for raw_line in lines:
-                line = raw_line.rstrip("\n")
-                stripped = line.strip()
-
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    if in_section and not updated:
-                        output_lines.append(f"{key}:{value}")
-                        updated = True
-                    in_section = stripped.lower() == header
-                    output_lines.append(line)
-                    continue
-
-                if in_section and key_pattern.match(line):
-                    comment = ""
-                    if "#" in line:
-                        comment_index = line.index("#")
-                        comment = line[comment_index:].strip()
-                    new_line = f"{key}:{value}"
-                    if comment:
-                        new_line = f"{new_line} {comment}"
-                    output_lines.append(new_line)
-                    updated = True
-                    continue
-
-                output_lines.append(line)
-
-            if in_section and not updated:
-                output_lines.append(f"{key}:{value}")
-                updated = True
-
-            if not updated:
-                continue
-
-            try:
-                with open(config_path, "w", encoding="utf-8") as cfg_file:
-                    cfg_file.write("\n".join(output_lines) + "\n")
-            except Exception:
-                continue
-
-            self.logger.info(msg)
-            return True
-
-        return False
-
     def _write_openams_config_value(self, key, value, previous_string=None):
         if not value:
             return
-        section_name = f"oams {self.oams_name}" if self.oams_name else None
         afc_function = getattr(self.afc, "function", None)
-        if not section_name or afc_function is None:
+        if afc_function is None:
             return
+
+        full_name_tokens = getattr(self, "full_name", None)
+        if isinstance(full_name_tokens, (list, tuple)):
+            section_name = " ".join(
+                str(token) for token in full_name_tokens if token is not None
+            )
+        else:
+            section_name = None
+
+        if not section_name:
+            if self.oams_name:
+                section_name = f"oams {self.oams_name}"
+            else:
+                return
 
         msg = f"\n{self.name} {key}: New: {value}"
         if previous_string:
             msg += f" Old: {previous_string}"
-
-        if self._rewrite_oams_config_file(section_name, key, value, msg):
-            return
 
         config_writer = getattr(afc_function, "ConfigRewrite", None)
         if not callable(config_writer):
