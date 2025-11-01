@@ -796,64 +796,75 @@ class afcAMS(afcUnit):
         if not config_dir:
             return False
 
-        config_path = os.path.join(config_dir, "oamsc.cfg")
-        if not os.path.isfile(config_path):
-            return False
-
         try:
-            with open(config_path, "r", encoding="utf-8") as cfg_file:
-                lines = cfg_file.readlines()
+            config_files = sorted(
+                os.path.join(config_dir, filename)
+                for filename in os.listdir(config_dir)
+                if filename.lower().endswith(".cfg")
+            )
         except Exception:
             return False
 
         header = f"[{section_name}]".strip().lower()
         key_pattern = re.compile(rf"\s*{re.escape(key)}\s*:")
 
-        in_section = False
-        updated = False
-        output_lines = []
+        for config_path in config_files:
+            if not os.path.isfile(config_path):
+                continue
 
-        for raw_line in lines:
-            line = raw_line.rstrip("\n")
-            stripped = line.strip()
+            try:
+                with open(config_path, "r", encoding="utf-8") as cfg_file:
+                    lines = cfg_file.readlines()
+            except Exception:
+                continue
 
-            if stripped.startswith("[") and stripped.endswith("]"):
-                if in_section and not updated:
-                    output_lines.append(f"{key}:{value}")
+            in_section = False
+            updated = False
+            output_lines = []
+
+            for raw_line in lines:
+                line = raw_line.rstrip("\n")
+                stripped = line.strip()
+
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    if in_section and not updated:
+                        output_lines.append(f"{key}:{value}")
+                        updated = True
+                    in_section = stripped.lower() == header
+                    output_lines.append(line)
+                    continue
+
+                if in_section and key_pattern.match(line):
+                    comment = ""
+                    if "#" in line:
+                        comment_index = line.index("#")
+                        comment = line[comment_index:].strip()
+                    new_line = f"{key}:{value}"
+                    if comment:
+                        new_line = f"{new_line} {comment}"
+                    output_lines.append(new_line)
                     updated = True
-                in_section = stripped.lower() == header
+                    continue
+
                 output_lines.append(line)
-                continue
 
-            if in_section and key_pattern.match(line):
-                comment = ""
-                if "#" in line:
-                    comment_index = line.index("#")
-                    comment = line[comment_index:].strip()
-                new_line = f"{key}:{value}"
-                if comment:
-                    new_line = f"{new_line} {comment}"
-                output_lines.append(new_line)
+            if in_section and not updated:
+                output_lines.append(f"{key}:{value}")
                 updated = True
+
+            if not updated:
                 continue
 
-            output_lines.append(line)
+            try:
+                with open(config_path, "w", encoding="utf-8") as cfg_file:
+                    cfg_file.write("\n".join(output_lines) + "\n")
+            except Exception:
+                continue
 
-        if in_section and not updated:
-            output_lines.append(f"{key}:{value}")
-            updated = True
+            self.logger.info(msg)
+            return True
 
-        if not updated:
-            return False
-
-        try:
-            with open(config_path, "w", encoding="utf-8") as cfg_file:
-                cfg_file.write("\n".join(output_lines) + "\n")
-        except Exception:
-            return False
-
-        self.logger.info(msg)
-        return True
+        return False
 
     def _write_openams_config_value(self, key, value, previous_string=None):
         if not value:
