@@ -253,8 +253,6 @@ class afcAMS(afcUnit):
 
     _sync_command_registered = False
     _sync_instances: Dict[str, "afcAMS"] = {}
-    _ptfe_command_registered = False
-    _ptfe_instances: Dict[int, "afcAMS"] = {}
 
     def __init__(self, config):
         super().__init__(config)
@@ -300,7 +298,13 @@ class afcAMS(afcUnit):
         )
 
         self._register_sync_dispatcher()
-        self._register_ptfe_calibration_dispatcher()
+        self.gcode.register_mux_command(
+            "AFC_OAMS_CALIBRATE_PTFE",
+            "UNIT",
+            self.name,
+            self.cmd_AFC_OAMS_CALIBRATE_PTFE,
+            desc=self.cmd_AFC_OAMS_CALIBRATE_PTFE_help,
+        )
 
     cmd_UNIT_CALIBRATION_help = (
         "open prompt to calibrate OpenAMS HUB HES or PTFE length values"
@@ -532,10 +536,17 @@ class afcAMS(afcUnit):
         return self._format_openams_calibration_command("OAMS_CALIBRATE_HUB_HES", lane)
 
     def _format_ptfe_length_calibration_command(self, lane):
-        command = self._format_openams_calibration_command(
-            "AFC_OAMS_CALIBRATE_PTFE", lane
-        )
-        return command
+        spool_index = self._get_openams_spool_index(lane)
+        if spool_index is None:
+            lane_name = getattr(lane, "name", lane)
+            self.logger.warning(
+                "Unable to format OpenAMS PTFE calibration command for lane %s on unit %s",
+                lane_name,
+                self.name,
+            )
+            return None
+
+        return f"AFC_OAMS_CALIBRATE_PTFE UNIT={self.name} SPOOL={spool_index}"
 
     def _values_look_binary(self, values):
         if not values:
@@ -1490,22 +1501,6 @@ class afcAMS(afcUnit):
 
         cls._sync_instances[self.name] = self
 
-    def _register_ptfe_calibration_dispatcher(self) -> None:
-        """Register the shared PTFE calibration wrapper command."""
-
-        cls = self.__class__
-        if not cls._ptfe_command_registered:
-            self.gcode.register_command(
-                "AFC_OAMS_CALIBRATE_PTFE",
-                cls._dispatch_ptfe_calibration_command,
-                desc="Run OAMS_CALIBRATE_PTFE_LENGTH and persist results",
-            )
-            cls._ptfe_command_registered = True
-
-        index = self._get_openams_index()
-        if index is not None:
-            cls._ptfe_instances[index] = self
-
     @classmethod
     def _extract_raw_param(cls, commandline: str, key: str) -> Optional[str]:
         """Recover multi-word parameter values from the raw command line."""
@@ -1532,32 +1527,6 @@ class afcAMS(afcUnit):
             value = value[1:-1]
 
         return value
-
-    @classmethod
-    def _dispatch_ptfe_calibration_command(cls, gcmd):
-        """Route PTFE calibration requests to the matching AMS unit."""
-
-        try:
-            oams_index = gcmd.get_int("OAMS")
-        except Exception:
-            gcmd.respond_info("AFC_OAMS_CALIBRATE_PTFE requires an OAMS parameter")
-            return
-
-        spool_index = gcmd.get_int("SPOOL", None)
-        if spool_index is None:
-            gcmd.respond_info(
-                "AFC_OAMS_CALIBRATE_PTFE requires a SPOOL parameter between 0-3"
-            )
-            return
-
-        instance = cls._ptfe_instances.get(oams_index)
-        if instance is None:
-            gcmd.respond_info(
-                f"No OpenAMS unit is registered for OAMS index {oams_index}"
-            )
-            return
-
-        instance._execute_ptfe_calibration_command(gcmd, oams_index, spool_index)
 
     def _run_command_with_capture(self, command: str) -> List[str]:
         """Execute a command while capturing respond_info messages."""
@@ -1654,6 +1623,38 @@ class afcAMS(afcUnit):
             gcmd.respond_info(
                 f"Updated hub bowden lengths to {formatted_lane}mm for {target_name}."
             )
+
+    cmd_AFC_OAMS_CALIBRATE_PTFE_help = (
+        "calibrate the OpenAMS PTFE length for the specified lane and save the result"
+    )
+
+    def cmd_AFC_OAMS_CALIBRATE_PTFE(self, gcmd):
+        """Handle PTFE calibration requests routed via mux command registration."""
+
+        prompt = AFCprompt(gcmd, self.logger)
+        prompt.p_end()
+
+        spool_index = gcmd.get_int("SPOOL", None)
+        max_index = len(self.lanes) - 1 if isinstance(self.lanes, dict) else None
+        max_label = max_index if max_index is not None and max_index >= 0 else 3
+        if (
+            spool_index is None
+            or spool_index < 0
+            or (max_index is not None and spool_index > max_index)
+        ):
+            gcmd.respond_info(
+                f"AFC_OAMS_CALIBRATE_PTFE requires a SPOOL parameter between 0-{max_label}"
+            )
+            return
+
+        oams_index = self._get_openams_index()
+        if oams_index is None:
+            gcmd.respond_info(
+                f"{self.name} is not mapped to an OpenAMS index for PTFE calibration"
+            )
+            return
+
+        self._execute_ptfe_calibration_command(gcmd, oams_index, spool_index)
 
     @classmethod
     def _dispatch_sync_tool_sensor(cls, gcmd):
