@@ -413,10 +413,28 @@ class afcAMS(afcUnit):
         prompt.p_end()
 
         active_lane = getattr(self.afc, "current", None)
-        if active_lane:
+        active_lane_obj = None
+        active_lane_name = None
+
+        if active_lane is not None:
+            if hasattr(active_lane, "unit_obj"):
+                active_lane_obj = active_lane
+                active_lane_name = getattr(active_lane_obj, "name", str(active_lane_obj))
+            else:
+                active_lane_name = str(active_lane)
+                afc_lanes = getattr(self.afc, "lanes", None)
+                if isinstance(afc_lanes, dict):
+                    active_lane_obj = afc_lanes.get(active_lane_name)
+
+        if (
+            active_lane_obj is not None
+            and getattr(active_lane_obj, "unit_obj", None) is self
+            and getattr(active_lane_obj, "tool_loaded", False)
+        ):
+            lane_label = active_lane_name or getattr(active_lane_obj, "name", "current lane")
             gcmd.respond_info(
-                "Cannot calibrate all OpenAMS lanes while {} is active. "
-                "Please unload the current tool and try again.".format(active_lane)
+                "Cannot calibrate all OpenAMS lanes while {} is active on this unit. "
+                "Please unload the current tool and try again.".format(lane_label)
             )
             return
 
