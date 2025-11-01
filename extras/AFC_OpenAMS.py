@@ -495,12 +495,34 @@ class afcAMS(afcUnit):
                     try:
                         numbers.append(float(part))
                     except (TypeError, ValueError):
-                        return None
+                        try:
+                            match_numbers = re.findall(r"[-+]?[0-9]*\.?[0-9]+", part)
+                        except re.error:
+                            match_numbers = []
+                        if not match_numbers:
+                            return None
+                        for item in match_numbers:
+                            try:
+                                numbers.append(float(item))
+                            except (TypeError, ValueError):
+                                return None
                 return tuple(numbers) if numbers else None
             try:
                 return (float(candidate),)
             except (TypeError, ValueError):
-                return None
+                try:
+                    match_numbers = re.findall(r"[-+]?[0-9]*\.?[0-9]+", candidate)
+                except re.error:
+                    match_numbers = []
+                if not match_numbers:
+                    return None
+                numbers = []
+                for item in match_numbers:
+                    try:
+                        numbers.append(float(item))
+                    except (TypeError, ValueError):
+                        return None
+                return tuple(numbers) if numbers else None
         if isinstance(raw_values, (list, tuple)):
             numbers = []
             for item in raw_values:
@@ -574,6 +596,47 @@ class afcAMS(afcUnit):
             return normalized
         return None
 
+    def _collect_status_values_for_keys(self, status, keys):
+        if not status:
+            return []
+
+        stack = [status]
+        seen = set()
+        collected = []
+        target_keys = {key.lower() for key in keys if isinstance(key, str)}
+        while stack:
+            current = stack.pop()
+            ident = id(current)
+            if ident in seen:
+                continue
+            seen.add(ident)
+
+            if isinstance(current, dict):
+                alias = None
+                for key, value in current.items():
+                    key_name = key.lower() if isinstance(key, str) else key
+                    if key_name in target_keys:
+                        collected.append(value)
+                    if isinstance(value, (dict, list, tuple, set)):
+                        stack.append(value)
+                    if (
+                        alias is None
+                        and isinstance(value, str)
+                        and value.lower() in target_keys
+                    ):
+                        alias = value
+                if alias is not None:
+                    for candidate_key in ("value", "values", "data", "result", "results"):
+                        candidate = current.get(candidate_key)
+                        if candidate is not None:
+                            collected.append(candidate)
+            elif isinstance(current, (list, tuple, set)):
+                for item in current:
+                    if isinstance(item, (dict, list, tuple, set)):
+                        stack.append(item)
+
+        return collected
+
     def _extract_ptfe_calibration_values(self, status):
         candidates = []
         ptfe_keys = (
@@ -587,23 +650,7 @@ class afcAMS(afcUnit):
             "bowden_lengths",
         )
 
-        if status:
-            for key in ptfe_keys:
-                value = status.get(key)
-                if value is not None:
-                    candidates.append(value)
-            calibration = status.get("calibration")
-            if isinstance(calibration, dict):
-                for key in ptfe_keys:
-                    value = calibration.get(key)
-                    if value is not None:
-                        candidates.append(value)
-                nested = calibration.get("values")
-                if isinstance(nested, dict):
-                    for key in ptfe_keys:
-                        value = nested.get(key)
-                        if value is not None:
-                            candidates.append(value)
+        candidates.extend(self._collect_status_values_for_keys(status, ptfe_keys))
 
         controller = None
         if self.hardware_service is not None:
