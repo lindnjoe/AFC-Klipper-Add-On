@@ -12,7 +12,7 @@ import os
 import re
 import traceback
 from textwrap import dedent
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from types import MethodType
 
 from configparser import Error as ConfigError
@@ -289,6 +289,14 @@ class afcAMS(afcUnit):
                 self.printer, self.oams_name, self.logger
             )
 
+        self.gcode.register_mux_command(
+            "AFC_OAMS_CALIBRATE_HUB_HES_ALL",
+            "UNIT",
+            self.name,
+            self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL,
+            desc=self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL_help,
+        )
+
         self._register_sync_dispatcher()
         self._register_ptfe_calibration_dispatcher()
 
@@ -377,12 +385,92 @@ class afcAMS(afcUnit):
         if group_buttons:
             buttons.append(list(group_buttons))
 
-        if index == 0:
+        total_buttons = sum(len(group) for group in buttons)
+        if total_buttons == 0:
             text = "No lanes are loaded, please load before calibration"
+            all_lanes = None
+        else:
+            all_lanes = [
+                (
+                    "All lanes",
+                    f"AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT={self.name}",
+                    "default",
+                )
+            ]
 
         back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
 
-        prompt.create_custom_p(title, text, None, True, buttons, back)
+        prompt.create_custom_p(title, text, all_lanes, True, buttons, back)
+
+    cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL_help = (
+        "calibrate the OpenAMS HUB HES value for all loaded lanes in the unit"
+    )
+
+    def cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL(self, gcmd):
+        """Iterate HUB HES calibration across every loaded OpenAMS lane."""
+
+        prompt = AFCprompt(gcmd, self.logger)
+        prompt.p_end()
+
+        active_lane = getattr(self.afc, "current", None)
+        if active_lane:
+            gcmd.respond_info(
+                "Cannot calibrate all OpenAMS lanes while {} is active. "
+                "Please unload the current tool and try again.".format(active_lane)
+            )
+            return
+
+        calibrations: List[Tuple[object, str]] = []
+        skipped: List[str] = []
+
+        for lane in self.lanes.values():
+            if not getattr(lane, "load_state", False):
+                continue
+
+            command = self._format_hub_hes_calibration_command(lane)
+            if not command:
+                lane_name = getattr(lane, "name", str(lane))
+                skipped.append(lane_name)
+                continue
+
+            calibrations.append((lane, command))
+
+        if not calibrations:
+            gcmd.respond_info(
+                "No loaded OpenAMS lanes were found to calibrate HUB HES values."
+            )
+            return
+
+        successful = 0
+
+        for lane, command in calibrations:
+            lane_name = getattr(lane, "name", str(lane))
+            gcmd.respond_info(
+                f"Running HUB HES calibration for {lane_name} with '{command}'."
+            )
+            try:
+                self.gcode.run_script_from_command(command)
+            except Exception:
+                self.logger.exception(
+                    "Failed to execute OpenAMS HUB HES calibration for lane %s", lane
+                )
+                gcmd.respond_info(
+                    f"Failed to execute HUB HES calibration for {lane_name}. See logs."
+                )
+                continue
+
+            successful += 1
+
+        gcmd.respond_info(
+            f"Completed HUB HES calibration for {successful} OpenAMS lane(s)."
+        )
+
+        if skipped:
+            skipped_lanes = ", ".join(skipped)
+            gcmd.respond_info(
+                "Skipped HUB HES calibration for lanes lacking OpenAMS mapping: "
+                f"{skipped_lanes}."
+            )
 
     def _get_openams_index(self):
         oams_name = getattr(self, "oams_name", None)
