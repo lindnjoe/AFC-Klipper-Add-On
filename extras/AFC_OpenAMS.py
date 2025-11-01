@@ -12,7 +12,7 @@ import os
 import re
 import traceback
 from textwrap import dedent
-from typing import Dict, List, Optional
+from typing import Dict, Optional, List
 from types import MethodType
 
 from configparser import Error as ConfigError
@@ -277,10 +277,10 @@ class afcAMS(afcUnit):
         self._lane_feed_activity: Dict[str, bool] = {}
         self._lane_feed_activity_by_lane: Dict[object, bool] = {}
         self._last_encoder_clicks: Optional[int] = None
-        self.oams = None
-        self.hardware_service = None
         self._last_hub_hes_string: Optional[str] = None
         self._last_ptfe_string: Optional[str] = None
+        self.oams = None
+        self.hardware_service = None
 
         if AMSRunoutCoordinator is not None:
             self.hardware_service = AMSRunoutCoordinator.register_afc_unit(self)
@@ -362,51 +362,6 @@ class afcAMS(afcUnit):
                 continue
 
             command = self._format_hub_hes_calibration_command(lane)
-            if not command:
-                continue
-
-            button_label = "{}".format(lane)
-            button_style = "primary" if index % 2 == 0 else "secondary"
-            group_buttons.append((button_label, command, button_style))
-
-            index += 1
-            if index % 4 == 0:
-                buttons.append(list(group_buttons))
-                group_buttons = []
-
-        if group_buttons:
-            buttons.append(list(group_buttons))
-
-        if index == 0:
-            text = "No lanes are loaded, please load before calibration"
-
-        back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
-
-        prompt.create_custom_p(title, text, None, True, buttons, back)
-
-    cmd_UNIT_BOW_CALIBRATION_help = (
-        "open prompt to calibrate OpenAMS PTFE lengths"
-    )
-
-    def cmd_UNIT_BOW_CALIBRATION(self, gcmd):
-        """Prompt for calibrating PTFE length for OpenAMS lanes."""
-
-        prompt = AFCprompt(gcmd, self.logger)
-        buttons = []
-        group_buttons = []
-        index = 0
-        title = f"OAMS PTFE Calibration {self.name}"
-        text = (
-            "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
-            "Results will be saved to oamsc.cfg when values change. "
-            "Command: OAMS_CALIBRATE_PTFE_LENGTH"
-        ).format(self.name)
-
-        for lane in self.lanes.values():
-            if not lane.load_state:
-                continue
-
-            command = self._format_ptfe_length_calibration_command(lane)
             if not command:
                 continue
 
@@ -840,6 +795,51 @@ class afcAMS(afcUnit):
                 )
             if formatted:
                 self._last_ptfe_string = formatted
+
+    cmd_UNIT_BOW_CALIBRATION_help = (
+        "open prompt to calibrate OpenAMS PTFE lengths"
+    )
+
+    def cmd_UNIT_BOW_CALIBRATION(self, gcmd):
+        """Prompt for calibrating PTFE length for OpenAMS lanes."""
+
+        prompt = AFCprompt(gcmd, self.logger)
+        buttons = []
+        group_buttons = []
+        index = 0
+        title = f"OAMS PTFE Calibration {self.name}"
+        text = (
+            "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
+            "Results will be saved to oamsc.cfg when values change. "
+            "Command: OAMS_CALIBRATE_PTFE_LENGTH"
+        ).format(self.name)
+
+        for lane in self.lanes.values():
+            if not lane.load_state:
+                continue
+
+            command = self._format_ptfe_length_calibration_command(lane)
+            if not command:
+                continue
+
+            button_label = "{}".format(lane)
+            button_style = "primary" if index % 2 == 0 else "secondary"
+            group_buttons.append((button_label, command, button_style))
+
+            index += 1
+            if index % 4 == 0:
+                buttons.append(list(group_buttons))
+                group_buttons = []
+
+        if group_buttons:
+            buttons.append(list(group_buttons))
+
+        if index == 0:
+            text = "No lanes are loaded, please load before calibration"
+
+        back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
+
+        prompt.create_custom_p(title, text, None, True, buttons, back)
 
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
@@ -1394,41 +1394,41 @@ class afcAMS(afcUnit):
 
         instance._execute_ptfe_calibration_command(gcmd, oams_index, spool_index)
 
+    def _run_command_with_capture(self, command: str) -> List[str]:
+        """Execute a command while capturing respond_info messages."""
+
+        captured: List[str] = []
+        respond_info = getattr(self.gcode, "respond_info", None)
+        if not callable(respond_info):
+            self.gcode.run_script_from_command(command)
+            return captured
+
+        original_attribute = self.gcode.__dict__.get("respond_info", _MISSING)
+
+        def _capture_messages(this, message, *args, **kwargs):
+            if isinstance(message, str):
+                captured.append(message)
+            return respond_info(message, *args, **kwargs)
+
+        self.gcode.respond_info = MethodType(_capture_messages, self.gcode)
+
+        try:
+            self.gcode.run_script_from_command(command)
+        finally:
+            if original_attribute is _MISSING:
+                self.gcode.__dict__.pop("respond_info", None)
+            else:
+                self.gcode.respond_info = original_attribute
+
+        return captured
+
     def _execute_ptfe_calibration_command(self, gcmd, oams_index: int, spool_index: int):
         """Run the PTFE calibration macro then persist the reported value."""
 
         lane = self._lane_for_spool_index(spool_index)
         lane_name = getattr(lane, "name", None)
         raw_command = f"OAMS_CALIBRATE_PTFE_LENGTH OAMS={oams_index} SPOOL={spool_index}"
-        captured_messages: List[str] = []
-        respond_info = getattr(self.gcode, "respond_info", None)
-        original_attribute = _MISSING
-
-        if callable(respond_info):
-            try:
-                original_attribute = self.gcode.__dict__["respond_info"]
-            except (AttributeError, KeyError):
-                original_attribute = _MISSING
-
-            def _capture_messages(this, message, *args, **kwargs):
-                if isinstance(message, str):
-                    captured_messages.append(message)
-                return respond_info(message, *args, **kwargs)
-
-            self.gcode.respond_info = MethodType(_capture_messages, self.gcode)
-
-        try:
-            self.gcode.run_script_from_command(raw_command)
-        finally:
-            if callable(respond_info):
-                if original_attribute is _MISSING:
-                    try:
-                        delattr(self.gcode, "respond_info")
-                    except AttributeError:
-                        pass
-                else:
-                    self.gcode.respond_info = original_attribute
-
+        captured_messages = self._run_command_with_capture(raw_command)
         captured_values = self._extract_ptfe_length_from_messages(captured_messages)
         formatted_capture = None
         if captured_values:
@@ -1442,14 +1442,10 @@ class afcAMS(afcUnit):
                     previous_string=self._last_ptfe_string,
                 )
             self._last_ptfe_string = formatted_capture
-            if lane_name:
-                gcmd.respond_info(
-                    f"Stored OpenAMS PTFE length {formatted_capture} for {lane_name} in oamsc.cfg."
-                )
-            else:
-                gcmd.respond_info(
-                    f"Stored OpenAMS PTFE length {formatted_capture} in oamsc.cfg."
-                )
+            lane_suffix = f" for {lane_name}" if lane_name else ""
+            gcmd.respond_info(
+                f"Stored OpenAMS PTFE length {formatted_capture}{lane_suffix} in oamsc.cfg."
+            )
             return
 
         if self._last_ptfe_string:
@@ -2073,3 +2069,4 @@ def load_config_prefix(config):
     _patch_lane_pre_sensor_for_ams()
     _patch_extruder_for_virtual_ams()
     return afcAMS(config)
+
