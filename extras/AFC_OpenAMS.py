@@ -662,26 +662,22 @@ class afcAMS(afcUnit):
         hub_values = self._extract_hub_hes_calibration_values(status)
         if hub_values:
             formatted = self._format_numeric_values(hub_values)
+            if formatted and formatted != self._last_hub_hes_string:
+                self._write_openams_config_value(
+                    "hub_hes_on", formatted, previous_string=self._last_hub_hes_string
+                )
             if formatted:
-                if self._last_hub_hes_string is None:
-                    self._last_hub_hes_string = formatted
-                elif formatted != self._last_hub_hes_string:
-                    self._write_openams_config_value(
-                        "hub_hes_on", formatted, previous_string=self._last_hub_hes_string
-                    )
-                    self._last_hub_hes_string = formatted
+                self._last_hub_hes_string = formatted
 
         ptfe_values = self._extract_ptfe_calibration_values(status)
         if ptfe_values:
             formatted = self._format_numeric_values(ptfe_values)
+            if formatted and formatted != self._last_ptfe_string:
+                self._write_openams_config_value(
+                    "ptfe_length", formatted, previous_string=self._last_ptfe_string
+                )
             if formatted:
-                if self._last_ptfe_string is None:
-                    self._last_ptfe_string = formatted
-                elif formatted != self._last_ptfe_string:
-                    self._write_openams_config_value(
-                        "ptfe_length", formatted, previous_string=self._last_ptfe_string
-                    )
-                    self._last_ptfe_string = formatted
+                self._last_ptfe_string = formatted
 
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
