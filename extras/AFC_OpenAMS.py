@@ -803,13 +803,9 @@ class afcAMS(afcUnit):
         return ", ".join(formatted) if formatted else None
 
     def _persist_lane_ptfe_length(self, lane, new_length) -> bool:
-        """Persist a calibrated PTFE length to the lane's hub configuration."""
+        """Record the latest calibrated PTFE length for a lane."""
 
         if lane is None:
-            return False
-
-        hub = getattr(lane, "hub_obj", None)
-        if hub is None:
             return False
 
         try:
@@ -825,13 +821,6 @@ class afcAMS(afcUnit):
         last_saved = self._last_lane_ptfe_lengths.get(lane_key)
         if last_saved is not None and abs(last_saved - numeric_length) <= tolerance:
             return False
-
-        try:
-            hub.afc_unload_bowden_length = numeric_length
-        except Exception:
-            self.logger.exception(
-                "Failed to update hub bowden lengths for lane %s", lane_key
-            )
 
         self._last_lane_ptfe_lengths[lane_key] = numeric_length
 
@@ -1565,14 +1554,13 @@ class afcAMS(afcUnit):
         captured_messages = self._run_command_with_capture(raw_command)
         captured_values = self._extract_ptfe_length_from_messages(captured_messages)
         lane_length_value = None
-        lane_persisted = False
         if lane is not None and captured_values:
             if 0 <= spool_index < len(captured_values):
                 lane_length_value = captured_values[spool_index]
             elif len(captured_values) == 1:
                 lane_length_value = captured_values[0]
             if lane_length_value is not None:
-                lane_persisted = self._persist_lane_ptfe_length(lane, lane_length_value)
+                self._persist_lane_ptfe_length(lane, lane_length_value)
 
         formatted_capture = None
         if captured_values:
@@ -1590,15 +1578,6 @@ class afcAMS(afcUnit):
             gcmd.respond_info(
                 f"Stored OpenAMS PTFE length {formatted_capture}{lane_suffix} in your cfg."
             )
-            if lane_persisted and lane_length_value is not None:
-                hub_name = getattr(getattr(lane, "hub_obj", None), "name", None)
-                target_name = hub_name or lane_name or "hub"
-                formatted_lane = self._format_numeric_values([lane_length_value]) or str(
-                    lane_length_value
-                )
-                gcmd.respond_info(
-                    f"Updated hub bowden lengths to {formatted_lane}mm for {target_name}."
-                )
             return
 
         if self._last_ptfe_string:
@@ -1612,16 +1591,6 @@ class afcAMS(afcUnit):
                 "Completed {} but no PTFE length was reported. Check OpenAMS status logs.".format(
                     raw_command
                 )
-            )
-
-        if lane_persisted and lane_length_value is not None and not formatted_capture:
-            hub_name = getattr(getattr(lane, "hub_obj", None), "name", None)
-            target_name = hub_name or lane_name or "hub"
-            formatted_lane = self._format_numeric_values([lane_length_value]) or str(
-                lane_length_value
-            )
-            gcmd.respond_info(
-                f"Updated hub bowden lengths to {formatted_lane}mm for {target_name}."
             )
 
     cmd_AFC_OAMS_CALIBRATE_PTFE_help = (
