@@ -12,7 +12,7 @@ import os
 import re
 import traceback
 from textwrap import dedent
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from configparser import Error as ConfigError
 try: from extras.AFC_utils import ERROR_STR
@@ -250,6 +250,8 @@ class afcAMS(afcUnit):
 
     _sync_command_registered = False
     _sync_instances: Dict[str, "afcAMS"] = {}
+    _ptfe_command_registered = False
+    _ptfe_instances: Dict[int, "afcAMS"] = {}
 
     def __init__(self, config):
         super().__init__(config)
@@ -286,6 +288,7 @@ class afcAMS(afcUnit):
             )
 
         self._register_sync_dispatcher()
+        self._register_ptfe_calibration_dispatcher()
 
     cmd_UNIT_CALIBRATION_help = (
         "open prompt to calibrate OpenAMS HUB HES or PTFE length values"
@@ -464,7 +467,10 @@ class afcAMS(afcUnit):
         return self._format_openams_calibration_command("OAMS_CALIBRATE_HUB_HES", lane)
 
     def _format_ptfe_length_calibration_command(self, lane):
-        return self._format_openams_calibration_command("OAMS_CALIBRATE_PTFE_LENGTH", lane)
+        command = self._format_openams_calibration_command(
+            "AFC_OAMS_CALIBRATE_PTFE", lane
+        )
+        return command
 
     def _values_look_binary(self, values):
         if not values:
@@ -1296,6 +1302,22 @@ class afcAMS(afcUnit):
 
         cls._sync_instances[self.name] = self
 
+    def _register_ptfe_calibration_dispatcher(self) -> None:
+        """Register the shared PTFE calibration wrapper command."""
+
+        cls = self.__class__
+        if not cls._ptfe_command_registered:
+            self.gcode.register_command(
+                "AFC_OAMS_CALIBRATE_PTFE",
+                cls._dispatch_ptfe_calibration_command,
+                desc="Run OAMS_CALIBRATE_PTFE_LENGTH and persist results",
+            )
+            cls._ptfe_command_registered = True
+
+        index = self._get_openams_index()
+        if index is not None:
+            cls._ptfe_instances[index] = self
+
     @classmethod
     def _extract_raw_param(cls, commandline: str, key: str) -> Optional[str]:
         """Recover multi-word parameter values from the raw command line."""
@@ -1322,6 +1344,165 @@ class afcAMS(afcUnit):
             value = value[1:-1]
 
         return value
+
+    @classmethod
+    def _dispatch_ptfe_calibration_command(cls, gcmd):
+        """Route PTFE calibration requests to the matching AMS unit."""
+
+        try:
+            oams_index = gcmd.get_int("OAMS")
+        except Exception:
+            gcmd.respond_info("AFC_OAMS_CALIBRATE_PTFE requires an OAMS parameter")
+            return
+
+        spool_index = gcmd.get_int("SPOOL", None)
+        if spool_index is None:
+            gcmd.respond_info(
+                "AFC_OAMS_CALIBRATE_PTFE requires a SPOOL parameter between 0-3"
+            )
+            return
+
+        instance = cls._ptfe_instances.get(oams_index)
+        if instance is None:
+            gcmd.respond_info(
+                f"No OpenAMS unit is registered for OAMS index {oams_index}"
+            )
+            return
+
+        instance._execute_ptfe_calibration_command(gcmd, oams_index, spool_index)
+
+    def _execute_ptfe_calibration_command(self, gcmd, oams_index: int, spool_index: int):
+        """Run the PTFE calibration macro then persist the reported value."""
+
+        lane = self._lane_for_spool_index(spool_index)
+        lane_name = getattr(lane, "name", None)
+        raw_command = f"OAMS_CALIBRATE_PTFE_LENGTH OAMS={oams_index} SPOOL={spool_index}"
+        previous_length = self._last_ptfe_string
+
+        self.gcode.run_script_from_command(raw_command)
+
+        updated_length, status = self._force_sync_ptfe_calibration(previous_length)
+
+        if updated_length and updated_length != previous_length:
+            if lane_name:
+                gcmd.respond_info(
+                    f"Stored OpenAMS PTFE length {updated_length} for {lane_name} in oamsc.cfg."
+                )
+            else:
+                gcmd.respond_info(
+                    f"Stored OpenAMS PTFE length {updated_length} in oamsc.cfg."
+                )
+            return
+
+        measured = None
+        if status:
+            try:
+                values = self._extract_ptfe_calibration_values(status)
+            except Exception:
+                values = None
+            if values:
+                measured = self._format_numeric_values(values)
+
+        if measured:
+            gcmd.respond_info(
+                "Completed {}. Latest reported PTFE length: {}.".format(
+                    raw_command, measured
+                )
+            )
+        else:
+            gcmd.respond_info(
+                "Completed {} but no PTFE length was reported. Check OpenAMS status logs.".format(
+                    raw_command
+                )
+            )
+
+    def _force_sync_ptfe_calibration(
+        self, previous_length: Optional[str]
+    ) -> Tuple[Optional[str], Optional[Dict[str, object]]]:
+        """Poll OpenAMS immediately so new PTFE data is persisted."""
+
+        status_snapshot: Optional[Dict[str, object]] = None
+
+        eventtime = None
+        try:
+            eventtime = self.reactor.monotonic()
+        except Exception:
+            eventtime = None
+
+        if eventtime is not None:
+            try:
+                self._sync_event(eventtime)
+            except Exception:
+                self.logger.debug(
+                    "Immediate OpenAMS sync after PTFE calibration failed",
+                    exc_info=True,
+                )
+
+        if self._last_ptfe_string and self._last_ptfe_string != previous_length:
+            return self._last_ptfe_string, status_snapshot
+
+        if self.hardware_service is not None:
+            try:
+                status_snapshot = self.hardware_service.poll_status()
+            except Exception:
+                status_snapshot = None
+
+            if not status_snapshot:
+                status_snapshot = self.hardware_service.latest_status()
+
+        controller = None
+        if not status_snapshot and self.hardware_service is not None:
+            try:
+                controller = self.hardware_service.resolve_controller()
+            except Exception:
+                controller = None
+
+        if controller is None:
+            controller = self.oams
+
+        if controller is not None:
+            try:
+                if eventtime is None:
+                    eventtime = self.reactor.monotonic()
+            except Exception:
+                eventtime = 0.0
+
+            snapshot = None
+            try:
+                snapshot = controller.get_status(eventtime)
+            except Exception:
+                snapshot = None
+
+            status_snapshot = status_snapshot or snapshot or {}
+
+            ptfe_keys = (
+                "ptfe_length",
+                "ptfe_lengths",
+                "ptfe_length_value",
+                "ptfe_length_values",
+                "ptfe_length_mm",
+                "ptfe_lengths_mm",
+                "bowden_length",
+                "bowden_lengths",
+            )
+
+            for attr in ptfe_keys:
+                try:
+                    value = getattr(controller, attr)
+                except Exception:
+                    value = None
+                if value is not None and attr not in status_snapshot:
+                    status_snapshot[attr] = value
+
+        if status_snapshot:
+            try:
+                self._persist_openams_calibration_results(status_snapshot)
+            except Exception:
+                self.logger.exception(
+                    "Failed to persist OpenAMS PTFE calibration results immediately"
+                )
+
+        return self._last_ptfe_string, status_snapshot
 
     @classmethod
     def _dispatch_sync_tool_sensor(cls, gcmd):
