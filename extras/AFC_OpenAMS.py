@@ -321,54 +321,13 @@ class afcAMS(afcUnit):
             "Command: OAMS_CALIBRATE_HUB_HES"
         ).format(self.name)
 
-        lane_container = getattr(self, "lanes", None)
-        if isinstance(lane_container, Mapping):
-            lane_values = list(lane_container.values())
-        elif hasattr(lane_container, "values"):
-            try:
-                lane_values = list(lane_container.values())
-            except Exception:
-                self.logger.exception(
-                    "Failed to enumerate OpenAMS lanes for calibration prompt"
-                )
-                lane_values = []
-        elif isinstance(lane_container, (list, tuple)):
-            lane_values = list(lane_container)
-        else:
-            lane_values = []
+        groups, count = self._build_openams_lane_button_groups(
+            "OAMS_CALIBRATE_HUB_HES", "HUB HES calibration"
+        )
 
-        groups: List[List[tuple]] = []
-        current_group: List[tuple] = []
-        index = 0
-
-        for lane in lane_values:
-            try:
-                if not getattr(lane, "load_state", False):
-                    continue
-            except Exception:
-                continue
-
-            command = self._format_openams_calibration_command(
-                "OAMS_CALIBRATE_HUB_HES", lane
-            )
-            if not command:
-                continue
-
-            button_label = "{}".format(lane)
-            button_style = "primary" if index % 2 == 0 else "secondary"
-            current_group.append((button_label, command, button_style))
-            index += 1
-
-            if index % 4 == 0:
-                groups.append(current_group)
-                current_group = []
-
-        if current_group:
-            groups.append(current_group)
-
-        if index == 0:
+        if count == 0:
             text = "No lanes are loaded, please load before calibration"
-        elif index > 1:
+        elif count > 1:
             groups.insert(
                 0,
                 [
@@ -402,52 +361,11 @@ class afcAMS(afcUnit):
             "Command: OAMS_CALIBRATE_PTFE_LENGTH"
         ).format(self.name)
 
-        lane_container = getattr(self, "lanes", None)
-        if isinstance(lane_container, Mapping):
-            lane_values = list(lane_container.values())
-        elif hasattr(lane_container, "values"):
-            try:
-                lane_values = list(lane_container.values())
-            except Exception:
-                self.logger.exception(
-                    "Failed to enumerate OpenAMS lanes for PTFE calibration prompt"
-                )
-                lane_values = []
-        elif isinstance(lane_container, (list, tuple)):
-            lane_values = list(lane_container)
-        else:
-            lane_values = []
+        groups, count = self._build_openams_lane_button_groups(
+            "OAMS_CALIBRATE_PTFE_LENGTH", "PTFE calibration"
+        )
 
-        groups: List[List[tuple]] = []
-        current_group: List[tuple] = []
-        index = 0
-
-        for lane in lane_values:
-            try:
-                if not getattr(lane, "load_state", False):
-                    continue
-            except Exception:
-                continue
-
-            command = self._format_openams_calibration_command(
-                "OAMS_CALIBRATE_PTFE_LENGTH", lane
-            )
-            if not command:
-                continue
-
-            button_label = "{}".format(lane)
-            button_style = "primary" if index % 2 == 0 else "secondary"
-            current_group.append((button_label, command, button_style))
-            index += 1
-
-            if index % 4 == 0:
-                groups.append(current_group)
-                current_group = []
-
-        if current_group:
-            groups.append(current_group)
-
-        if index == 0:
+        if count == 0:
             text = "No lanes are loaded, please load before calibration"
 
         back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
@@ -484,6 +402,56 @@ class afcAMS(afcUnit):
             return f"AFC_OAMS_CALIBRATE_HUB_HES UNIT={self.name} SPOOL={spool_index}"
 
         return f"AFC_OAMS_CALIBRATE_PTFE UNIT={self.name} SPOOL={spool_index}"
+
+    def _build_openams_lane_button_groups(
+        self, base_command, context
+    ) -> tuple[List[List[tuple[str, str, str]]], int]:
+        lane_values = self._openams_lane_values(context)
+
+        groups: List[List[tuple[str, str, str]]] = []
+        current_group: List[tuple[str, str, str]] = []
+        index = 0
+
+        for lane in lane_values:
+            try:
+                if not getattr(lane, "load_state", False):
+                    continue
+            except Exception:
+                continue
+
+            command = self._format_openams_calibration_command(base_command, lane)
+            if not command:
+                continue
+
+            button_label = "{}".format(lane)
+            button_style = "primary" if index % 2 == 0 else "secondary"
+            current_group.append((button_label, command, button_style))
+            index += 1
+
+            if index % 4 == 0:
+                groups.append(current_group)
+                current_group = []
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups, index
+
+    def _openams_lane_values(self, context) -> List[AFCLane]:
+        lane_container = getattr(self, "lanes", None)
+        if isinstance(lane_container, Mapping):
+            return list(lane_container.values())
+        if hasattr(lane_container, "values"):
+            try:
+                return list(lane_container.values())
+            except Exception:
+                self.logger.exception(
+                    "Failed to enumerate OpenAMS lanes for %s prompt", context
+                )
+                return []
+        if isinstance(lane_container, (list, tuple)):
+            return list(lane_container)
+        return []
 
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
