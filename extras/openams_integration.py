@@ -1,4 +1,4 @@
-# Armored Turtle Automated Filament Changer
+# Armored Turtle Automated Filament Changer (OPTIMIZED)
 #
 # Copyright (C) 2024 Armored Turtle
 #
@@ -34,16 +34,13 @@ class AMSHardwareService:
         self._lane_snapshots: Dict[str, Dict[str, Any]] = {}
         self._status_callbacks: List[Callable[[Dict[str, Any]], None]] = []
         self._lanes_by_spool: Dict[Tuple[str, int], str] = {}
+        
+        # Cache reactor reference
+        self._reactor = None
 
-    # ------------------------------------------------------------------
-    # Factory helpers
-    # ------------------------------------------------------------------
     @classmethod
-    def for_printer(
-        cls, printer, name: str = "default", logger: Optional[logging.Logger] = None
-    ) -> "AMSHardwareService":
+    def for_printer(cls, printer, name: str = "default", logger: Optional[logging.Logger] = None) -> "AMSHardwareService":
         """Return the singleton service for the provided printer/name pair."""
-
         key = (id(printer), name)
         try:
             service = cls._instances[key]
@@ -55,12 +52,8 @@ class AMSHardwareService:
                 service.logger = logger
         return service
 
-    # ------------------------------------------------------------------
-    # Controller registration & lookup
-    # ------------------------------------------------------------------
     def attach_controller(self, controller: Any) -> None:
         """Attach the low level ``OAMS`` controller to this service."""
-
         with self._lock:
             self._controller = controller
         if controller is not None:
@@ -74,7 +67,6 @@ class AMSHardwareService:
 
     def resolve_controller(self) -> Optional[Any]:
         """Return the currently attached controller, attempting lookup if needed."""
-
         with self._lock:
             controller = self._controller
         if controller is not None:
@@ -89,24 +81,28 @@ class AMSHardwareService:
             self.attach_controller(controller)
         return controller
 
-    # ------------------------------------------------------------------
-    # Status polling & observers
-    # ------------------------------------------------------------------
     def _monotonic(self) -> float:
-        reactor = getattr(self.printer, "get_reactor", None)
-        if callable(reactor):
-            try:
-                return reactor().monotonic()
-            except Exception:
-                pass
+        """Cache reactor reference for faster lookups."""
+        if self._reactor is None:
+            reactor = getattr(self.printer, "get_reactor", None)
+            if callable(reactor):
+                try:
+                    self._reactor = reactor()
+                except Exception:
+                    pass
+            if self._reactor is None:
+                try:
+                    self._reactor = self.printer.get_reactor()
+                except Exception:
+                    return 0.0
+        
         try:
-            return self.printer.get_reactor().monotonic()
+            return self._reactor.monotonic()
         except Exception:
             return 0.0
 
     def poll_status(self) -> Optional[Dict[str, Any]]:
         """Query the controller for its latest status snapshot."""
-
         controller = self.resolve_controller()
         if controller is None:
             return None
@@ -115,6 +111,7 @@ class AMSHardwareService:
         try:
             status = controller.get_status(eventtime)
         except Exception:
+            #  Direct attribute access fallback
             status = {
                 "current_spool": getattr(controller, "current_spool", None),
                 "f1s_hes_value": list(getattr(controller, "f1s_hes_value", []) or []),
@@ -128,43 +125,39 @@ class AMSHardwareService:
         return status
 
     def _update_status(self, status: Dict[str, Any]) -> None:
+        """Update cached status and notify observers."""
         with self._lock:
             self._status = dict(status)
             callbacks = list(self._status_callbacks)
-        for callback in callbacks:
-            try:
-                callback(dict(status))
-            except Exception:
-                self.logger.exception("AMS status observer failed for %s", self.name)
+        
+        # Only call callbacks if there are any registered
+        if callbacks:
+            status_copy = dict(status)
+            for callback in callbacks:
+                try:
+                    callback(status_copy)
+                except Exception:
+                    self.logger.exception("AMS status observer failed for %s", self.name)
 
     def latest_status(self) -> Dict[str, Any]:
+        """Return the most recently cached status snapshot."""
         with self._lock:
             return dict(self._status)
 
     def register_status_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Register a callback to be notified of status updates."""
         with self._lock:
             if callback not in self._status_callbacks:
                 self._status_callbacks.append(callback)
 
     def unregister_status_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Unregister a previously registered status callback."""
         with self._lock:
             if callback in self._status_callbacks:
                 self._status_callbacks.remove(callback)
 
-    # ------------------------------------------------------------------
-    # Lane snapshot helpers used for runout coordination
-    # ------------------------------------------------------------------
-    def update_lane_snapshot(
-        self,
-        unit_name: str,
-        lane_name: str,
-        lane_state: bool,
-        hub_state: Optional[bool],
-        eventtime: float,
-        *,
-        spool_index: Optional[int] = None,
-        tool_state: Optional[bool] = None,
-    ) -> None:
+    def update_lane_snapshot(self, unit_name: str, lane_name: str, lane_state: bool, hub_state: Optional[bool], eventtime: float, *, spool_index: Optional[int] = None, tool_state: Optional[bool] = None) -> None:
+        """Update the cached state snapshot for a specific lane."""
         key = f"{unit_name}:{lane_name}"
         with self._lock:
             self._lane_snapshots[key] = {
@@ -186,14 +179,14 @@ class AMSHardwareService:
                 self._lane_snapshots[key]["tool_state"] = bool(tool_state)
 
     def latest_lane_snapshot(self, unit_name: str, lane_name: str) -> Optional[Dict[str, Any]]:
+        """Return the most recent state snapshot for a specific lane."""
         key = f"{unit_name}:{lane_name}"
         with self._lock:
             snapshot = self._lane_snapshots.get(key)
         return dict(snapshot) if snapshot else None
 
-    def resolve_lane_for_spool(
-        self, unit_name: str, spool_index: Optional[int]
-    ) -> Optional[str]:
+    def resolve_lane_for_spool(self, unit_name: str, spool_index: Optional[int]) -> Optional[str]:
+        """Map a spool index to its corresponding lane name."""
         if spool_index is None:
             return None
         try:
@@ -204,42 +197,43 @@ class AMSHardwareService:
         with self._lock:
             return self._lanes_by_spool.get(key)
 
-    def latest_lane_snapshot_for_spool(
-        self, unit_name: str, spool_index: Optional[int]
-    ) -> Optional[Dict[str, Any]]:
+    def latest_lane_snapshot_for_spool(self, unit_name: str, spool_index: Optional[int]) -> Optional[Dict[str, Any]]:
+        """Return the most recent state snapshot for a spool by its index."""
         lane_name = self.resolve_lane_for_spool(unit_name, spool_index)
         if lane_name is None:
             return None
         return self.latest_lane_snapshot(unit_name, lane_name)
 
-    # ------------------------------------------------------------------
-    # High level hardware helpers used by AFC
-    # ------------------------------------------------------------------
     def _require_controller(self):
+        """Ensure a controller is available, raising if not."""
         controller = self.resolve_controller()
         if controller is None:
             raise RuntimeError(f"OpenAMS controller '{self.name}' is not ready")
         return controller
 
     def load_spool(self, spool_index: int) -> None:
+        """Command the OAMS to load a specific spool."""
         controller = self._require_controller()
         controller.oams_load_spool_cmd.send([spool_index])
 
     def unload_spool(self) -> None:
+        """Command the OAMS to unload the current spool."""
         controller = self._require_controller()
         controller.oams_unload_spool_cmd.send([])
 
     def set_follower(self, enable: bool, direction: int) -> None:
+        """Enable or disable the OAMS follower motor."""
         controller = self._require_controller()
         controller.oams_follower_cmd.send([1 if enable else 0, direction])
 
     def set_led_error(self, idx: int, value: int) -> None:
+        """Set the error LED state for a specific spool bay."""
         controller = self._require_controller()
         controller.set_led_error(idx, value)
 
 
 class AMSRunoutCoordinator:
-    """Coordinates runout events between OpenAMS and AFC."""
+    """Coordinates runout events between OpenAMS and AFC """
 
     _units: Dict[Tuple[int, str], List[Any]] = {}
     _monitors: Dict[Tuple[int, str], List[Any]] = {}
@@ -247,12 +241,12 @@ class AMSRunoutCoordinator:
 
     @classmethod
     def _key(cls, printer, name: str) -> Tuple[int, str]:
+        """Generate a unique key for printer/name combinations."""
         return (id(printer), name)
 
     @classmethod
     def register_afc_unit(cls, unit) -> AMSHardwareService:
         """Register an ``afcAMS`` unit as participating in AMS integration."""
-
         service = AMSHardwareService.for_printer(unit.printer, unit.oams_name, unit.logger)
         key = cls._key(unit.printer, unit.oams_name)
         with cls._lock:
@@ -264,7 +258,6 @@ class AMSRunoutCoordinator:
     @classmethod
     def register_runout_monitor(cls, monitor) -> AMSHardwareService:
         """Register an OpenAMS runout monitor and return the hardware service."""
-
         printer = getattr(monitor, "printer", None)
         state = getattr(monitor, "fps_state", None)
         oams_name = getattr(state, "current_oams", None) if state else None
@@ -278,15 +271,8 @@ class AMSRunoutCoordinator:
         return AMSHardwareService.for_printer(printer, oams_name)
 
     @classmethod
-    def notify_runout_detected(
-        cls,
-        monitor,
-        spool_index: Optional[int],
-        *,
-        lane_name: Optional[str] = None,
-    ) -> None:
+    def notify_runout_detected(cls, monitor, spool_index: Optional[int], *, lane_name: Optional[str] = None) -> None:
         """Forward runout detection from OpenAMS to any registered AFC units."""
-
         printer = getattr(monitor, "printer", None)
         state = getattr(monitor, "fps_state", None)
         oams_name = getattr(state, "current_oams", None) if state else None
@@ -298,25 +284,13 @@ class AMSRunoutCoordinator:
         lane_hint = lane_name or getattr(monitor, "latest_lane_name", None)
         for unit in units:
             try:
-                unit.handle_runout_detected(
-                    spool_index, monitor, lane_name=lane_hint
-                )
+                unit.handle_runout_detected(spool_index, monitor, lane_name=lane_hint)
             except Exception:
-                unit.logger.exception(
-                    "Failed to propagate OpenAMS runout to AFC unit %s", unit.name
-                )
+                unit.logger.exception("Failed to propagate OpenAMS runout to AFC unit %s", unit.name)
 
     @classmethod
-    def notify_afc_error(
-        cls,
-        printer,
-        name: str,
-        message: str,
-        *,
-        pause: bool = False,
-    ) -> None:
+    def notify_afc_error(cls, printer, name: str, message: str, *, pause: bool = False) -> None:
         """Deliver an OpenAMS pause/error message to any registered AFC units."""
-
         key = cls._key(printer, name)
         with cls._lock:
             units = list(cls._units.get(key, ()))
@@ -336,23 +310,11 @@ class AMSRunoutCoordinator:
                 logger = getattr(unit, "logger", None)
                 if logger is None:
                     logger = logging.getLogger(__name__)
-                logger.exception(
-                    "Failed to deliver OpenAMS error '%s' to AFC unit %s", message, unit
-                )
+                logger.exception("Failed to deliver OpenAMS error '%s' to AFC unit %s", message, unit)
 
     @classmethod
-    def notify_lane_tool_state(
-        cls,
-        printer,
-        name: str,
-        lane_name: str,
-        *,
-        loaded: bool,
-        spool_index: Optional[int] = None,
-        eventtime: Optional[float] = None,
-    ) -> bool:
+    def notify_lane_tool_state(cls, printer, name: str, lane_name: str, *, loaded: bool, spool_index: Optional[int] = None, eventtime: Optional[float] = None) -> bool:
         """Propagate lane tool state changes from OpenAMS into AFC."""
-
         key = cls._key(printer, name)
         with cls._lock:
             units = list(cls._units.get(key, ()))
@@ -369,27 +331,22 @@ class AMSRunoutCoordinator:
         handled = False
         for unit in units:
             try:
-                if unit.handle_openams_lane_tool_state(
-                    lane_name,
-                    loaded,
-                    spool_index=spool_index,
-                    eventtime=eventtime,
-                ):
+                if unit.handle_openams_lane_tool_state(lane_name, loaded, spool_index=spool_index, eventtime=eventtime):
                     handled = True
             except Exception:
-                unit.logger.exception(
-                    "Failed to update AFC lane %s from OpenAMS tool state", lane_name
-                )
+                unit.logger.exception("Failed to update AFC lane %s from OpenAMS tool state", lane_name)
         return handled
 
     @classmethod
     def active_units(cls, printer, name: str) -> Iterable[Any]:
+        """Return all AFC units registered for a specific OpenAMS instance."""
         key = cls._key(printer, name)
         with cls._lock:
             return tuple(cls._units.get(key, ()))
 
     @classmethod
     def active_monitors(cls, printer, name: str) -> Iterable[Any]:
+        """Return all runout monitors registered for a specific OpenAMS instance."""
         key = cls._key(printer, name)
         with cls._lock:
             return tuple(cls._monitors.get(key, ()))
