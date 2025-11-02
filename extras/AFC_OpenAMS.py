@@ -14,7 +14,6 @@ import traceback
 from textwrap import dedent
 from types import MethodType
 from typing import Dict, Optional, List
-from collections.abc import Mapping
 
 from configparser import Error as ConfigError
 try: from extras.AFC_utils import ERROR_STR
@@ -287,6 +286,8 @@ class afcAMS(afcUnit):
                 self.printer, self.oams_name, self.logger
             )
 
+        self._register_sync_dispatcher()
+
         self.gcode.register_mux_command(
             "AFC_OAMS_CALIBRATE_HUB_HES",
             "UNIT",
@@ -307,76 +308,6 @@ class afcAMS(afcUnit):
             self.name,
             self.cmd_AFC_OAMS_CALIBRATE_PTFE,
             desc="calibrate the OpenAMS PTFE length for a specific lane",
-        )
-
-        self._register_sync_dispatcher()
-
-    def cmd_UNIT_LANE_CALIBRATION(self, gcmd):
-        """Prompt for calibrating HUB HES values via OpenAMS macros."""
-
-        prompt = AFCprompt(gcmd, self.logger)
-        title = f"{self.name} Lane Calibration"
-        text = (
-            "Select a loaded lane from {} to calibrate HUB HES using OpenAMS. "
-            "Command: OAMS_CALIBRATE_HUB_HES"
-        ).format(self.name)
-
-        groups, count = self._build_openams_lane_button_groups(
-            "OAMS_CALIBRATE_HUB_HES", "HUB HES calibration"
-        )
-
-        if count == 0:
-            text = "No lanes are loaded, please load before calibration"
-        elif count > 1:
-            groups.insert(
-                0,
-                [
-                    (
-                        "All lanes",
-                        f"AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT={self.name}",
-                        "default",
-                    )
-                ],
-            )
-
-        back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
-
-        prompt.create_custom_p(
-            title,
-            text,
-            buttons=None,
-            cancel=True,
-            groups=groups if groups else None,
-            footer_buttons=back,
-        )
-
-    def cmd_UNIT_BOW_CALIBRATION(self, gcmd):
-        """Prompt for calibrating PTFE length for OpenAMS lanes."""
-
-        prompt = AFCprompt(gcmd, self.logger)
-        title = f"OAMS PTFE Calibration {self.name}"
-        text = (
-            "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
-            "Results will be saved to your cfg when values change. "
-            "Command: OAMS_CALIBRATE_PTFE_LENGTH"
-        ).format(self.name)
-
-        groups, count = self._build_openams_lane_button_groups(
-            "OAMS_CALIBRATE_PTFE_LENGTH", "PTFE calibration"
-        )
-
-        if count == 0:
-            text = "No lanes are loaded, please load before calibration"
-
-        back = [("Back", "UNIT_CALIBRATION UNIT={}".format(self.name), "info")]
-
-        prompt.create_custom_p(
-            title,
-            text,
-            buttons=None,
-            cancel=True,
-            groups=groups if groups else None,
-            footer_buttons=back,
         )
 
     def _format_openams_calibration_command(self, base_command, lane):
@@ -402,56 +333,6 @@ class afcAMS(afcUnit):
             return f"AFC_OAMS_CALIBRATE_HUB_HES UNIT={self.name} SPOOL={spool_index}"
 
         return f"AFC_OAMS_CALIBRATE_PTFE UNIT={self.name} SPOOL={spool_index}"
-
-    def _build_openams_lane_button_groups(
-        self, base_command, context
-    ) -> tuple[List[List[tuple[str, str, str]]], int]:
-        lane_values = self._openams_lane_values(context)
-
-        groups: List[List[tuple[str, str, str]]] = []
-        current_group: List[tuple[str, str, str]] = []
-        index = 0
-
-        for lane in lane_values:
-            try:
-                if not getattr(lane, "load_state", False):
-                    continue
-            except Exception:
-                continue
-
-            command = self._format_openams_calibration_command(base_command, lane)
-            if not command:
-                continue
-
-            button_label = "{}".format(lane)
-            button_style = "primary" if index % 2 == 0 else "secondary"
-            current_group.append((button_label, command, button_style))
-            index += 1
-
-            if index % 4 == 0:
-                groups.append(current_group)
-                current_group = []
-
-        if current_group:
-            groups.append(current_group)
-
-        return groups, index
-
-    def _openams_lane_values(self, context) -> List[AFCLane]:
-        lane_container = getattr(self, "lanes", None)
-        if isinstance(lane_container, Mapping):
-            return list(lane_container.values())
-        if hasattr(lane_container, "values"):
-            try:
-                return list(lane_container.values())
-            except Exception:
-                self.logger.exception(
-                    "Failed to enumerate OpenAMS lanes for %s prompt", context
-                )
-                return []
-        if isinstance(lane_container, (list, tuple)):
-            return list(lane_container)
-        return []
 
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
