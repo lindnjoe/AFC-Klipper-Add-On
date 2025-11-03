@@ -288,6 +288,62 @@ class afcAMS(afcUnit):
 
         return f"AFC_OAMS_CALIBRATE_PTFE UNIT={self.name} SPOOL={spool_index}"
 
+    def cmd_UNIT_LANE_CALIBRATION(self, gcmd):
+        """Override base prompt to expose an all-lane HUB HES calibration action."""
+        if not self._is_openams_unit():
+            super().cmd_UNIT_LANE_CALIBRATION(gcmd)
+            return
+
+        prompt = AFCprompt(gcmd, self.logger)
+        buttons = []
+        group_buttons = []
+        index = 0
+        title = f"{self.name} Lane Calibration"
+        text = (
+            "Select a loaded lane from {} to calibrate HUB HES using OpenAMS. "
+            "Command: OAMS_CALIBRATE_HUB_HES"
+        ).format(self.name)
+
+        for lane in self.lanes.values():
+            if not getattr(lane, "load_state", False):
+                continue
+
+            button_command = self._format_openams_calibration_command(
+                "OAMS_CALIBRATE_HUB_HES", lane
+            )
+            if button_command is None:
+                continue
+
+            button_label = f"{lane}"
+            button_style = "primary" if index % 2 == 0 else "secondary"
+            group_buttons.append((button_label, button_command, button_style))
+
+            index += 1
+            if index % 2 == 0:
+                buttons.append(list(group_buttons))
+                group_buttons = []
+
+        if group_buttons:
+            buttons.append(list(group_buttons))
+
+        total_buttons = sum(len(group) for group in buttons)
+        if total_buttons == 0:
+            text = "No lanes are loaded, please load before calibration"
+
+        all_lanes = None
+        if total_buttons > 1:
+            all_lanes = [
+                (
+                    "Calibrate All HUB HES",
+                    f"AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT={self.name}",
+                    "default",
+                )
+            ]
+
+        back = [("Back", f"UNIT_CALIBRATION UNIT={self.name}", "info")]
+
+        prompt.create_custom_p(title, text, all_lanes, True, buttons, back)
+
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
         super().handle_connect()
