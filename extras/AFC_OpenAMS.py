@@ -8,12 +8,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import traceback
 from textwrap import dedent
 from types import MethodType
-from typing import Dict, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from configparser import Error as ConfigError
 try: from extras.AFC_utils import ERROR_STR
@@ -32,10 +33,17 @@ try: from extras.AFC_respond import AFCprompt
 except: raise ConfigError(ERROR_STR.format(import_lib="AFC_respond", trace=traceback.format_exc()))
 
 try:
-    from extras.openams_integration import AMSHardwareService, AMSRunoutCoordinator
+    from extras.openams_integration import (
+        AMSHardwareService,
+        AMSRunoutCoordinator,
+        LaneRegistry,
+        AMSEventBus,
+    )
 except Exception:
     AMSHardwareService = None
     AMSRunoutCoordinator = None
+    LaneRegistry = None
+    AMSEventBus = None
 
 # OPTIMIZATION: Configurable sync intervals
 SYNC_INTERVAL = 2.0
@@ -239,8 +247,29 @@ class afcAMS(afcUnit):
         self.timer = self.reactor.register_timer(self._sync_event)
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
-        #  Build lane index map for O(1) lookup
-        self._lane_by_index: Dict[int, Any] = {}
+        # PHASE 1: Lane registry integration
+        self.registry = None
+        if LaneRegistry is not None:
+            try:
+                self.registry = LaneRegistry.for_printer(self.printer)
+            except Exception:
+                self.logger.exception("Failed to initialize LaneRegistry")
+
+        # PHASE 5: Event bus subscription for spool changes
+        self.event_bus = None
+        if AMSEventBus is not None:
+            try:
+                self.event_bus = AMSEventBus.get_instance()
+                self.event_bus.subscribe("spool_loaded", self._handle_spool_loaded_event, priority=10)
+                self.event_bus.subscribe("spool_unloaded", self._handle_spool_unloaded_event, priority=10)
+            except Exception:
+                self.logger.exception("Failed to subscribe to AMS events")
+
+        self._lane_temp_cache: Dict[str, int] = {}
+        self._last_loaded_lane_by_extruder: Dict[str, Optional[str]] = {}
+
+        self._saved_unit_cache: Optional[Dict[str, Any]] = None
+        self._saved_unit_mtime: Optional[float] = None
 
         self._last_lane_states: Dict[str, bool] = {}
         self._last_hub_states: Dict[str, bool] = {}
@@ -350,18 +379,48 @@ class afcAMS(afcUnit):
 
         self._ensure_virtual_tool_sensor()
 
-        #  Build lane index map once
-        self._lane_by_index = {}
+        #  Register each lane with the shared registry
         for lane in self.lanes.values():
             lane.prep_state = False
             lane.load_state = False
             lane.status = AFCLaneState.NONE
             lane.ams_share_prep_load = getattr(lane, "load", None) is None
-            
-            # Build index map
+
             idx = getattr(lane, "index", 0) - 1
-            if idx >= 0:
-                self._lane_by_index[idx] = lane
+            if idx >= 0 and self.registry is not None:
+                lane_name = getattr(lane, "name", None)
+                unit_name = self.oams_name or self.name
+                group = getattr(lane, "map", None)
+                if not group and lane_name:
+                    lane_num = ''.join(ch for ch in str(lane_name) if ch.isdigit())
+                    if lane_num:
+                        group = f"T{lane_num}"
+                    else:
+                        group = str(lane_name)
+
+                extruder_name = getattr(lane, "extruder_name", None) or getattr(self, "extruder", None)
+
+                if lane_name and group and extruder_name:
+                    try:
+                        self.registry.register_lane(
+                            lane_name=lane_name,
+                            unit_name=unit_name,
+                            spool_index=idx,
+                            group=group,
+                            extruder=extruder_name,
+                            fps_name=None,
+                            hub_name=getattr(lane, "hub", None),
+                            led_index=getattr(lane, "led_index", None),
+                            custom_load_cmd=getattr(lane, "custom_load_cmd", None),
+                            custom_unload_cmd=getattr(lane, "custom_unload_cmd", None),
+                        )
+                    except Exception:
+                        self.logger.exception("Failed to register lane %s with registry", lane_name)
+
+            try:
+                self.get_lane_temperature(getattr(lane, "name", None), 240)
+            except Exception:
+                self.logger.debug("Unable to seed lane temperature for %s", getattr(lane, "name", None), exc_info=True)
 
         first_leg = ("<span class=warning--text>|</span>"
                     "<span class=error--text>_</span>")
@@ -734,6 +793,233 @@ class afcAMS(afcUnit):
 
         return lookup
 
+    def _get_extruder_object(self, extruder_name: Optional[str]):
+        if not extruder_name:
+            return None
+
+        key = f"AFC_extruder {extruder_name}"
+        lookup = getattr(self.printer, "lookup_object", None)
+        extruder = None
+        if callable(lookup):
+            try:
+                extruder = lookup(key, None)
+            except Exception:
+                extruder = None
+
+        if extruder is None:
+            objects = getattr(self.printer, "objects", None)
+            if isinstance(objects, dict):
+                extruder = objects.get(key)
+
+        return extruder
+
+    def _current_lane_for_extruder(self, extruder_name: Optional[str]) -> Optional[str]:
+        extruder = self._get_extruder_object(extruder_name)
+        lane_name = getattr(extruder, "lane_loaded", None) if extruder else None
+        return self._canonical_lane_name(lane_name)
+
+    def _get_lane_object(self, lane_name: Optional[str]):
+        canonical = self._canonical_lane_name(lane_name)
+        if canonical is None:
+            return None
+
+        lane = self.lanes.get(canonical)
+        if lane is not None:
+            return lane
+
+        key = f"AFC_lane {canonical}"
+        lookup = getattr(self.printer, "lookup_object", None)
+        if callable(lookup):
+            try:
+                lane = lookup(key, None)
+            except Exception:
+                lane = None
+        else:
+            lane = None
+
+        if lane is None:
+            objects = getattr(self.printer, "objects", None)
+            if isinstance(objects, dict):
+                lane = objects.get(key)
+
+        return lane
+
+    def _saved_unit_file_path(self) -> Optional[str]:
+        afc = getattr(self, "afc", None)
+        base_path = getattr(afc, "VarFile", None)
+        if not base_path:
+            return None
+
+        return os.path.expanduser(str(base_path) + ".unit")
+
+    def _load_saved_unit_snapshot(self) -> Optional[Dict[str, Any]]:
+        filename = self._saved_unit_file_path()
+        if not filename:
+            return None
+
+        try:
+            mtime = os.path.getmtime(filename)
+        except OSError:
+            self._saved_unit_cache = None
+            self._saved_unit_mtime = None
+            return None
+
+        if self._saved_unit_cache is not None and self._saved_unit_mtime == mtime:
+            return self._saved_unit_cache
+
+        try:
+            with open(filename, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            self.logger.debug("Failed to read saved AFC unit data from %s", filename, exc_info=True)
+            self._saved_unit_cache = None
+        else:
+            self._saved_unit_cache = data if isinstance(data, dict) else None
+
+        self._saved_unit_mtime = mtime
+        return self._saved_unit_cache
+
+    def _get_saved_lane_temperature(self, lane_name: Optional[str]) -> Optional[int]:
+        canonical = self._canonical_lane_name(lane_name)
+        if canonical is None:
+            return None
+
+        snapshot = self._load_saved_unit_snapshot()
+        if not snapshot:
+            return None
+
+        unit_key = getattr(self, "name", None)
+        unit_data = snapshot.get(str(unit_key)) if unit_key is not None else None
+        if not isinstance(unit_data, dict):
+            return None
+
+        lane_data = unit_data.get(canonical)
+        if not isinstance(lane_data, dict):
+            return None
+
+        temp_value = lane_data.get("extruder_temp")
+        if temp_value is None:
+            temp_value = lane_data.get("nozzle_temp")
+        if temp_value is None:
+            return None
+
+        try:
+            resolved = int(temp_value)
+        except (TypeError, ValueError):
+            return None
+
+        return resolved
+
+    def get_lane_temperature(self, lane_name: Optional[str], default_temp: int = 240) -> int:
+        fallback = int(default_temp)
+
+        canonical_name = self._canonical_lane_name(lane_name)
+        lookup_name = canonical_name if canonical_name is not None else lane_name
+
+        lane_obj = self._get_lane_object(canonical_name or lane_name)
+        if lane_obj is not None:
+            for attr in ("extruder_temp", "nozzle_temp"):
+                temp_value = getattr(lane_obj, attr, None)
+                if temp_value is None:
+                    continue
+                try:
+                    resolved = int(temp_value)
+                except (TypeError, ValueError):
+                    continue
+                if lookup_name:
+                    self._lane_temp_cache[lookup_name] = resolved
+                return resolved
+
+        saved_temp = self._get_saved_lane_temperature(canonical_name)
+        if saved_temp is not None:
+            try:
+                resolved = int(saved_temp)
+            except (TypeError, ValueError):
+                resolved = fallback
+            else:
+                if lookup_name:
+                    self._lane_temp_cache[lookup_name] = resolved
+                return resolved
+
+        if lookup_name:
+            cached = self._lane_temp_cache.get(lookup_name)
+            if cached is not None:
+                try:
+                    return int(cached)
+                except (TypeError, ValueError):
+                    self._lane_temp_cache.pop(lookup_name, None)
+
+        return fallback
+
+    def prepare_unload(
+        self,
+        extruder: Optional[str] = None,
+        default_temp: int = 240,
+    ) -> Tuple[Optional[str], int]:
+        """Return the lane being unloaded and the purge temperature to use."""
+
+        extruder_name = extruder or getattr(self, "extruder", None)
+        lane_name = self._current_lane_for_extruder(extruder_name)
+
+        old_temp = (
+            self.get_lane_temperature(lane_name, default_temp)
+            if lane_name is not None
+            else int(default_temp)
+        )
+
+        purge_temp = old_temp
+
+        next_lane_name: Optional[str] = None
+        afc_obj = getattr(self, "afc", None)
+        if afc_obj is not None:
+            next_lane_name = getattr(afc_obj, "next_lane_load", None)
+
+        canonical_next = self._canonical_lane_name(next_lane_name)
+        if canonical_next and canonical_next != lane_name:
+            next_temp = self.get_lane_temperature(canonical_next, default_temp)
+            if next_temp > purge_temp:
+                purge_temp = next_temp
+
+        if extruder_name:
+            self._last_loaded_lane_by_extruder[extruder_name] = lane_name
+
+        return lane_name, purge_temp
+
+    def get_purge_temp_for_change(
+        self,
+        old_lane: Optional[str],
+        new_lane: Optional[str],
+        *,
+        extruder: Optional[str] = None,
+        default_temp: int = 240,
+    ) -> int:
+        extruder_name = extruder or getattr(self, "extruder", None)
+        _ = extruder_name  # reserved for future use
+
+        old_temp = self.get_lane_temperature(old_lane, default_temp) if old_lane else int(default_temp)
+        new_temp = self.get_lane_temperature(new_lane, default_temp)
+
+        return old_temp if old_temp >= new_temp else new_temp
+
+    def record_load(self, extruder: Optional[str] = None, lane_name: Optional[str] = None) -> Optional[str]:
+        extruder_name = extruder or getattr(self, "extruder", None)
+        canonical = self._canonical_lane_name(lane_name)
+        if extruder_name:
+            self._last_loaded_lane_by_extruder[extruder_name] = canonical
+
+        if canonical:
+            temp = self.get_lane_temperature(canonical, 240)
+            self._lane_temp_cache[canonical] = temp
+
+        return canonical
+
+    def get_last_loaded_lane(self, extruder: Optional[str] = None) -> Optional[str]:
+        extruder_name = extruder or getattr(self, "extruder", None)
+        if extruder_name is None:
+            return None
+
+        return self._last_loaded_lane_by_extruder.get(extruder_name)
+
     cmd_SYNC_TOOL_SENSOR_help = "Synchronise the AMS virtual tool-start sensor with the assigned lane."
     def cmd_SYNC_TOOL_SENSOR(self, gcmd):
         cls = self.__class__
@@ -980,7 +1266,7 @@ class afcAMS(afcUnit):
 
             # OPTIMIZATION: Use indexed lane lookup instead of iteration
             for idx in range(4):  # OAMS supports 4 bays
-                lane = self._lane_by_index.get(idx)
+                lane = self._lane_for_spool_index(idx)
                 if lane is None:
                     continue
 
@@ -1031,9 +1317,26 @@ class afcAMS(afcUnit):
 
     def _lane_for_spool_index(self, spool_index: Optional[int]):
         """Use indexed lookup instead of iteration."""
-        if spool_index is None or spool_index < 0 or spool_index >= 4:
+        if spool_index is None:
             return None
-        return self._lane_by_index.get(spool_index)
+
+        try:
+            normalized = int(spool_index)
+        except (TypeError, ValueError):
+            return None
+
+        registry_unit = self.oams_name or self.name
+        if self.registry is not None:
+            lane_info = self.registry.get_by_spool(registry_unit, normalized)
+            if lane_info is not None:
+                lane = self.lanes.get(lane_info.lane_name)
+                if lane is not None:
+                    return lane
+
+        if normalized < 0 or normalized >= 4:
+            return None
+
+        return self._lane_by_local_index(normalized)
 
     def _resolve_lane_reference(self, lane_name: Optional[str]):
         """Return a lane object by name (or alias), case-insensitively."""
@@ -1185,6 +1488,114 @@ class afcAMS(afcUnit):
             except Exception:
                 self.logger.exception("Failed to mirror tool sensor state for unloaded lane %s", lane.name)
         return True
+
+    def _is_event_for_unit(self, unit_name: Optional[str]) -> bool:
+        """Check whether an event payload targets this unit."""
+        if not unit_name:
+            return False
+
+        candidates = {str(self.name).lower()}
+        if getattr(self, "oams_name", None):
+            candidates.add(str(self.oams_name).lower())
+
+        return str(unit_name).lower() in candidates
+
+    def _handle_spool_loaded_event(self, *, event_type=None, **kwargs):
+        """Update local state in response to a spool_loaded event."""
+        unit_name = kwargs.get("unit_name")
+        if not self._is_event_for_unit(unit_name):
+            return
+
+        spool_index = kwargs.get("spool_index")
+        try:
+            normalized_index = int(spool_index) if spool_index is not None else None
+        except (TypeError, ValueError):
+            normalized_index = None
+
+        lane = self._find_lane_by_spool(normalized_index)
+        if lane is None:
+            return
+
+        lane.load_state = True
+        self._last_lane_states[lane.name] = True
+
+        eventtime = kwargs.get("eventtime", 0.0)
+        try:
+            self.get_lane_temperature(lane.name, 240)
+        except Exception:
+            self.logger.debug("Failed to refresh temperature for lane %s", lane.name, exc_info=True)
+
+        extruder_name = getattr(lane, "extruder_name", None)
+        if extruder_name is None and self.registry is not None:
+            try:
+                extruder_name = self.registry.resolve_extruder(lane.name)
+            except Exception:
+                extruder_name = None
+
+        self.record_load(extruder=extruder_name, lane_name=lane.name)
+
+        if self.hardware_service is not None and normalized_index is not None:
+            hub_state = getattr(lane, "loaded_to_hub", None)
+            tool_state = getattr(lane, "tool_loaded", None)
+            try:
+                self.hardware_service.update_lane_snapshot(
+                    self.oams_name,
+                    lane.name,
+                    True,
+                    hub_state if hub_state is not None else None,
+                    eventtime,
+                    spool_index=normalized_index,
+                    tool_state=tool_state if tool_state is not None else None,
+                    emit_spool_event=False,
+                )
+            except Exception:
+                self.logger.exception("Failed to mirror spool load event for %s", lane.name)
+
+    def _handle_spool_unloaded_event(self, *, event_type=None, **kwargs):
+        """Update local state in response to a spool_unloaded event."""
+        unit_name = kwargs.get("unit_name")
+        if not self._is_event_for_unit(unit_name):
+            return
+
+        spool_index = kwargs.get("spool_index")
+        try:
+            normalized_index = int(spool_index) if spool_index is not None else None
+        except (TypeError, ValueError):
+            normalized_index = None
+
+        lane = self._find_lane_by_spool(normalized_index)
+        if lane is None:
+            return
+
+        lane.load_state = False
+        self._last_lane_states[lane.name] = False
+        lane.tool_loaded = False
+        lane.loaded_to_hub = False
+
+        try:
+            self.get_lane_temperature(lane.name, 240)
+        except Exception:
+            self.logger.debug("Failed to refresh cached temperature for unloaded lane %s", lane.name, exc_info=True)
+
+        extruder_name = getattr(lane, "extruder_name", None)
+        if extruder_name and self._last_loaded_lane_by_extruder.get(extruder_name) == lane.name:
+            self._last_loaded_lane_by_extruder.pop(extruder_name, None)
+
+        eventtime = kwargs.get("eventtime", 0.0)
+        if self.hardware_service is not None and normalized_index is not None:
+            try:
+                self.hardware_service.update_lane_snapshot(
+                    self.oams_name,
+                    lane.name,
+                    False,
+                    False,
+                    eventtime,
+                    spool_index=normalized_index,
+                    tool_state=False,
+                    emit_spool_event=False,
+                )
+            except Exception:
+                self.logger.exception("Failed to mirror spool unload event for %s", lane.name)
 
     def cmd_AFC_OAMS_CALIBRATE_HUB_HES(self, gcmd):
         """Run the OpenAMS HUB HES calibration for a specific lane."""
@@ -1522,8 +1933,37 @@ class afcAMS(afcUnit):
         return True
 
     def _find_lane_by_spool(self, spool_index):
-        """Use indexed lookup."""
-        return self._lane_by_index.get(spool_index)
+        """Resolve lane by spool index using registry when available."""
+        if spool_index is None:
+            return None
+
+        try:
+            normalized = int(spool_index)
+        except (TypeError, ValueError):
+            return None
+
+        registry_unit = self.oams_name or self.name
+        if self.registry is not None:
+            lane_info = self.registry.get_by_spool(registry_unit, normalized)
+            if lane_info is not None:
+                lane = self.lanes.get(lane_info.lane_name)
+                if lane is not None:
+                    return lane
+
+        return self._lane_by_local_index(normalized)
+
+    def _lane_by_local_index(self, normalized: int):
+        for candidate in self.lanes.values():
+            lane_index = getattr(candidate, "index", None)
+            try:
+                lane_index = int(lane_index) - 1
+            except (TypeError, ValueError):
+                continue
+
+            if lane_index == normalized:
+                return candidate
+
+        return None
 
     def _get_openams_index(self):
         """Helper to extract OAMS index."""
