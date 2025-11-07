@@ -277,7 +277,7 @@ class LaneRegistry:
                 self._by_extruder[extruder] = []
             self._by_extruder[extruder].append(info)
             
-            self.logger.info("Registered lane: %s â†’ %s[%d] â†’ %s (extruder=%s, fps=%s)", 
+            self.logger.info("Registered lane: %s ? %s[%d] ? %s (extruder=%s, fps=%s)", 
                            lane_name, unit_name, spool_index, group, extruder, fps_name)
             
             return info
