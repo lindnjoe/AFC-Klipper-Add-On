@@ -3,6 +3,14 @@
 # Copyright (C) 2024 Armored Turtle
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+#
+# OPTIMIZATIONS APPLIED:
+# 1. Object Caching: Cache frequently accessed objects (gcode, extruder, lane, OAMS index)
+#    to eliminate redundant printer.lookup_object() calls
+# 2. Adaptive Polling: Sync intervals adjust between active (2s) and idle (4s) based on
+#    encoder activity and printer state
+# 3. Sensor Helper Caching: Virtual sensor helpers cached to avoid repeated lookups
+# 4. Registry Integration: Uses LaneRegistry for O(1) lane lookups across units
 
 """AMS integration helpers for Armored Turtle AFC."""
 
@@ -282,10 +290,14 @@ class afcAMS(afcUnit):
         self._last_encoder_clicks: Optional[int] = None
         self._last_hub_hes_values: Optional[List[float]] = None
         self._last_ptfe_value: Optional[float] = None
-        
-        # Cache sensor helper reference
+
+        # OPTIMIZATION: Cache frequently accessed objects
         self._cached_sensor_helper = None
-        
+        self._cached_gcode = None
+        self._cached_extruder_objects: Dict[str, Any] = {}
+        self._cached_lane_objects: Dict[str, Any] = {}
+        self._cached_oams_index: Optional[int] = None
+
         self.oams = None
         self.hardware_service = None
 
@@ -376,6 +388,17 @@ class afcAMS(afcUnit):
     def handle_connect(self):
         """Initialise the AMS unit and configure custom logos."""
         super().handle_connect()
+
+        # OPTIMIZATION: Pre-warm object caches for faster runtime access
+        if self._cached_gcode is None:
+            try:
+                self._cached_gcode = self.printer.lookup_object("gcode")
+            except Exception:
+                pass
+
+        # Pre-cache OAMS index
+        if self.oams is not None and self._cached_oams_index is None:
+            self._cached_oams_index = getattr(self.oams, "oams_idx", None)
 
         self._ensure_virtual_tool_sensor()
 
@@ -532,10 +555,14 @@ class afcAMS(afcUnit):
                 if previous is None or previous is sensor:
                     objects[alias_object] = sensor
 
-            try:
-                gcode = self.printer.lookup_object("gcode")
-            except Exception:
-                gcode = None
+            # OPTIMIZATION: Use cached gcode object
+            gcode = self._cached_gcode
+            if gcode is None:
+                try:
+                    gcode = self.printer.lookup_object("gcode")
+                    self._cached_gcode = gcode
+                except Exception:
+                    gcode = None
 
             if gcode is not None:
                 for command, handler, desc in (
@@ -794,8 +821,14 @@ class afcAMS(afcUnit):
         return lookup
 
     def _get_extruder_object(self, extruder_name: Optional[str]):
+        # OPTIMIZATION: Cache extruder object lookups
         if not extruder_name:
             return None
+
+        # Check cache first
+        cached = self._cached_extruder_objects.get(extruder_name)
+        if cached is not None:
+            return cached
 
         key = f"AFC_extruder {extruder_name}"
         lookup = getattr(self.printer, "lookup_object", None)
@@ -811,6 +844,10 @@ class afcAMS(afcUnit):
             if isinstance(objects, dict):
                 extruder = objects.get(key)
 
+        # Cache result (even if None to avoid repeated lookups)
+        if extruder is not None:
+            self._cached_extruder_objects[extruder_name] = extruder
+
         return extruder
 
     def _current_lane_for_extruder(self, extruder_name: Optional[str]) -> Optional[str]:
@@ -819,13 +856,20 @@ class afcAMS(afcUnit):
         return self._canonical_lane_name(lane_name)
 
     def _get_lane_object(self, lane_name: Optional[str]):
+        # OPTIMIZATION: Cache lane object lookups
         canonical = self._canonical_lane_name(lane_name)
         if canonical is None:
             return None
 
+        # Check local lanes dict first
         lane = self.lanes.get(canonical)
         if lane is not None:
             return lane
+
+        # Check cache
+        cached = self._cached_lane_objects.get(canonical)
+        if cached is not None:
+            return cached
 
         key = f"AFC_lane {canonical}"
         lookup = getattr(self.printer, "lookup_object", None)
@@ -841,6 +885,10 @@ class afcAMS(afcUnit):
             objects = getattr(self.printer, "objects", None)
             if isinstance(objects, dict):
                 lane = objects.get(key)
+
+        # Cache result if found
+        if lane is not None:
+            self._cached_lane_objects[canonical] = lane
 
         return lane
 
@@ -1966,9 +2014,16 @@ class afcAMS(afcUnit):
         return None
 
     def _get_openams_index(self):
-        """Helper to extract OAMS index."""
+        """Helper to extract OAMS index (OPTIMIZED with caching)."""
+        # OPTIMIZATION: Cache OAMS index after first lookup
+        if self._cached_oams_index is not None:
+            return self._cached_oams_index
+
         if self.oams is not None:
-            return getattr(self.oams, "oams_idx", None)
+            oams_idx = getattr(self.oams, "oams_idx", None)
+            if oams_idx is not None:
+                self._cached_oams_index = oams_idx
+                return oams_idx
         return None
 
     def _get_openams_spool_index(self, lane):
