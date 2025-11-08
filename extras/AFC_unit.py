@@ -3,7 +3,6 @@
 # Copyright (C) 2024 Armored Turtle
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import re
 import traceback
 
 from configfile import error
@@ -100,51 +99,6 @@ class afcUnit:
     def __str__(self):
         return self.name
 
-    def _is_openams_unit(self):
-        return str(getattr(self, "type", "")) == "OpenAMS"
-
-    def _get_openams_index(self):
-        if not self._is_openams_unit():
-            return None
-
-        oams_name = getattr(self, "oams_name", None)
-        if not oams_name:
-            return None
-
-        match = re.search(r"(\d+)$", str(oams_name))
-        if match:
-            try:
-                return int(match.group(1))
-            except (TypeError, ValueError):
-                return None
-        return None
-
-    def _get_openams_spool_index(self, lane):
-        try:
-            index = int(getattr(lane, "index", 0)) - 1
-        except (TypeError, ValueError):
-            return None
-
-        return index if index >= 0 else None
-
-    def _format_openams_calibration_command(self, base_command, lane):
-        if not self._is_openams_unit():
-            return None
-
-        oams_index = self._get_openams_index()
-        spool_index = self._get_openams_spool_index(lane)
-
-        if oams_index is None or spool_index is None:
-            lane_name = getattr(lane, "name", lane)
-            self.logger.warning(
-                "Unable to format OpenAMS calibration command for lane %s on unit %s",
-                lane_name,
-                self.name,
-            )
-            return None
-
-        return "{} OAMS={} SPOOL={}".format(base_command, oams_index, spool_index)
-
     def handle_connect(self):
         """
         Handles klippy:connect event, and does error checking to make sure users have hub/extruder/buffers sections if these variables are defined at the unit level
@@ -228,26 +182,15 @@ class afcUnit:
         prompt = AFCprompt(gcmd, self.logger)
         buttons = []
         title = '{} Calibration'.format(self.name)
+        text = 'Select to calibrate the distance from extruder to hub or bowden length'
         # Selection buttons
-        if self._is_openams_unit():
-            text = 'Select to calibrate the hub_hes value or oams ptfe length.'
-            lane_button_label = "Calibrate Lane HUB HES"
-        else:
-            text = 'Select to calibrate the distance from extruder to hub or bowden length'
-            lane_button_label = "Calibrate Lanes"
-
-        buttons.append((lane_button_label, "UNIT_LANE_CALIBRATION UNIT={}".format(self.name), "primary"))
+        buttons.append(("Calibrate Lanes", "UNIT_LANE_CALIBRATION UNIT={}".format(self.name), "primary"))
 
         direct_hubs = any( lane.is_direct_hub() for lane in self.afc.lanes.values())
         lanes_loaded = any( lane.load_state and not lane.is_direct_hub() for lane in self.afc.lanes.values())
 
         if not direct_hubs or lanes_loaded:
-            if self._is_openams_unit():
-                bowden_button_label = "Calibrate OAMS PTFE Length"
-            else:
-                bowden_button_label = "Calibrate afc_bowden_length"
-
-            buttons.append((bowden_button_label, "UNIT_BOW_CALIBRATION UNIT={}".format(self.name), "secondary"))
+            buttons.append(("Calibrate afc_bowden_length", "UNIT_BOW_CALIBRATION UNIT={}".format(self.name), "secondary"))
 
         # Add button for TD-1 calibration if user has one connected and defined
         if self.afc.td1_defined:
@@ -281,45 +224,30 @@ class afcUnit:
         title = '{} Lane Calibration'.format(self.name)
         text  = ('Select a loaded lane from {} to calibrate length from extruder to hub. '
                  'Config option: dist_hub').format(self.name)
-        if self._is_openams_unit():
-            text = (
-                'Select a loaded lane from {} to calibrate HUB HES using OpenAMS. '
-                'Command: OAMS_CALIBRATE_HUB_HES'
-            ).format(self.name)
 
         # Create buttons for each lane and group every 4 lanes together
         for lane in self.lanes.values():
-            if not lane.load_state:
-                continue
-
-            if self._is_openams_unit():
-                button_command = self._format_openams_calibration_command(
-                    "OAMS_CALIBRATE_HUB_HES", lane
-                )
-                if button_command is None:
-                    continue
-            elif lane.is_direct_hub():
+            if lane.load_state:
+                button_label = "{}".format(lane)
                 # Do a bowden length calibration for direct hubs, dist_hub length gets set properly this way
-                button_command = "CALIBRATE_AFC BOWDEN={}".format(lane)
-            else:
-                button_command = "CALIBRATE_AFC LANE={}".format(lane)
+                if lane.is_direct_hub():
+                    button_command = "CALIBRATE_AFC BOWDEN={}".format(lane)
+                else:
+                    button_command = "CALIBRATE_AFC LANE={}".format(lane)
+                button_style = "primary" if index % 2 == 0 else "secondary"
+                group_buttons.append((button_label, button_command, button_style))
 
-            button_label = "{}".format(lane)
-            button_style = "primary" if index % 2 == 0 else "secondary"
-            group_buttons.append((button_label, button_command, button_style))
-
-            index += 1
-            if index % 2 == 0:
-                buttons.append(list(group_buttons))
-                group_buttons = []
+                # Add group to buttons list after every 4 lanes
+                if (index + 1) % 2 == 0 or index == len(self.lanes) - 1:
+                    buttons.append(list(group_buttons))
+                    group_buttons = []
+                index += 1
 
         if group_buttons:
             buttons.append(list(group_buttons))
 
         total_buttons = sum(len(group) for group in buttons)
-        if self._is_openams_unit():
-            all_lanes = None
-        elif total_buttons > 1:
+        if total_buttons > 1:
             all_lanes = [('All lanes', 'CALIBRATE_AFC LANE=all UNIT={}'.format(self.name), 'default')]
         else:
             all_lanes = None
@@ -353,39 +281,23 @@ class afcUnit:
         group_buttons = []
         index = 0
         title = 'Bowden Calibration {}'.format(self.name)
-        text = (
-            'Select a loaded lane from {} to measure Bowden length. '
-            'ONLY CALIBRATE BOWDEN USING 1 LANE PER UNIT/hub.'
-            'Config option: afc_bowden_length'
-        ).format(self.name)
-        if self._is_openams_unit():
-            text = (
-                'Select a loaded lane from {} to calibrate PTFE length using OpenAMS. '
-                'Command: OAMS_CALIBRATE_PTFE_LENGTH'
-            ).format(self.name)
+        text = ('Select a loaded lane from {} to measure Bowden length. '
+                'ONLY CALIBRATE BOWDEN USING 1 LANE PER UNIT/hub.'
+                'Config option: afc_bowden_length').format(self.name)
 
         for lane in self.lanes.values():
-            if not lane.load_state or lane.is_direct_hub():
-                continue
-
-            if self._is_openams_unit():
-                button_command = self._format_openams_calibration_command(
-                    "OAMS_CALIBRATE_PTFE_LENGTH", lane
-                )
-                if button_command is None:
-                    continue
-            else:
+            if lane.load_state and not lane.is_direct_hub():
+                # Create a button for each lane
+                button_label = "{}".format(lane)
                 button_command = "CALIBRATE_AFC BOWDEN={}".format(lane)
+                button_style = "primary" if index % 2 == 0 else "secondary"
+                group_buttons.append((button_label, button_command, button_style))
 
-            # Create a button for each lane
-            button_label = "{}".format(lane)
-            button_style = "primary" if index % 2 == 0 else "secondary"
-            group_buttons.append((button_label, button_command, button_style))
-
-            index += 1
-            if index % 2 == 0:
-                buttons.append(list(group_buttons))
-                group_buttons = []
+                # Add group to buttons list after every 4 lanes
+                if (index + 1) % 2 == 0 or index == len(self.lanes) - 1:
+                    buttons.append(list(group_buttons))
+                    group_buttons = []
+                index += 1
 
         if group_buttons:
             buttons.append(list(group_buttons))
