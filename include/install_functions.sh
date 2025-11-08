@@ -58,6 +58,7 @@ template_unit_files() {
     "HTLF") MCU="${htlf_board_type}" ;;
     "BoxTurtle (4-Lane)") MCU="AFC" ;;
     "NightOwl") MCU="ERB" ;;
+    "AMS") MCU="AMS" ;;
     *) MCU="UNKNOWN" ;;  # Optional: fallback
   esac
 
@@ -85,6 +86,11 @@ copy_unit_files() {
     cp "${afc_path}/config/mcu/ERB_2.0.cfg" "${afc_config_dir}/mcu/ERB_2.0.cfg"
     cp "${afc_path}/templates/AFC_Hardware-NightOwl.cfg" "${afc_config_dir}/AFC_Hardware.cfg"
     cp "${afc_path}/templates/AFC_NightOwl_1.cfg" "${afc_config_dir}/AFC_NightOwl_1.cfg"
+    ;;
+
+  "AMS")
+    cp "${afc_path}/templates/AFC_Hardware-AFC.cfg" "${afc_config_dir}/AFC_Hardware.cfg"
+    cp "${afc_path}/templates/AFC_AMS1.cfg" "${afc_config_dir}/AFC_${boxturtle_name}.cfg"
     ;;
 
   "HTLF")
@@ -166,6 +172,10 @@ install_afc() {
       append_buffer_config "TurtleNeckV2"
       add_buffer_to_extruder "${afc_config_dir}/AFC_${boxturtle_name}.cfg" "${boxturtle_name}"
     fi
+  elif [ "$installation_type" == "AMS" ]; then
+    if [ "$boxturtle_name" != "AMS_1" ]; then
+      sed -i "s/AMS_1/${boxturtle_name}/g" "${afc_config_dir}/AFC_${boxturtle_name}.cfg"
+    fi
   fi
   check_and_append_prep "${afc_config_dir}/AFC.cfg"
   replace_varfile_path "${afc_config_dir}/AFC.cfg"
@@ -188,6 +198,10 @@ if [ "$installation_type" == "BoxTurtle (4-Lane)" ] || [ "$installation_type" ==
 elif [ "$installation_type" == "NightOwl" ]; then
   message+="""
 - Ensure you enter either your CAN bus or serial information in the ${afc_config_dir}/AFC_NightOwl_1.cfg file
+  """
+elif [ "$installation_type" == "AMS" ]; then
+  message+="""
+- Ensure you update the ${afc_config_dir}/AFC_${boxturtle_name}.cfg file to match your AMS configuration
   """
 elif [ "$installation_type" == "HTLF" ]; then
   message+="""

@@ -100,6 +100,14 @@ printf "
               \e[49m                 \e[49;38;5;53m▀▀\e[49m     \e[49;38;5;53m▀▀▀\e[49m \e[49;38;5;53m▀▀▀\e[49m  \e[49;38;5;53m▀▀▀\e[49m \e[49;38;5;53m▀▀▀\e[49m     \e[49;38;5;53m▀▀▀\e[49m                \e[m
 ";
 printf "                                    NightOwl by mjonuschat\n"
+    elif [ "$installation_type" == "AMS" ]; then
+printf "                 █████╗ ███╗   ███╗███████╗\n"
+printf "                ██╔══██╗████╗ ████║██╔════╝\n"
+printf "                ███████║██╔████╔██║██████╗ \n"
+printf "                ██╔══██║██║╚██╔╝██║╚════██╗\n"
+printf "                ██║  ██║██║ ╚═╝ ██║██████╔╝\n"
+printf "                ╚═╝  ╚═╝╚═╝     ╚═╝╚═════╝ \n"
+printf "\n                          AMS Integration by Armored Turtle\n"
     elif [ "$installation_type" == "HTLF" ]; then
 printf "
                           \e[49m         \e[38;5;0;49m▄▄▄▄\e[38;5;232;48;5;0m▄▄▄▄▄▄▄▄\e[38;5;0;49m▄▄▄\e[49m             \e[m
@@ -179,6 +187,9 @@ fi
           printf "B. Buffer type: %s \n" "$buffer_type"
           printf "C. BoxTurtle Name: %s \n" "$boxturtle_name"
           ;;
+        "AMS")
+          printf "C. AMS Name: %s \n" "$boxturtle_name"
+          ;;
         "HTLF")
           printf "D. HTLF Board Type: %s \n" "$htlf_board_type"
           ;;
@@ -199,7 +210,13 @@ fi
 
     case $choice in
       T)
-        cycle_array installation_options counter installation_type "Installation Type" ;;
+        cycle_array installation_options counter installation_type "Installation Type"
+        if [ "$installation_type" == "AMS" ]; then
+          if [[ ! "$boxturtle_name" =~ ^AMS_ ]]; then
+            boxturtle_name="AMS_1"
+          fi
+        fi
+        ;;
       [1-8])
         index=$((choice - 1))
         toggle_option "${toggle_items[$index]}" "${toggle_labels[$index]}" ;;
