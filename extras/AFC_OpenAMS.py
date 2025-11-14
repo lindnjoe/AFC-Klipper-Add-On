@@ -1553,6 +1553,19 @@ class afcAMS(afcUnit):
             return
 
         eventtime = self.reactor.monotonic()
+
+        # Mark lane as completely empty (prep and load sensors)
+        # This ensures AFC sees the lane as empty even if f1s sensor still shows filament
+        try:
+            lane.prep_state = False
+            lane.load_state = False
+            self._last_lane_states[lane.name] = False
+            if hasattr(lane, 'hub_obj') and lane.hub_obj:
+                self._last_hub_states[lane.hub_obj.name] = False
+            self.logger.info("Marked lane %s as empty for runout", lane.name)
+        except Exception:
+            self.logger.exception("Failed to mark lane %s as empty during runout", lane.name)
+
         try:
             lane.handle_load_runout(eventtime, False)
         except TypeError:
