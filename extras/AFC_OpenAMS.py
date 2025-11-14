@@ -667,6 +667,15 @@ class afcAMS(afcUnit):
         if not self._lane_matches_extruder(lane):
             return
 
+        # Wait for all moves to complete to prevent "Timer too close" errors
+        try:
+            toolhead = self.printer.lookup_object("toolhead")
+            toolhead.wait_moves()
+            # Add a small delay to allow the MCU to catch up
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        except Exception:
+            pass
+
         eventtime = self.reactor.monotonic()
         lane_name = getattr(lane, "name", None)
         self._set_virtual_tool_sensor_state(True, eventtime, lane_name, force=True, lane_obj=lane)
@@ -677,6 +686,15 @@ class afcAMS(afcUnit):
 
         if not self._lane_matches_extruder(lane):
             return
+
+        # Wait for all moves to complete to prevent "Timer too close" errors
+        try:
+            toolhead = self.printer.lookup_object("toolhead")
+            toolhead.wait_moves()
+            # Add a small delay to allow the MCU to catch up
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        except Exception:
+            pass
 
         eventtime = self.reactor.monotonic()
         lane_name = getattr(lane, "name", None)
@@ -1489,6 +1507,14 @@ class afcAMS(afcUnit):
                 self.logger.exception("Failed to mark lane %s as loaded", lane.name)
             try:
                 lane.sync_to_extruder()
+                # Wait for all moves to complete to prevent "Timer too close" errors
+                try:
+                    toolhead = self.printer.lookup_object("toolhead")
+                    toolhead.wait_moves()
+                    # Add a small delay to allow the MCU to catch up
+                    self.reactor.pause(self.reactor.monotonic() + 0.05)
+                except Exception:
+                    pass
             except Exception:
                 self.logger.exception("Failed to sync lane %s to extruder", lane.name)
             if afc_function is not None:
@@ -1532,6 +1558,14 @@ class afcAMS(afcUnit):
         if getattr(lane, "tool_loaded", False):
             try:
                 lane.unsync_to_extruder()
+                # Wait for all moves to complete to prevent "Timer too close" errors
+                try:
+                    toolhead = self.printer.lookup_object("toolhead")
+                    toolhead.wait_moves()
+                    # Add a small delay to allow the MCU to catch up
+                    self.reactor.pause(self.reactor.monotonic() + 0.05)
+                except Exception:
+                    pass
             except Exception:
                 self.logger.exception("Failed to unsync lane %s from extruder", lane.name)
             try:
