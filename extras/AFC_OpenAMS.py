@@ -1186,10 +1186,99 @@ class afcAMS(afcUnit):
                 "remove the '[afc_openams %s]' section from your config.",
                 self.oams_name, self.name, self.name
             )
-            # Don't start the sync timer if no OAMS hardware
+            # Don't start polling if no OAMS hardware
             return
 
-        self.reactor.update_timer(self.timer, self.reactor.NOW)
+        # PHASE 2: Subscribe to hardware sensor events instead of polling
+        if self.hardware_service is not None:
+            # Subscribe to sensor change events
+            self.event_bus.subscribe("f1s_changed", self._on_f1s_changed, priority=5)
+            self.event_bus.subscribe("hub_changed", self._on_hub_changed, priority=5)
+
+            # Start unified polling in AMSHardwareService
+            try:
+                self.hardware_service.start_polling()
+            except Exception:
+                self.logger.exception("Failed to start unified polling for %s", self.oams_name)
+        else:
+            # Fallback: use legacy polling if hardware_service unavailable
+            self.logger.warning("AMSHardwareService not available, using legacy polling for %s", self.name)
+            self.reactor.update_timer(self.timer, self.reactor.NOW)
+
+    def _on_f1s_changed(self, event_type, unit_name, bay, value, eventtime, **kwargs):
+        """Handle f1s sensor change events (PHASE 2: event-driven).
+
+        This replaces the f1s polling logic from _sync_event.
+        """
+        if unit_name != self.oams_name:
+            return  # Not our unit
+
+        lane = self._lane_for_spool_index(bay)
+        if lane is None:
+            return
+
+        lane_val = bool(value)
+
+        # Update lane state based on sensor
+        if getattr(lane, "ams_share_prep_load", False):
+            self._update_shared_lane(lane, lane_val, eventtime)
+        elif lane_val != self._last_lane_states.get(lane.name):
+            lane.load_callback(eventtime, lane_val)
+            lane.prep_callback(eventtime, lane_val)
+            self._mirror_lane_to_virtual_sensor(lane, eventtime)
+            self._last_lane_states[lane.name] = lane_val
+
+        # Update hardware service snapshot
+        if self.hardware_service is not None:
+            hub_obj = getattr(lane, "hub_obj", None)
+            hub_state = self._last_hub_states.get(hub_obj.name) if hub_obj else None
+            tool_state = self._lane_reports_tool_filament(lane)
+            try:
+                self.hardware_service.update_lane_snapshot(
+                    self.oams_name, lane.name, lane_val, hub_state, eventtime,
+                    spool_index=bay, tool_state=tool_state
+                )
+            except Exception:
+                self.logger.exception("Failed to update lane snapshot for %s", lane.name)
+
+        # Sync virtual tool sensor
+        self._sync_virtual_tool_sensor(eventtime)
+
+    def _on_hub_changed(self, event_type, unit_name, bay, value, eventtime, **kwargs):
+        """Handle hub sensor change events (PHASE 2: event-driven).
+
+        This replaces the hub polling logic from _sync_event.
+        """
+        if unit_name != self.oams_name:
+            return  # Not our unit
+
+        lane = self._lane_for_spool_index(bay)
+        if lane is None:
+            return
+
+        hub = getattr(lane, "hub_obj", None)
+        if hub is None:
+            return
+
+        hub_val = bool(value)
+        if hub_val != self._last_hub_states.get(hub.name):
+            hub.switch_pin_callback(eventtime, hub_val)
+            fila = getattr(hub, "fila", None)
+            if fila is not None:
+                fila.runout_helper.note_filament_present(eventtime, hub_val)
+            self._last_hub_states[hub.name] = hub_val
+
+        # Update hardware service snapshot
+        if self.hardware_service is not None:
+            lane_state = self._last_lane_states.get(lane.name, False)
+            tool_state = self._lane_reports_tool_filament(lane)
+            try:
+                self.hardware_service.update_lane_snapshot(
+                    self.oams_name, lane.name, lane_state, hub_val, eventtime,
+                    spool_index=bay, tool_state=tool_state
+                )
+            except Exception:
+                self.logger.exception("Failed to update lane snapshot for %s", lane.name)
 
     def _update_shared_lane(self, lane, lane_val, eventtime):
         """Synchronise shared prep/load sensor lanes without triggering errors."""
