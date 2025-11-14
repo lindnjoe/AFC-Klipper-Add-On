@@ -370,13 +370,25 @@ class AMSHardwareService:
         self._status: Dict[str, Any] = {}
         self._lane_snapshots: Dict[str, Dict[str, Any]] = {}
         self._status_callbacks: List[Callable[[Dict[str, Any]], None]] = []
-        
+
         # PHASE 1: Use registry instead of local _lanes_by_spool
         self.registry = LaneRegistry.for_printer(printer)
         self.event_bus = AMSEventBus.get_instance()
-        
+
         # Cache reactor reference
         self._reactor = None
+
+        # PHASE 2: Unified polling with event publishing
+        self._polling_timer = None
+        self._polling_interval = 2.0  # Active polling interval
+        self._polling_interval_idle = 4.0  # Idle polling interval
+        self._consecutive_idle_polls = 0
+        self._idle_poll_threshold = 3
+        self._last_encoder_clicks = None
+        self._last_f1s_hes = [None, None, None, None]
+        self._last_hub_hes = [None, None, None, None]
+        self._last_fps_value = None
+        self._polling_enabled = False
 
     @classmethod
     def for_printer(cls, printer, name: str = "default", logger: Optional[logging.Logger] = None) -> "AMSHardwareService":
@@ -435,11 +447,178 @@ class AMSHardwareService:
                     self._reactor = self.printer.get_reactor()
                 except Exception:
                     return 0.0
-        
+
         try:
             return self._reactor.monotonic()
         except Exception:
             return 0.0
+
+    def _log_info(self, message: str) -> None:
+        """Helper to log info messages compatible with both AFC_logger and standard logging."""
+        try:
+            # AFC_logger signature: info(message, console_only=False)
+            self.logger.info(message)
+        except TypeError:
+            # Standard logging signature: info(msg, *args)
+            self.logger.info(message)
+
+    def _log_warning(self, message: str) -> None:
+        """Helper to log warning messages compatible with both AFC_logger and standard logging."""
+        try:
+            self.logger.warning(message)
+        except TypeError:
+            self.logger.warning(message)
+
+    def _log_error(self, message: str) -> None:
+        """Helper to log error messages compatible with both AFC_logger and standard logging."""
+        try:
+            # AFC_logger has error() but not exception()
+            if hasattr(self.logger, 'error'):
+                self.logger.error(message)
+            else:
+                self.logger.error(message)
+        except Exception:
+            # Fallback to print if all else fails
+            print(f"AMSHardwareService: {message}")
+
+    def _log_debug(self, message: str) -> None:
+        """Helper to log debug messages compatible with both AFC_logger and standard logging."""
+        try:
+            self.logger.debug(message)
+        except Exception:
+            pass  # Ignore debug logging failures
+
+    def start_polling(self) -> None:
+        """Start the unified hardware polling timer.
+
+        PHASE 2: Centralizes all hardware polling in one place.
+        Publishes events when sensor values change.
+        """
+        if self._polling_timer is not None:
+            self._log_warning(f"Polling already started for {self.name}")
+            return
+
+        if self._reactor is None:
+            self._monotonic()  # Initialize reactor
+
+        if self._reactor is None:
+            self._log_error("Cannot start polling: reactor not available")
+            return
+
+        self._polling_enabled = True
+        self._polling_timer = self._reactor.register_timer(
+            self._polling_callback,
+            self._reactor.NOW
+        )
+        self._log_info(f"Started unified hardware polling for {self.name}")
+
+    def stop_polling(self) -> None:
+        """Stop the unified hardware polling timer."""
+        self._polling_enabled = False
+        if self._polling_timer is not None and self._reactor is not None:
+            self._reactor.unregister_timer(self._polling_timer)
+            self._polling_timer = None
+            self._log_info(f"Stopped unified hardware polling for {self.name}")
+
+    def _polling_callback(self, eventtime: float) -> float:
+        """Unified polling callback that detects changes and publishes events.
+
+        PHASE 2: Single source of truth for hardware state changes.
+        """
+        if not self._polling_enabled:
+            return self._reactor.NEVER
+
+        try:
+            # Poll hardware
+            status = self.poll_status()
+            if not status:
+                return eventtime + self._polling_interval_idle
+
+            # Detect encoder changes (for adaptive polling)
+            encoder_changed = False
+            encoder_clicks = status.get("encoder_clicks")
+            if encoder_clicks is not None:
+                if self._last_encoder_clicks is not None:
+                    if encoder_clicks != self._last_encoder_clicks:
+                        encoder_changed = True
+                        self._consecutive_idle_polls = 0
+                self._last_encoder_clicks = encoder_clicks
+
+            # Detect f1s_hes changes (spool present in bay)
+            f1s_values = status.get("f1s_hes_value", [])
+            for bay in range(min(len(f1s_values), 4)):
+                new_val = bool(f1s_values[bay])
+                old_val = self._last_f1s_hes[bay]
+
+                # Publish on first detection (old_val is None) OR when value changes
+                if old_val is None or new_val != old_val:
+                    # Publish sensor change event
+                    self.event_bus.publish(
+                        "f1s_changed",
+                        unit_name=self.name,
+                        bay=bay,
+                        value=new_val,
+                        eventtime=eventtime
+                    )
+                    if old_val is None:
+                        self._log_info(f"f1s[{bay}] initial state: {new_val}")
+                    else:
+                        self._log_debug(f"f1s[{bay}] changed: {old_val} -> {new_val}")
+
+                self._last_f1s_hes[bay] = new_val
+
+            # Detect hub_hes changes (filament at hub)
+            hub_values = status.get("hub_hes_value", [])
+            for bay in range(min(len(hub_values), 4)):
+                new_val = bool(hub_values[bay])
+                old_val = self._last_hub_hes[bay]
+
+                # Publish on first detection (old_val is None) OR when value changes
+                if old_val is None or new_val != old_val:
+                    # Publish sensor change event
+                    self.event_bus.publish(
+                        "hub_changed",
+                        unit_name=self.name,
+                        bay=bay,
+                        value=new_val,
+                        eventtime=eventtime
+                    )
+                    if old_val is None:
+                        self._log_info(f"hub[{bay}] initial state: {new_val}")
+                    else:
+                        self._log_debug(f"hub[{bay}] changed: {old_val} -> {new_val}")
+
+                self._last_hub_hes[bay] = new_val
+
+            # Detect fps_value changes (pressure sensor)
+            fps_value = status.get("fps_value")
+            if fps_value is not None:
+                old_fps = self._last_fps_value
+                # Only publish significant pressure changes (> 0.05 threshold)
+                if old_fps is not None and abs(fps_value - old_fps) > 0.05:
+                    self.event_bus.publish(
+                        "fps_changed",
+                        unit_name=self.name,
+                        value=fps_value,
+                        old_value=old_fps,
+                        eventtime=eventtime
+                    )
+                self._last_fps_value = fps_value
+
+            # Adaptive polling interval
+            if encoder_changed:
+                return eventtime + self._polling_interval
+
+            self._consecutive_idle_polls += 1
+            if self._consecutive_idle_polls > self._idle_poll_threshold:
+                return eventtime + self._polling_interval_idle
+
+            return eventtime + self._polling_interval
+
+        except Exception:
+            import traceback
+            self._log_error(f"Error in unified polling callback for {self.name}: {traceback.format_exc()}")
+            return eventtime + self._polling_interval_idle
 
     def poll_status(self) -> Optional[Dict[str, Any]]:
         """Query the controller for its latest status snapshot."""
@@ -477,7 +656,8 @@ class AMSHardwareService:
                 try:
                     callback(status_copy)
                 except Exception:
-                    self.logger.exception("AMS status observer failed for %s", self.name)
+                    import traceback
+                    self._log_error(f"AMS status observer failed for {self.name}: {traceback.format_exc()}")
 
     def latest_status(self) -> Dict[str, Any]:
         """Return the most recently cached status snapshot."""
