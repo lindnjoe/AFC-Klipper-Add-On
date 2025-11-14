@@ -1167,6 +1167,17 @@ class afcAMS(afcUnit):
 
     def handle_ready(self):
         """Resolve the OpenAMS object once Klippy is ready."""
+        # First check if ANY OpenAMS hardware exists in the system
+        if not _has_openams_hardware(self.printer):
+            self.logger.info(
+                "No OpenAMS hardware found in configuration. "
+                "Skipping OpenAMS integration for AFC unit '%s'. "
+                "This is normal if you are using Box Turtle or other non-AMS hardware.",
+                self.name
+            )
+            # Skip all OpenAMS initialization if no hardware is present
+            return
+
         if self.hardware_service is not None:
             self.oams = self.hardware_service.resolve_controller()
         else:
@@ -1178,7 +1189,7 @@ class afcAMS(afcUnit):
                 except Exception:
                     self.logger.exception("Failed to attach AMSHardwareService for %s", self.oams_name)
 
-        # Check if OAMS hardware was found
+        # Check if OAMS hardware was found for THIS specific unit
         if self.oams is None:
             self.logger.warning(
                 "OpenAMS hardware '[oams %s]' not found for AFC unit '%s'. "
@@ -2298,6 +2309,24 @@ def _patch_lane_pre_sensor_for_ams() -> None:
     AFCLane.get_toolhead_pre_sensor_state = _ams_get_toolhead_pre_sensor_state
     AFCLane._ams_pre_sensor_patched = True
 
+def _has_openams_hardware(printer):
+    """Check if any OpenAMS hardware is configured in the system.
+
+    Returns True if any [oams ...] sections are found in the configuration.
+    This prevents unnecessary OpenAMS initialization for users with other unit types.
+    """
+    try:
+        # Try to find any OAMS objects in the printer
+        # This will work after all configs have been loaded during handle_ready
+        for obj_name in printer.objects:
+            if obj_name.startswith('oams '):
+                return True
+        return False
+    except Exception:
+        # If we can't check, assume OAMS might be present to avoid breaking existing setups
+        return True
+
+
 def load_config_prefix(config):
     """Load OpenAMS integration - actual hardware check happens at handle_ready."""
     # Note: We can't reliably check for OAMS sections during config load because
@@ -2305,6 +2334,7 @@ def load_config_prefix(config):
     # The actual OAMS hardware check happens in handle_ready() after all configs load.
 
     # Always apply patches during config load for any afc_openams sections
+    # The patches will only take effect if OpenAMS hardware is actually present
     _patch_lane_pre_sensor_for_ams()
     _patch_extruder_for_virtual_ams()
     return afcAMS(config)
