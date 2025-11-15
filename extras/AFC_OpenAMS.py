@@ -768,17 +768,33 @@ class afcAMS(afcUnit):
                         other_lane._oams_runout_detected = False
                     self.logger.debug("Cleared tool_loaded for %s on same FPS (new lane %s loaded)", other_lane.name, lane.name)
                 elif other_extruder is not None:
-                    # Different extruder - unsync from old extruder to allow AFC unload
-                    # This clears other_extruder.lane_loaded so AFC won't block the unload
-                    try:
-                        other_lane.unsync_to_extruder()
-                        other_lane.tool_loaded = False
-                        if hasattr(other_lane, '_oams_runout_detected'):
-                            other_lane._oams_runout_detected = False
-                        self.logger.info("Unsynced %s from %s to allow unload (cross-FPS runout, new lane %s on %s)",
-                                       other_lane.name, other_extruder, lane.name, lane_extruder)
-                    except Exception:
-                        self.logger.exception("Failed to unsync %s from extruder during cross-FPS lane load", other_lane.name)
+                    # Different extruder - check if it's using virtual sensor
+                    # Only unsync for virtual sensors (AMS_EXTRUDER) - real sensors handle clearing naturally
+                    other_extruder_obj = getattr(other_lane, "extruder_obj", None)
+                    if other_extruder_obj is not None:
+                        other_tool_start = getattr(other_extruder_obj, "tool_start", None)
+                        is_virtual_sensor = (
+                            other_tool_start is not None and
+                            isinstance(other_tool_start, str) and
+                            other_tool_start.upper().startswith("AMS_")
+                        )
+
+                        if is_virtual_sensor:
+                            # Virtual sensor - manually unsync to clear extruder.lane_loaded
+                            # (Real sensors would handle this naturally when filament clears)
+                            try:
+                                other_lane.unsync_to_extruder()
+                                other_lane.tool_loaded = False
+                                if hasattr(other_lane, '_oams_runout_detected'):
+                                    other_lane._oams_runout_detected = False
+                                self.logger.info("Unsynced %s from virtual sensor extruder %s (cross-FPS runout, new lane %s on %s)",
+                                               other_lane.name, other_extruder, lane.name, lane_extruder)
+                            except Exception:
+                                self.logger.exception("Failed to unsync %s from extruder during cross-FPS lane load", other_lane.name)
+                        else:
+                            # Real sensor - let AFC's natural sensor handling clear it when filament clears
+                            self.logger.debug("Skipping unsync for %s on real sensor extruder %s (AFC will handle naturally)",
+                                           other_lane.name, other_extruder)
 
         if not self._lane_matches_extruder(lane):
             return
