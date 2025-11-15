@@ -1740,16 +1740,28 @@ class afcAMS(afcUnit):
 
         eventtime = self.reactor.monotonic()
 
-        # Set runout flag to prevent sensor state sync from overwriting empty state
-        # during AFC's runout handling. Do NOT manually set prep_state/load_state here -
-        # let the actual hardware sensors report when filament clears each sensor.
-        # This allows proper coasting - filament continues through PTFE tube after hub
-        # empties, and AFC triggers infinite runout when prep sensor actually goes empty.
+        # Check if this is a same-FPS runout (OpenAMS handles internally) vs cross-FPS (AFC handles)
+        runout_lane_name = getattr(lane, "runout_lane", None)
+        is_same_fps = False
+        if runout_lane_name:
+            target_lane = self.afc.lanes.get(runout_lane_name)
+            if target_lane:
+                source_extruder = getattr(lane.extruder_obj, "name", None) if hasattr(lane, "extruder_obj") else None
+                target_extruder = getattr(target_lane.extruder_obj, "name", None) if hasattr(target_lane, "extruder_obj") else None
+                is_same_fps = (source_extruder == target_extruder and source_extruder is not None)
+
+        # For both same-FPS and cross-FPS runouts: Set runout flag and let sensor sync handle the states
+        # The f1s sensors update in real-time and should naturally report False when filament clears
+        # The runout flag prevents sensor sync from overwriting empty->True during runout handling
         try:
             if not hasattr(lane, '_oams_runout_detected'):
                 lane._oams_runout_detected = False
             lane._oams_runout_detected = True
-            self.logger.info("Marked lane %s for runout tracking (waiting for sensor to clear)", lane.name)
+
+            if is_same_fps:
+                self.logger.info("Same-FPS runout: Marked lane %s for runout (OpenAMS handling reload, sensors sync naturally)", lane.name)
+            else:
+                self.logger.info("Cross-FPS runout: Marked lane %s for runout (AFC will handle tool change)", lane.name)
         except Exception:
             self.logger.exception("Failed to mark lane %s for runout tracking", lane.name)
 
