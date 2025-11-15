@@ -769,6 +769,12 @@ class afcAMS(afcUnit):
         """Update the virtual tool sensor when a lane unloads from the tool."""
         super().lane_tool_unloaded(lane)
 
+        # Explicitly clear tool_loaded to prevent sensor sync from re-setting it
+        lane.tool_loaded = False
+        # Clear runout flag if set
+        if hasattr(lane, '_oams_runout_detected'):
+            lane._oams_runout_detected = False
+
         if not self._lane_matches_extruder(lane):
             return
 
