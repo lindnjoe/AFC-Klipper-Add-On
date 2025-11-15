@@ -1598,6 +1598,26 @@ class afcAMS(afcUnit):
         # When sensor goes False (empty), clear tool_loaded like same-FPS runout does
         # This mimics the behavior in _update_shared_lane() for non-shared lanes
         if not lane_val:
+            # IMPORTANT: For virtual sensor extruders, unsync BEFORE clearing tool_loaded
+            # This ensures extruder.lane_loaded gets cleared to allow AFC to unload this lane
+            if getattr(lane, 'tool_loaded', False):
+                extruder_obj = getattr(lane, "extruder_obj", None)
+                if extruder_obj is not None:
+                    tool_start = getattr(extruder_obj, "tool_start", None)
+                    is_virtual_sensor = (
+                        tool_start is not None and
+                        isinstance(tool_start, str) and
+                        tool_start.upper().startswith("AMS_")
+                    )
+                    if is_virtual_sensor:
+                        # Virtual sensor - unsync from extruder to clear extruder.lane_loaded
+                        try:
+                            lane.unsync_to_extruder()
+                            self.logger.info("Unsynced %s from virtual sensor extruder %s when sensor cleared",
+                                           lane.name, extruder_obj.name)
+                        except Exception:
+                            self.logger.exception("Failed to unsync %s from extruder when sensor cleared", lane.name)
+
             lane.tool_loaded = False
             lane.loaded_to_hub = False
             lane.status = AFCLaneState.NONE
