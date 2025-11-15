@@ -749,6 +749,37 @@ class afcAMS(afcUnit):
         """Update the virtual tool sensor when a lane loads into the tool."""
         super().lane_tool_loaded(lane)
 
+        # When a new lane loads to toolhead, clear tool_loaded on any OTHER lanes from this unit
+        # that are on the SAME FPS/extruder (each FPS can have its own lane loaded)
+        # Also unsync lanes on DIFFERENT extruders to allow AFC to unload them
+        lane_extruder = getattr(lane.extruder_obj, "name", None) if hasattr(lane, "extruder_obj") else None
+        if lane_extruder:
+            for other_lane in self.lanes.values():
+                if other_lane.name == lane.name:
+                    continue
+                if not getattr(other_lane, 'tool_loaded', False):
+                    continue
+                # Check if other lane is on same extruder
+                other_extruder = getattr(other_lane.extruder_obj, "name", None) if hasattr(other_lane, "extruder_obj") else None
+                if other_extruder == lane_extruder:
+                    # Same extruder - just clear tool_loaded
+                    other_lane.tool_loaded = False
+                    if hasattr(other_lane, '_oams_runout_detected'):
+                        other_lane._oams_runout_detected = False
+                    self.logger.debug("Cleared tool_loaded for %s on same FPS (new lane %s loaded)", other_lane.name, lane.name)
+                elif other_extruder is not None:
+                    # Different extruder - unsync from old extruder to allow AFC unload
+                    # This clears other_extruder.lane_loaded so AFC won't block the unload
+                    try:
+                        other_lane.unsync_to_extruder()
+                        other_lane.tool_loaded = False
+                        if hasattr(other_lane, '_oams_runout_detected'):
+                            other_lane._oams_runout_detected = False
+                        self.logger.info("Unsynced %s from %s to allow unload (cross-FPS runout, new lane %s on %s)",
+                                       other_lane.name, other_extruder, lane.name, lane_extruder)
+                    except Exception:
+                        self.logger.exception("Failed to unsync %s from extruder during cross-FPS lane load", other_lane.name)
+
         if not self._lane_matches_extruder(lane):
             return
 
@@ -1547,6 +1578,16 @@ class afcAMS(afcUnit):
             lane.prep_callback(eventtime, prep_state=lane_val)
         except Exception:
             self.logger.exception("Failed to update prep sensor for lane %s", lane)
+
+        # When sensor goes False (empty), clear tool_loaded like same-FPS runout does
+        # This mimics the behavior in _update_shared_lane() for non-shared lanes
+        if not lane_val:
+            lane.tool_loaded = False
+            lane.loaded_to_hub = False
+            lane.status = AFCLaneState.NONE
+            lane.unit_obj.lane_unloaded(lane)
+            lane.td1_data = {}
+            lane.afc.spool.clear_values(lane)
 
         self._mirror_lane_to_virtual_sensor(lane, eventtime)
         lane_name = getattr(lane, "name", None)
