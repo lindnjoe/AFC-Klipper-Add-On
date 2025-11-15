@@ -311,6 +311,11 @@ class afcAMS(afcUnit):
         self.gcode.register_mux_command("AFC_OAMS_CALIBRATE_HUB_HES", "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_HUB_HES, desc="calibrate the OpenAMS HUB HES value for a specific lane")
         self.gcode.register_mux_command("AFC_OAMS_CALIBRATE_HUB_HES_ALL", "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL, desc="calibrate the OpenAMS HUB HES value for every loaded lane")
         self.gcode.register_mux_command("AFC_OAMS_CALIBRATE_PTFE", "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_PTFE, desc="calibrate the OpenAMS PTFE length for a specific lane")
+        self.gcode.register_mux_command("UNIT_PTFE_CALIBRATION", "UNIT", self.name, self.cmd_UNIT_PTFE_CALIBRATION, desc="show OpenAMS PTFE calibration menu")
+
+    def _is_openams_unit(self):
+        """Check if this unit has OpenAMS hardware available."""
+        return self.oams is not None
 
     def _format_openams_calibration_command(self, base_command, lane):
         if base_command not in {"OAMS_CALIBRATE_HUB_HES", "OAMS_CALIBRATE_PTFE_LENGTH"}:
@@ -329,11 +334,91 @@ class afcAMS(afcUnit):
 
         return f"AFC_OAMS_CALIBRATE_PTFE UNIT={self.name} SPOOL={spool_index}"
 
+    def cmd_UNIT_CALIBRATION(self, gcmd):
+        """Override base calibration menu to show OpenAMS-specific options."""
+        if not self._is_openams_unit():
+            super().cmd_UNIT_CALIBRATION(gcmd)
+            return
+
+        prompt = AFCprompt(gcmd, self.logger)
+        title = f"{self.name} Calibration"
+        text = "Select OpenAMS calibration type"
+        buttons = []
+
+        # HUB HES calibration button
+        buttons.append(("Calibrate HUB HES", f"UNIT_LANE_CALIBRATION UNIT={self.name}", "primary"))
+
+        # PTFE calibration button
+        buttons.append(("Calibrate PTFE Length", f"UNIT_PTFE_CALIBRATION UNIT={self.name}", "secondary"))
+
+        # Back button
+        back = [("Back", "AFC_CALIBRATION", "info")]
+
+        prompt.create_custom_p(title, text, None, True, [buttons], back)
+
+    def cmd_UNIT_PTFE_CALIBRATION(self, gcmd):
+        """Show PTFE calibration menu with buttons for each loaded lane."""
+        if not self._is_openams_unit():
+            gcmd.respond_info("PTFE calibration is only available for OpenAMS units.")
+            return
+
+        # Check if any lane on THIS UNIT is loaded to toolhead
+        for lane in self.lanes.values():
+            if getattr(lane, "tool_loaded", False):
+                gcmd.respond_info(f"Cannot run OpenAMS calibration while {lane.name} is loaded to the toolhead. Please unload the tool and try again.")
+                return
+
+        prompt = AFCprompt(gcmd, self.logger)
+        buttons = []
+        group_buttons = []
+        index = 0
+        title = f"{self.name} PTFE Length Calibration"
+        text = (
+            "Select a loaded lane from {} to calibrate PTFE length using OpenAMS. "
+            "Command: OAMS_CALIBRATE_PTFE_LENGTH"
+        ).format(self.name)
+
+        for lane in self.lanes.values():
+            if not getattr(lane, "load_state", False):
+                continue
+
+            button_command = self._format_openams_calibration_command(
+                "OAMS_CALIBRATE_PTFE_LENGTH", lane
+            )
+            if button_command is None:
+                continue
+
+            button_label = f"{lane}"
+            button_style = "primary" if index % 2 == 0 else "secondary"
+            group_buttons.append((button_label, button_command, button_style))
+
+            index += 1
+            if index % 2 == 0:
+                buttons.append(list(group_buttons))
+                group_buttons = []
+
+        if group_buttons:
+            buttons.append(list(group_buttons))
+
+        total_buttons = sum(len(group) for group in buttons)
+        if total_buttons == 0:
+            text = "No lanes are loaded, please load before calibration"
+
+        back = [("Back", f"UNIT_CALIBRATION UNIT={self.name}", "info")]
+
+        prompt.create_custom_p(title, text, None, True, buttons, back)
+
     def cmd_UNIT_LANE_CALIBRATION(self, gcmd):
         """Override base prompt to expose an all-lane HUB HES calibration action."""
         if not self._is_openams_unit():
             super().cmd_UNIT_LANE_CALIBRATION(gcmd)
             return
+
+        # Check if any lane on THIS UNIT is loaded to toolhead
+        for lane in self.lanes.values():
+            if getattr(lane, "tool_loaded", False):
+                gcmd.respond_info(f"Cannot run OpenAMS calibration while {lane.name} is loaded to the toolhead. Please unload the tool and try again.")
+                return
 
         prompt = AFCprompt(gcmd, self.logger)
         buttons = []
@@ -1128,6 +1213,7 @@ class afcAMS(afcUnit):
                 self.afc.function.afc_led(cur_lane.led_fault, cur_lane.led_index)
                 msg += '<span class=error--text> NOT READY</span>'
                 cur_lane.do_enable(False)
+                cur_lane.disable_buffer()
                 msg = '<span class=error--text>CHECK FILAMENT Prep: False - Load: True</span>'
                 succeeded = False
         else:
@@ -1136,11 +1222,20 @@ class afcAMS(afcUnit):
             if not cur_lane.load_state:
                 msg += '<span class=error--text> NOT LOADED</span>'
                 self.afc.function.afc_led(cur_lane.led_not_ready, cur_lane.led_index)
+                cur_lane.disable_buffer()
                 succeeded = False
             else:
                 cur_lane.status = AFCLaneState.LOADED
                 msg += '<span class=success--text> AND LOADED</span>'
                 self.afc.function.afc_led(cur_lane.led_spool_illum, cur_lane.led_spool_index)
+
+                # Enable buffer if: (prep AND hub sensor) OR tool_loaded
+                # Check hub sensor to distinguish loaded lanes from lanes with just filament present
+                hub_loaded = cur_lane.hub_obj and cur_lane.hub_obj.state
+                if hub_loaded or cur_lane.tool_loaded:
+                    cur_lane.enable_buffer()
+                else:
+                    cur_lane.disable_buffer()
 
                 if cur_lane.tool_loaded:
                     tool_ready = (cur_lane.get_toolhead_pre_sensor_state() or cur_lane.extruder_obj.tool_start == "buffer" or cur_lane.extruder_obj.tool_end_state)
@@ -1153,10 +1248,11 @@ class afcAMS(afcUnit):
                             self.afc.spool.set_active_spool(cur_lane.spool_id)
                             cur_lane.unit_obj.lane_tool_loaded(cur_lane)
                             cur_lane.status = AFCLaneState.TOOLED
-                        cur_lane.enable_buffer()
                     elif tool_ready:
                         msg += '<span class=error--text> error in ToolHead. Lane identified as loaded but not identified as loaded in extruder</span>'
                         succeeded = False
+                        # Disable buffer on error
+                        cur_lane.disable_buffer()
 
         if assignTcmd:
             self.afc.function.TcmdAssign(cur_lane)
@@ -1164,6 +1260,40 @@ class afcAMS(afcUnit):
         self.logger.info('{lane_name} tool cmd: {tcmd:3} {msg}'.format(lane_name=cur_lane.name, tcmd=cur_lane.map, msg=msg))
         cur_lane.set_afc_prep_done()
         return succeeded
+
+    def calibrate_bowden(self, cur_lane, dis, tol):
+        """OpenAMS units use different calibration commands."""
+        msg = (
+            "OpenAMS units do not support standard AFC bowden calibration. "
+            "Use OpenAMS-specific calibration commands instead:\n"
+            "  - AFC_OAMS_CALIBRATE_HUB_HES UNIT={} SPOOL=<spool_index>\n"
+            "  - AFC_OAMS_CALIBRATE_PTFE UNIT={} SPOOL=<spool_index>\n"
+            "  - AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT={}"
+        ).format(self.name, self.name, self.name)
+        self.logger.info(msg)
+        return False, msg, 0
+
+    def calibrate_td1(self, cur_lane, dis, tol):
+        """OpenAMS units use different calibration commands."""
+        msg = (
+            "OpenAMS units do not support standard AFC TD1 calibration. "
+            "Use OpenAMS-specific calibration commands instead:\n"
+            "  - AFC_OAMS_CALIBRATE_HUB_HES UNIT={} SPOOL=<spool_index>\n"
+            "  - AFC_OAMS_CALIBRATE_PTFE UNIT={} SPOOL=<spool_index>"
+        ).format(self.name, self.name)
+        self.logger.info(msg)
+        return False, msg, 0
+
+    def calibrate_hub(self, cur_lane, tol):
+        """OpenAMS units use different calibration commands."""
+        msg = (
+            "OpenAMS units do not support standard AFC hub calibration. "
+            "Use OpenAMS-specific calibration commands instead:\n"
+            "  - AFC_OAMS_CALIBRATE_HUB_HES UNIT={} SPOOL=<spool_index>\n"
+            "  - AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT={}"
+        ).format(self.name, self.name)
+        self.logger.info(msg)
+        return False, msg, 0
 
     def handle_ready(self):
         """Resolve the OpenAMS object once Klippy is ready."""
@@ -1294,26 +1424,30 @@ class afcAMS(afcUnit):
     def _update_shared_lane(self, lane, lane_val, eventtime):
         """Synchronise shared prep/load sensor lanes without triggering errors."""
         # Check if runout has been detected for this lane
-        # If so, ignore sensor state updates that would show filament present
+        # Only block sensor updates if actively in runout state
         if hasattr(lane, '_oams_runout_detected') and lane._oams_runout_detected:
-            # Clear the flag if printer is no longer printing or lane is not current
+            should_block = False
             try:
                 is_printing = self.afc.function.is_printing()
-                is_current = (getattr(lane, 'name', None) == getattr(self.afc, 'current', None))
-                if not is_printing or not is_current:
+                is_tool_loaded = getattr(lane, 'tool_loaded', False)
+                lane_status = getattr(lane, 'status', None)
+                # Only block if actively printing with this lane loaded and in runout state
+                if is_printing and is_tool_loaded and lane_status in (AFCLaneState.INFINITE_RUNOUT, AFCLaneState.TOOL_UNLOADING):
+                    should_block = True
+                else:
+                    # Clear the flag - runout handling is complete
                     lane._oams_runout_detected = False
-                    self.logger.debug("Clearing runout flag for shared lane %s - printer not printing or lane not current", getattr(lane, "name", "unknown"))
+                    self.logger.debug("Clearing runout flag for shared lane %s - runout handling complete", getattr(lane, "name", "unknown"))
             except Exception:
-                pass
+                # On error, clear the flag to be safe
+                lane._oams_runout_detected = False
 
-            if hasattr(lane, '_oams_runout_detected') and lane._oams_runout_detected:
-                if lane_val:  # Trying to set sensors to True (filament present)
-                    self.logger.debug("Ignoring shared lane sensor update for lane %s - runout already detected", getattr(lane, "name", "unknown"))
-                    return
-                else:  # Sensor is confirming empty state
-                    # Clear the runout flag since sensor is now correctly reporting empty
-                    lane._oams_runout_detected = False
-                    self.logger.debug("Shared lane sensor confirmed empty state for lane %s - clearing runout flag", getattr(lane, "name", "unknown"))
+            if should_block and lane_val:  # Only block if conditions met and trying to set sensors to True
+                self.logger.debug("Ignoring shared lane sensor update for lane %s - runout in progress", getattr(lane, "name", "unknown"))
+                return
+            elif not lane_val:  # Sensor confirms empty - always clear flag
+                lane._oams_runout_detected = False
+                self.logger.debug("Shared lane sensor confirmed empty state for lane %s - clearing runout flag", getattr(lane, "name", "unknown"))
 
         if lane_val == self._last_lane_states.get(lane.name):
             return
@@ -1351,27 +1485,34 @@ class afcAMS(afcUnit):
     def _apply_lane_sensor_state(self, lane, lane_val, eventtime):
         """Apply a boolean lane sensor value using existing AFC callbacks."""
         # Check if runout has been detected for this lane
-        # If so, ignore sensor state updates that would show filament present
-        # This prevents physical sensors from overwriting the runout state
+        # Only block sensor updates if:
+        # 1. Runout flag is set AND
+        # 2. Printer is actively printing AND
+        # 3. Lane is currently loaded to tool AND
+        # 4. Lane status indicates it's in a runout/unload state
         if hasattr(lane, '_oams_runout_detected') and lane._oams_runout_detected:
-            # Clear the flag if printer is no longer printing or lane is not current
+            should_block = False
             try:
                 is_printing = self.afc.function.is_printing()
-                is_current = (getattr(lane, 'name', None) == getattr(self.afc, 'current', None))
-                if not is_printing or not is_current:
+                is_tool_loaded = getattr(lane, 'tool_loaded', False)
+                lane_status = getattr(lane, 'status', None)
+                # Only block if actively printing with this lane loaded and in runout state
+                if is_printing and is_tool_loaded and lane_status in (AFCLaneState.INFINITE_RUNOUT, AFCLaneState.TOOL_UNLOADING):
+                    should_block = True
+                else:
+                    # Clear the flag - runout handling is complete
                     lane._oams_runout_detected = False
-                    self.logger.debug("Clearing runout flag for lane %s - printer not printing or lane not current", getattr(lane, "name", "unknown"))
+                    self.logger.debug("Clearing runout flag for lane %s - runout handling complete", getattr(lane, "name", "unknown"))
             except Exception:
-                pass
+                # On error, clear the flag to be safe
+                lane._oams_runout_detected = False
 
-            if hasattr(lane, '_oams_runout_detected') and lane._oams_runout_detected:
-                if lane_val:  # Trying to set sensors to True (filament present)
-                    self.logger.debug("Ignoring sensor update for lane %s - runout already detected", getattr(lane, "name", "unknown"))
-                    return
-                else:  # Sensor is confirming empty state
-                    # Clear the runout flag since sensor is now correctly reporting empty
-                    lane._oams_runout_detected = False
-                    self.logger.debug("Sensor confirmed empty state for lane %s - clearing runout flag", getattr(lane, "name", "unknown"))
+            if should_block and lane_val:  # Only block if conditions met and trying to set sensors to True
+                self.logger.debug("Ignoring sensor update for lane %s - runout in progress", getattr(lane, "name", "unknown"))
+                return
+            elif not lane_val:  # Sensor confirms empty - always clear flag
+                lane._oams_runout_detected = False
+                self.logger.debug("Sensor confirmed empty state for lane %s - clearing runout flag", getattr(lane, "name", "unknown"))
 
         try:
             share = getattr(lane, "ams_share_prep_load", False)
@@ -1601,6 +1742,8 @@ class afcAMS(afcUnit):
 
         # Mark lane as completely empty (prep and load sensors)
         # This ensures AFC sees the lane as empty even if f1s sensor still shows filament
+        # DO NOT call handle_load_runout() here - let AFC's own sensor detect runout naturally
+        # after the filament coasts through the system
         try:
             lane.prep_state = False
             lane.load_state = False
@@ -1611,16 +1754,14 @@ class afcAMS(afcUnit):
             if not hasattr(lane, '_oams_runout_detected'):
                 lane._oams_runout_detected = False
             lane._oams_runout_detected = True
-            self.logger.info("Marked lane %s as empty for runout", lane.name)
+            self.logger.info("Marked lane %s as empty for runout (AFC will detect via sensor)", lane.name)
         except Exception:
             self.logger.exception("Failed to mark lane %s as empty during runout", lane.name)
 
-        try:
-            lane.handle_load_runout(eventtime, False)
-        except TypeError:
-            lane.handle_load_runout(eventtime, load_state=False)
-        except AttributeError:
-            self.logger.warning("Lane %s is missing load runout handler for AMS integration", lane)
+        # NOTE: We do NOT call lane.handle_load_runout() here
+        # This would trigger infinite runout immediately when OpenAMS detects the spool is empty
+        # Instead, we let the filament coast naturally and AFC's prep/load sensor will detect
+        # the runout when the filament actually clears, triggering infinite runout at the proper time
 
     def handle_openams_lane_tool_state(self, lane_name: str, loaded: bool, *, spool_index: Optional[int] = None, eventtime: Optional[float] = None) -> bool:
         """Update lane/tool state in response to OpenAMS hardware events."""
@@ -1861,26 +2002,30 @@ class afcAMS(afcUnit):
             return
 
         lane = self._find_lane_by_spool(spool_index)
+        if lane is None:
+            gcmd.respond_info(f"Could not find lane for spool index {spool_index}.")
+            return
+
+        # Check if this lane's extruder has something loaded to toolhead
+        extruder_name = getattr(lane.extruder_obj, "name", None) if hasattr(lane, "extruder_obj") else None
+        loaded_lane = self._check_toolhead_loaded(extruder_name)
+        if loaded_lane:
+            gcmd.respond_info(f"Cannot run OpenAMS calibration while {loaded_lane} is loaded to the toolhead on this extruder. Please unload the tool and try again.")
+            return
+
         lane_name = getattr(lane, "name", None)
         self._calibrate_hub_hes_spool(spool_index, gcmd, lane_name=lane_name)
 
     def cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL(self, gcmd):
         """Calibrate HUB HES for every loaded OpenAMS lane in this unit."""
+        # Check if any lane on THIS UNIT has something loaded to toolhead
+        for lane in self.lanes.values():
+            if getattr(lane, "tool_loaded", False):
+                gcmd.respond_info(f"Cannot run OpenAMS calibration while {lane.name} is loaded to the toolhead. Please unload the tool and try again.")
+                return
+
         prompt = AFCprompt(gcmd, self.logger)
         prompt.p_end()
-
-        active_lane = getattr(self.afc, "current", None)
-        if isinstance(active_lane, AFCLane):
-            active_lane_obj = active_lane
-        elif isinstance(active_lane, str):
-            active_lane_obj = self.lanes.get(active_lane)
-        else:
-            active_lane_obj = None
-
-        if (isinstance(active_lane_obj, AFCLane) and getattr(active_lane_obj, "unit_obj", None) is self and getattr(active_lane_obj, "tool_loaded", False)):
-            lane_label = getattr(active_lane_obj, "name", "current lane")
-            gcmd.respond_info("Cannot calibrate all OpenAMS lanes while {} is active on this unit. Please unload the current tool and try again.".format(lane_label))
-            return
 
         calibrations = []
         skipped = []
@@ -1916,6 +2061,17 @@ class afcAMS(afcUnit):
             return
 
         lane = self._find_lane_by_spool(spool_index)
+        if lane is None:
+            gcmd.respond_info(f"Could not find lane for spool index {spool_index}.")
+            return
+
+        # Check if this lane's extruder has something loaded to toolhead
+        extruder_name = getattr(lane.extruder_obj, "name", None) if hasattr(lane, "extruder_obj") else None
+        loaded_lane = self._check_toolhead_loaded(extruder_name)
+        if loaded_lane:
+            gcmd.respond_info(f"Cannot run OpenAMS calibration while {loaded_lane} is loaded to the toolhead on this extruder. Please unload the tool and try again.")
+            return
+
         lane_name = getattr(lane, "name", None)
         self._calibrate_ptfe_spool(spool_index, gcmd, lane_name=lane_name)
 
@@ -2187,6 +2343,28 @@ class afcAMS(afcUnit):
             return False
 
         return True
+
+    def _check_toolhead_loaded(self, extruder_name=None):
+        """Check if a lane is currently loaded to the specified extruder's toolhead.
+
+        Args:
+            extruder_name: Optional extruder name to check. If None, checks all extruders.
+
+        Returns: Lane name if loaded, None otherwise.
+        """
+        # If specific extruder provided, only check lanes on that extruder
+        if extruder_name:
+            for lane_name, lane in self.afc.lanes.items():
+                if getattr(lane, "tool_loaded", False):
+                    lane_extruder = getattr(lane.extruder_obj, "name", None) if hasattr(lane, "extruder_obj") else None
+                    if lane_extruder == extruder_name:
+                        return lane_name
+        else:
+            # Check all lanes across all AFC units
+            for lane_name, lane in self.afc.lanes.items():
+                if getattr(lane, "tool_loaded", False):
+                    return lane_name
+        return None
 
     def _find_lane_by_spool(self, spool_index):
         """Resolve lane by spool index using registry when available."""
