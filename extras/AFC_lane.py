@@ -634,6 +634,10 @@ class AFCLane:
         Common function to grab TD-1 data once user inserts filament into a lane. Only happens if user has specified
         this by setting `capture_td1_when_loaded: True` and if hub is clear and toolhead is not loaded.
         """
+        # Allow unit-specific override of TD-1 prep capture workflow.
+        if hasattr(self.unit_obj, 'prep_capture_td1'):
+            return self.unit_obj.prep_capture_td1(self)
+
         if self.td1_when_loaded:
             if not self.hub_obj.state and self.afc.function.get_current_lane_obj() is None:
                 self.get_td1_data()
@@ -692,7 +696,7 @@ class AFCLane:
                         self._perform_pause_runout()
                 elif self.status != "calibrating":
                     self.set_unloaded()
-
+        self.fila_load.runout_helper.min_event_systime = self.reactor.monotonic() + self.fila_load.runout_helper.event_delay
         self.afc.save_vars()
 
     def prep_callback(self, eventtime, state):
@@ -807,7 +811,7 @@ class AFCLane:
             elif not prep_state:
                 # Filament is unloaded
                 self.set_unloaded()
-
+        self.fila_prep.runout_helper.min_event_systime = self.reactor.monotonic() + self.fila_prep.runout_helper.event_delay
         self.afc.save_vars()
 
     def do_enable(self, enable):
@@ -1213,6 +1217,9 @@ class AFCLane:
         Captures TD-1 data for lane. Has error checking to verify that lane is loaded, hub is not blocked
         and that TD-1 device is still detected before trying to capture data.
         """
+        # Allow unit-specific override of TD-1 capture workflow.
+        if hasattr(self.unit_obj, 'capture_td1_data'):
+            return self.unit_obj.capture_td1_data(self)
         max_move_tries = 0
         status = True
         msg = ""
