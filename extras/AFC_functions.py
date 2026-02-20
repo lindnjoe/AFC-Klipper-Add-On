@@ -1326,7 +1326,11 @@ class afcFunction:
         text = f'{title} for {cali}. '
         if reset_lane:
             text += 'First: reset lane, Second: review messages in console and take necessary action and re-run calibration.'
-            buttons.append(("Reset lane", "AFC_LANE_RESET LANE={} DISTANCE={}".format(cali, dis), "primary"))
+            lane = self.afc.lanes.get(str(cali)) if cali is not None else None
+            if lane and hasattr(lane.unit_obj, 'get_lane_reset_command'):
+                buttons.append(("Reset lane", lane.unit_obj.get_lane_reset_command(lane, dis), "primary"))
+            else:
+                buttons.append(("Reset lane", "AFC_LANE_RESET LANE={} DISTANCE={}".format(cali, dis), "primary"))
 
         if fail_message:
             text += f" Fail message: {fail_message}"
