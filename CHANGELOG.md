@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added unit-defined lane hooks so integrations can provide custom `lane_unload`, `load_sequence`, and `unload_sequence` behavior.
 - Added unit-specific TD-1 workflow override handling in lane logic.
+- Added unit-specific lane reset button handling in `AFC_functions.py`.
 
 ### Changed
 - Refactored OpenAMS lane handling to use event-driven updates instead of constant sensor polling.
 - Refactored OpenAMS hardware integration to use `LaneRegistry` for lane lookups and manager coordination.
-- Refactored lane reset button handling in `AFC_functions.py` to allow unit-defined behavior.
 
 ### Removed
 - Removed sample `custom_load_cmd` and `custom_unload_cmd` entries from `templates/AFC_AMS_1.cfg`.
