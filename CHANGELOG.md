@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2026-02-21]
+### Added
+- Added unit-defined lane hooks so integrations can provide custom `lane_unload`, `load_sequence`, and `unload_sequence` behavior.
+- Added unit-specific TD-1 workflow override handling in lane logic.
+
+### Changed
+- Refactored OpenAMS lane handling to use event-driven updates instead of constant sensor polling.
+- Refactored OpenAMS hardware integration to use `LaneRegistry` for lane lookups and manager coordination.
+- Refactored lane reset button handling in `AFC_functions.py`.
+
+### Removed
+- Removed sample `custom_load_cmd` and `custom_unload_cmd` entries from `templates/AFC_AMS_1.cfg`.
+
 ## [2026-02-18]
 ### Fixed
 - Fixed M104/M109 macros to work as expected on tools when a lane is not yet loaded
