@@ -1301,7 +1301,7 @@ class afc:
         # Allow unit to provide custom load sequence
         if hasattr(cur_lane.unit_obj, 'load_sequence'):
             return cur_lane.unit_obj.load_sequence(cur_lane, cur_hub, cur_extruder)
-        # Placeholder for custom load sequence
+        
         if cur_lane.custom_load_cmd:
             self.logger.info("Running custom load command for lane {}".format(cur_lane.name))
             self.gcode.run_script_from_command(cur_lane.custom_load_cmd)
