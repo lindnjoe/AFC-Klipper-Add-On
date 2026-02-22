@@ -1,6 +1,6 @@
 # Armored Turtle Automated Filament Control
 #
-# Copyright (C) 2024-2026 Armored Turtle
+# Copyright (C) 2024 Armored Turtle
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
@@ -15,9 +15,7 @@ class AFCprompt:
 
     # Prompt text action
     def p_text(self, text):
-        lines = text.split("\n")
-        for line in lines:
-            self.logger.raw("// action:prompt_text {}".format(line))
+        self.logger.raw("// action:prompt_text {}".format(text))
 
     # Prompt button action (with style options)
     def p_button(self, label, command, style=None):
