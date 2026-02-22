@@ -859,7 +859,7 @@ class afcAMS(afcUnit):
         #  Register each lane with the shared registry
         for lane in self.lanes.values():
             lane.prep_state = False
-            lane.load_state = False
+            lane._load_state = False
             lane.status = AFCLaneState.NONE
             lane.ams_share_prep_load = getattr(lane, "load", None) is None
             # Initialize OpenAMS runout tracking attributes so downstream code
@@ -1873,32 +1873,8 @@ class afcAMS(afcUnit):
 
         return succeeded
 
-    def calibrate_bowden(self, cur_lane, dis, tol):
-        """OpenAMS units use different calibration commands."""
-        msg = (
-            "OpenAMS units do not support standard AFC bowden calibration. "
-            "Use OpenAMS-specific calibration commands instead:\n"
-            "  - AFC_OAMS_CALIBRATE_HUB_HES UNIT={} SPOOL=<spool_index>\n"
-            "  - AFC_OAMS_CALIBRATE_PTFE UNIT={} SPOOL=<spool_index>\n"
-            "  - AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT={}"
-        ).format(self.name, self.name, self.name)
-        self.logger.info(msg)
-        return False, msg, 0
-
-    def _unload_after_td1(self, cur_lane, spool_index, fps_id):
-        """
-        Unload filament after TD-1 operation by reversing follower and spool motor until hub clears.
-        """
-        try:
-            self.oams.abort_current_action(wait=True, code=0)
-        except Exception as e:
-            self.logger.debug(f"Failed to abort existing action before unload for {cur_lane.name}")
-
-        hub_cleared = False
-        unload_wait = 5.0
-        initial_delay = 0.0  # Unload immediately once load is confirmed
-        for attempt in range(3):  # Increased to 3 attempts
-            # Send unload command first to retract spool motor
+        if lane_val:
+            lane._load_state = False
             try:
                 self.oams.oams_unload_spool_cmd.send([])
             except Exception as e:
