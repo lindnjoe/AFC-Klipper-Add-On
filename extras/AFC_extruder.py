@@ -1,6 +1,6 @@
 # Armored Turtle Automated Filament Changer
 #
-# Copyright (C) 2024 Armored Turtle
+# Copyright (C) 2024-2026 Armored Turtle
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
@@ -360,7 +360,7 @@ class AFCExtruder:
             self.logger.info(f"{self.name} no lanes")
             # Due to race conditions at startup, these variables might not be set correctly,
             #  set to current tool start state
-            self.tc_lane.load_state = self.tc_lane.prep_state = self.tool_start_state
+            self.tc_lane._load_state = self.tc_lane.prep_state = self.tool_start_state
 
             if self.tool_start == "buffer":
                 raise error(
@@ -473,7 +473,7 @@ class AFCExtruder:
         with self.mutex:
             if state != self.tool_start_state:
                 if self.tc_unit_name and self.no_lanes:
-                    self.tc_lane.load_state = state
+                    self.tc_lane._load_state = state
                     self.tc_lane.prep_state = state
 
                     if (self.printer.state_message == READY and
