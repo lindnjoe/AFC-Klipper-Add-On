@@ -1,17 +1,23 @@
 # Armored Turtle Automated Filament Changer
 #
-# Copyright (C) 2024 Armored Turtle
+# Copyright (C) 2024-2026 Armored Turtle
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+from __future__ import annotations
+
 import traceback
 
-from configparser import Error as error
+from configparser import Error as config_error
+from typing import TYPE_CHECKING, Dict
 
 try: from extras.AFC_utils import ERROR_STR
-except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
+except: raise config_error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
 
 try: from extras.AFC_utils import add_filament_switch
-except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.format_exc()))
+except: raise config_error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.format_exc()))
+
+if TYPE_CHECKING:
+    from extras.AFC_lane import AFCLane
 
 class afc_hub:
     def __init__(self, config):
@@ -24,18 +30,19 @@ class afc_hub:
         self.name       = self.fullname.split()[-1]
 
         self.unit = None
-        self.lanes = {}
-        self.state = False
+        self.lanes: Dict[str, AFCLane] = {}
+        self._state: bool = False
 
-        self.switch_pin = config.get('switch_pin', None)
+        # switch_pin is optional for OpenAMS/virtual hub usage; default to virtual when omitted
+        self.switch_pin             = config.get('switch_pin', 'virtual')           # Pin hub sensor it connected to
         # HUB Cut variables
         # Next two variables are used in AFC
-        self.hub_clear_move_dis     = config.getfloat("hub_clear_move_dis", 25)     # How far to move filament so that it's not block the hub exit
+        self.hub_clear_move_dis     = config.getfloat("hub_clear_move_dis", 65)     # How far to move filament so that it's not block the hub exit
         self.afc_bowden_length      = config.getfloat("afc_bowden_length", 900)     # Length of the Bowden tube from the hub to the toolhead sensor in mm.
         self.td1_bowden_length      = config.getfloat("td1_bowden_length", self.afc_bowden_length-50)     # Length of the Bowden tube from the hub to a TD-1 device in mm.
         self.afc_unload_bowden_length= config.getfloat("afc_unload_bowden_length", self.afc_bowden_length) # Length to unload when retracting back from toolhead to hub in mm. Defaults to afc_bowden_length
         self.assisted_retract       = config.getboolean("assisted_retract", False)  # if True, retracts are assisted to prevent loose windings on the spool
-        self.move_dis               = config.getfloat("move_dis", 50)               # Distance to move the filament within the hub in mm.
+        self.move_dis               = config.getfloat("move_dis", 75)               # Distance to move the filament within the hub in mm.
         # Servo settings
         self.cut                    = config.getboolean("cut", False)               # Set True if Hub cutter installed (e.g. Snappy)
         self.cut_cmd                = config.get('cut_cmd', None)                   # Macro to use for cut.
@@ -53,25 +60,15 @@ class afc_hub:
         self.enable_sensors_in_gui  = config.getboolean("enable_sensors_in_gui",    self.afc.enable_sensors_in_gui) # Set to True to show hub sensor switches as filament sensor in mainsail/fluidd gui, overrides value set in AFC.cfg
         self.debounce_delay         = config.getfloat("debounce_delay",             self.afc.debounce_delay)
         self.enable_runout          = config.getboolean("enable_hub_runout",        self.afc.enable_hub_runout)
+        self.switch_pin = str(self.switch_pin).strip() or "virtual"
 
-        buttons = self.printer.load_object(config, "buttons")
-        self.fila = None
-        self.debounce_button = None
-
-        if self.switch_pin is not None:
-            self.state = False
+        if self.switch_pin.lower() != "virtual":
+            buttons = self.printer.load_object(config, "buttons")
+            self.fila, self.debounce_button = add_filament_switch(f"{self.name}_Hub", self.switch_pin,
+                                                                  self.printer, self.enable_sensors_in_gui,
+                                                                  self.handle_runout, self.enable_runout,
+                                                                  self.debounce_delay)
             buttons.register_buttons([self.switch_pin], self.switch_pin_callback)
-
-            self.fila, self.debounce_button = add_filament_switch(f"{self.name}_Hub",
-                                                                  self.switch_pin,
-                                                                  self.printer,
-                                                                  self.enable_sensors_in_gui,
-                                                                  self.handle_runout,
-                                                                  self.enable_runout,
-                                                                  self.debounce_delay
-                                                                )
-        else:
-            self.state = False
 
         # Adding self to AFC hubs
         self.afc.hubs[self.name]=self
@@ -108,8 +105,51 @@ class afc_hub:
 
         self.printer.send_event("afc_hub:register_macros", self)
 
+        if self.switch_pin.lower() == "virtual":
+            msg = "The following lanes need load sensors for virtual hub sensor to work correctly:"
+            report_error = False
+            for lane in self.lanes.values():
+                # OpenAMS lanes use OAMS hardware sensors instead of AFC load pins
+                unit_obj = getattr(lane, "unit_obj", None)
+                is_openams = (
+                    getattr(unit_obj, "type", None) == "OpenAMS"
+                    or hasattr(unit_obj, "oams_name")
+                )
+                if lane.load is None and not is_openams:
+                    report_error = True
+                    msg += f"\n{lane.fullname}"
+
+            if report_error:
+                raise config_error(msg)
+
+    @property
+    def state(self):
+        """
+        Returns current state of switch.
+
+        For classic virtual hubs (no real hub sensor), infer hub occupancy from lane load
+        sensors. For OpenAMS virtual hubs, use per-lane ``loaded_to_hub`` because OpenAMS
+        provides an actual hub sensor value and ``load_state`` only indicates spool/load
+        presence, not hub-path occupancy.
+        """
+        state = self._state
+        if self.switch_pin.lower() == "virtual":
+            lane_states = []
+            for lane in self.lanes.values():
+                unit_obj = getattr(lane, "unit_obj", None)
+                is_openams_lane = (
+                    getattr(unit_obj, "type", None) == "OpenAMS"
+                    or hasattr(unit_obj, "oams_name")
+                )
+                if is_openams_lane:
+                    lane_states.append(bool(getattr(lane, "loaded_to_hub", False)))
+                else:
+                    lane_states.append(bool(getattr(lane, "_load_state", False)))
+            state = any(lane_states)
+        return state
+
     def switch_pin_callback(self, eventtime, state):
-        self.state = state
+        self._state = state
 
     def hub_cut(self, cur_lane):
         servo_string = 'SET_SERVO SERVO={servo} ANGLE={{angle}}'.format(servo=self.cut_servo_name)

@@ -1,6 +1,6 @@
 # Armored Turtle Automated Filament Changer
 #
-# Copyright (C) 2024 Armored Turtle
+# Copyright (C) 2024-2026 Armored Turtle
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
@@ -232,7 +232,8 @@ class AFCTrigger:
         # Skip fault detection for lanes without an extruder stepper
         cur_lane = self.current_lane
         if cur_lane is not None and getattr(cur_lane, 'extruder_stepper', None) is None:
-            return eventtime + CHECK_RUNOUT_TIMEOUT        
+            return eventtime + CHECK_RUNOUT_TIMEOUT
+
         extruder_pos = self.get_extruder_pos()
         # Check for filament problems
         if (self.afc.function.is_printing(check_movement=True)
@@ -314,6 +315,7 @@ class AFCTrigger:
 
         cur_stepper = self.current_lane.extruder_stepper.stepper
         if cur_stepper is None: return
+
         self.current_lane.update_rotation_distance( multiplier )
         if multiplier > 1:
             self.last_state = ADVANCING_STATE_NAME
@@ -339,6 +341,7 @@ class AFCTrigger:
 
         cur_stepper = self.current_lane.extruder_stepper.stepper
         if cur_stepper is None: return
+
         self.current_lane.update_rotation_distance( 1 )
         self.logger.info(
             "Rotation distance reset for {} : {:.4f}".format(
@@ -626,7 +629,7 @@ class AFCTrigger:
                     stepper = self.current_lane.extruder_stepper.stepper
                     self.response['rotation_distance'] = stepper.get_rotation_distance()[0]
                 else:
-                    self.response['rotation_distance'] = None                
+                    self.response['rotation_distance'] = None
                 self.response['active_lane'] = self.current_lane.name
         else:
             self.response['rotation_distance'] = None
