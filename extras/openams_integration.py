@@ -1,4 +1,4 @@
-# Armored Turtle Automated Filament Changer  
+# Armored Turtle Automated Filament Changer
 #
 # Copyright (C) 2024 Armored Turtle
 #
@@ -66,10 +66,10 @@ def normalize_oams_name(name: Optional[str], *, default: str = "default") -> str
 
 class AMSEventBus:
     """Lightweight event system for lane state changes.
-    
+
     This eliminates polling overhead by publishing events when state changes occur.
     Subscribers register callbacks for specific event types.
-    
+
     Event Types:
         - spool_loaded: When OAMS loads a spool
         - spool_unloaded: When OAMS unloads a spool
@@ -79,7 +79,7 @@ class AMSEventBus:
         - lane_hub_unloaded: When filament leaves the hub
         - fps_state_changed: When FPS sensor state changes
     """
-    
+
     _instance: Optional['AMSEventBus'] = None
     _lock = threading.RLock()
     _MAX_HISTORY = 500
@@ -99,10 +99,10 @@ class AMSEventBus:
             if logger is not None and cls._instance.logger is None:
                 cls._instance.logger = logger
             return cls._instance
-    
+
     def subscribe(self, event_type: str, callback: Callable, *, priority: int = 0) -> None:
         """Register a callback for a specific event type.
-        
+
         Args:
             event_type: Type of event to subscribe to
             callback: Function to call when event occurs (receives **kwargs)
@@ -111,7 +111,7 @@ class AMSEventBus:
         with self._lock:
             if event_type not in self._subscribers:
                 self._subscribers[event_type] = []
-            
+
             # Insert based on priority (higher priority first)
             subscribers = self._subscribers[event_type]
             insert_idx = 0
@@ -120,20 +120,20 @@ class AMSEventBus:
                     insert_idx = i
                     break
                 insert_idx = i + 1
-            
+
             subscribers.insert(insert_idx, (callback, priority))
             if self.logger is not None:
                 self.logger.debug(f"Subscribed to '{event_type}' (priority={priority}, total={len(subscribers)})")
-    
+
     def unsubscribe(self, event_type: str, callback: Callable) -> None:
         """Unregister a callback from a specific event type."""
         with self._lock:
             if event_type in self._subscribers:
                 self._subscribers[event_type] = [
-                    (cb, pri) for cb, pri in self._subscribers[event_type] 
+                    (cb, pri) for cb, pri in self._subscribers[event_type]
                     if cb != callback
                 ]
-    
+
     def publish(self, event_type: str, **kwargs) -> int:
         """Publish an event to all subscribers.
 
@@ -158,10 +158,10 @@ class AMSEventBus:
                     self._event_history = self._event_history[-self._MAX_HISTORY:]
 
             subscribers = list(self._subscribers.get(event_type, []))
-        
+
         if not subscribers:
             return 0
-        
+
         success_count = 0
         for callback, priority in subscribers:
             try:
@@ -170,21 +170,21 @@ class AMSEventBus:
             except Exception as e:
                 if self.logger is not None:
                     self.logger.error(f"Event handler failed for '{event_type}' (priority={priority}): {e}")
-        
+
         return success_count
-    
-    def get_history(self, event_type: Optional[str] = None, 
+
+    def get_history(self, event_type: Optional[str] = None,
                    since: Optional[float] = None) -> List[Tuple[str, float, Dict[str, Any]]]:
         """Get event history, optionally filtered by type and time."""
         with self._lock:
             history = list(self._event_history)
-        
+
         if event_type:
             history = [(et, time, data) for et, time, data in history if et == event_type]
-        
+
         if since is not None:
             history = [(et, time, data) for et, time, data in history if time >= since]
-        
+
         return history
 
 
@@ -203,14 +203,14 @@ class LaneInfo:
     unit_name: str          # "AMS_1", "AMS_2", etc.
     spool_index: int        # 0-3 (zero-indexed position in OAMS unit)
     extruder: str           # "extruder4", "extruder5", etc.
-    
+
     # Optional fields
     fps_name: Optional[str] = None          # "fps1", "fps2", etc.
     hub_name: Optional[str] = None          # "Hub_1", "Hub_2", etc.
     led_index: Optional[str] = None         # LED indicator reference
     custom_load_cmd: Optional[str] = None   # Custom load macro
     custom_unload_cmd: Optional[str] = None # Custom unload macro
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
@@ -228,17 +228,17 @@ class LaneInfo:
 
 class LaneRegistry:
     """Single source of truth for lane identity across OpenAMS and AFC.
-    
+
     This registry eliminates multiple redundant lookups by providing O(1) access
     to lane information via any identifier (lane name, spool index, etc.).
-    
+
     All lane tracking should go through this registry instead of maintaining
     separate mappings in multiple files.
     """
-    
+
     _instances: Dict[int, 'LaneRegistry'] = {}
     _lock = threading.RLock()
-    
+
     def __init__(self, printer, logger=None):
         self.printer = printer
         self.logger = logger
@@ -265,7 +265,7 @@ class LaneRegistry:
             elif logger is not None:
                 cls._instances[key].logger = logger
             return cls._instances[key]
-    
+
     def register_lane(self,
                      lane_name: str,
                      unit_name: str,
@@ -314,7 +314,7 @@ class LaneRegistry:
                 custom_load_cmd=custom_load_cmd,
                 custom_unload_cmd=custom_unload_cmd,
             )
-            
+
             # Add to storage
             self._lanes.append(info)
 
@@ -328,9 +328,9 @@ class LaneRegistry:
             self._by_extruder[extruder].append(info)
 
             self.logger.info(f"Registered lane: {lane_name} - {unit_name}[{spool_index}] (extruder={extruder}, fps={fps_name})")
-            
+
             return info
-    
+
     def _unregister_lane(self, info: LaneInfo) -> None:
         """Internal: Remove a lane from all indexes."""
         if info in self._lanes:
@@ -346,12 +346,12 @@ class LaneRegistry:
             # Remove empty list to prevent memory leak
             if not extruder_lanes:
                 self._by_extruder.pop(info.extruder, None)
-    
+
     def get_by_lane(self, lane_name: str) -> Optional[LaneInfo]:
         """Get lane info by AFC lane name (e.g., "lane4")."""
         with self._lock:
             return self._by_lane_name.get(lane_name)
-    
+
     def get_by_spool(self, unit_name: str, spool_index: int) -> Optional[LaneInfo]:
         """Get lane info by OAMS unit and spool index (e.g., "AMS_1", 0)."""
         with self._lock:
@@ -361,27 +361,27 @@ class LaneRegistry:
         """Resolve a lane by name (case-insensitive, O(1) lookup)."""
         with self._lock:
             return self._by_lane_name_lower.get(token.lower())
-    
+
     def get_by_extruder(self, extruder: str) -> List[LaneInfo]:
         """Get all lanes for an extruder (e.g., "extruder4")."""
         with self._lock:
             return list(self._by_extruder.get(extruder, []))
-    
+
     def get_all_lanes(self) -> List[LaneInfo]:
         """Get all registered lanes."""
         with self._lock:
             return list(self._lanes)
-    
+
     def resolve_lane_name(self, unit_name: str, spool_index: int) -> Optional[str]:
         """Helper: Get lane name from unit and spool index."""
         info = self.get_by_spool(unit_name, spool_index)
         return info.lane_name if info else None
-    
+
     def resolve_spool_index(self, lane_name: str) -> Optional[int]:
         """Helper: Get spool index from lane name."""
         info = self.get_by_lane(lane_name)
         return info.spool_index if info else None
-    
+
     def resolve_extruder(self, lane_name: str) -> Optional[str]:
         """Helper: Get extruder from lane name."""
         info = self.get_by_lane(lane_name)
@@ -401,7 +401,7 @@ class AMSHardwareService:
     ``klipper_openams`` and exposes high level helpers so AFC can interact with
     the same hardware instance without reimplementing any low level MCU
     messaging.
-    
+
     Uses LaneRegistry for all lane lookups.
     """
 
@@ -666,7 +666,7 @@ class AMSHardwareService:
         with self._lock:
             self._status = dict(status)
             callbacks = list(self._status_callbacks)
-        
+
         # Only call callbacks if there are any registered
         if callbacks:
             status_copy = dict(status)
@@ -705,7 +705,7 @@ class AMSHardwareService:
         enabling event-driven updates instead of polling.
         """
         key = f"{unit_name}:{lane_name}"
-        
+
         normalized_index: Optional[int]
         if spool_index is not None:
             try:
@@ -734,7 +734,7 @@ class AMSHardwareService:
                 self._lane_snapshots[key]["spool_index"] = old_snapshot["spool_index"]
             if tool_state is not None:
                 self._lane_snapshots[key]["tool_state"] = bool(tool_state)
-            
+
         # Determine the best spool index to report with events
         event_spool_index = normalized_index
         if event_spool_index is None:
@@ -770,7 +770,7 @@ class AMSHardwareService:
                     spool_index=spool_index,
                     eventtime=eventtime
                 )
-        
+
         if tool_state is not None:
             old_tool_state = old_snapshot.get("tool_state")
             if old_tool_state is not None and old_tool_state != tool_state:
@@ -792,7 +792,7 @@ class AMSHardwareService:
 
     def resolve_lane_for_spool(self, unit_name: str, spool_index: Optional[int]) -> Optional[str]:
         """Map a spool index to its corresponding lane name.
-        
+
         Uses LaneRegistry instead of local mapping.
         """
         if spool_index is None:
@@ -801,7 +801,7 @@ class AMSHardwareService:
             normalized = int(spool_index)
         except (TypeError, ValueError):
             return None
-        
+
         # Use registry
         return self.registry.resolve_lane_name(unit_name, normalized)
 
@@ -868,7 +868,7 @@ class AMSHardwareService:
         """
         controller = self._require_controller()
         controller.oams_load_spool_cmd.send([spool_index])
-        
+
         # Publish event
         eventtime = self._monotonic()
         self.event_bus.publish(
@@ -887,7 +887,7 @@ class AMSHardwareService:
         controller = self._require_controller()
         current_spool = getattr(controller, "current_spool", None)
         controller.oams_unload_spool_cmd.send([])
-        
+
         # Publish event
         eventtime = self._monotonic()
         self.event_bus.publish(
