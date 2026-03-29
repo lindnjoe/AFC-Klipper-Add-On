@@ -339,9 +339,9 @@ class AFCSpool:
         cur_lane.material = ''
         cur_lane.color = ''
         cur_lane.weight = 0
-        cur_lane.auto_switch_triggered = False
         cur_lane.extruder_temp = None
         cur_lane.bed_temp = None
+        cur_lane.auto_switch_triggered = False
         cur_lane.clear_lane_data()
 
     def set_spoolID(self, cur_lane, SpoolID, save_vars=True):

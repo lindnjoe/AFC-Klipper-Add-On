@@ -29,12 +29,11 @@ except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".f
 try: from extras.AFC_unit import afcUnit
 except: raise error(ERROR_STR.format(import_lib="AFC_unit", trace=traceback.format_exc()))
 
-try: from extras.AFC import State
-except: raise error(ERROR_STR.format(import_lib="AFC", trace=traceback.format_exc()))
-
 try: from extras.AFC_lane import AFCMoveWarning, SpeedMode, AssistActive
 except: raise error(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.format_exc()))
 
+try: from extras.AFC import State
+except: raise error(ERROR_STR.format(import_lib="AFC", trace=traceback.format_exc()))
 
 class AfcToolchanger(afcUnit):
     def __init__(self, config: ConfigWrapper) -> None:
@@ -66,14 +65,6 @@ class AfcToolchanger(afcUnit):
         self.logger.raw( '{lane_name} tool cmd: {tcmd:3} {msg}'.format(lane_name=cur_lane.name, tcmd=cur_lane.map, msg=msg))
         cur_lane.set_afc_prep_done()
         return True
-
-    def _increase_unselect(self):
-        """
-        Helper function to lookup current selected extruder and increase tool unselected count
-        """
-        current_extruder = self.afc.function.get_current_extruder_obj()
-        if current_extruder:
-            current_extruder.estats.tool_unselected.increase_count()
 
     def move_to_hub(self, lane: AFCLane, dist: float,
                     dir: MoveDirection, use_homing: bool=True,
@@ -107,6 +98,14 @@ class AfcToolchanger(afcUnit):
         return: True, 0, AFCMoveWarning.NONE
         """
         return True, 0, AFCMoveWarning.NONE
+
+    def _increase_unselect(self):
+        """
+        Helper function to lookup current selected extruder and increase tool unselected count
+        """
+        current_extruder = self.afc.function.get_current_extruder_obj()
+        if current_extruder:
+            current_extruder.estats.tool_unselected.increase_count()
 
     cmd_AFC_SELECT_TOOL_help = "Select specified tool"
     cmd_AFC_SELECT_TOOL_options = {

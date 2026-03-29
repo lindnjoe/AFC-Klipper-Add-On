@@ -33,9 +33,9 @@ class afc_hub:
         self.lanes: Dict[str, AFCLane] = {}
         self._state: bool = False
 
-        self.switch_pin = config.get('switch_pin', None)
         # HUB Cut variables
         # Next two variables are used in AFC
+        self.switch_pin             = config.get('switch_pin', None)                 # Pin hub sensor it connected to
         self.hub_clear_move_dis     = config.getfloat("hub_clear_move_dis", 65)     # How far to move filament so that it's not block the hub exit
         self.afc_bowden_length      = config.getfloat("afc_bowden_length", 900)     # Length of the Bowden tube from the hub to the toolhead sensor in mm.
         self.td1_bowden_length      = config.getfloat("td1_bowden_length", self.afc_bowden_length-50)     # Length of the Bowden tube from the hub to a TD-1 device in mm.
@@ -107,7 +107,8 @@ class afc_hub:
             msg = "The following lanes need load sensors for virtual hub sensor to work correctly:"
             report_error = False
             for lane in self.lanes.values():
-                if lane.load is None:
+                if lane.load is None and lane.prep is not None:
+                    # Lane has prep sensor but no load sensor - likely a config error
                     report_error = True
                     msg += f"\n{lane.fullname}"
 
@@ -118,11 +119,17 @@ class afc_hub:
     def state(self):
         """
         Returns current state of switch. If using virtual sensor returns True if any lanes load
-        sensor is triggered.
+        sensor is triggered.  For lanes without a physical load sensor (e.g. OpenAMS, ACE),
+        the unit drives the hub state via switch_pin_callback when filament is
+        actually in the hub path (not merely staged nearby).
         """
         state = self._state
         if self.switch_pin.lower() == "virtual":
-            state = any(lane.raw_load_state for lane in self.lanes.values())
+            state = self._state or any(
+                lane.raw_load_state
+                for lane in self.lanes.values()
+                if lane.load is not None
+            )
         return state
 
     def switch_pin_callback(self, eventtime, state):

@@ -110,6 +110,15 @@ class AFCTrigger:
         """
         return self.name
 
+
+    def get_fps_value(self):
+        """Get current FPS pressure value. Always None for hardware buffers.
+
+        Provides interface compatibility with AFC_FPS so callers don't need
+        to check buffer type before calling.
+        """
+        return None
+
     def _handle_ready(self):
         """
         Handle Klipper ready event, initialize toolhead and setup fault detection if enabled.
@@ -229,6 +238,20 @@ class AFCTrigger:
         :param eventtime: Current event time from reactor
         :return float: Next scheduled event time (eventtime + CHECK_RUNOUT_TIMEOUT)
         """
+        # Skip fault detection for lanes without an extruder stepper
+        cur_lane = self.current_lane
+        if cur_lane is not None and getattr(cur_lane, 'extruder_stepper', None) is None:
+            return eventtime + CHECK_RUNOUT_TIMEOUT
+
+        # Skip fault detection if the active extruder is not this buffer's extruder.
+        # During tool changes the active extruder switches, and movement on the new
+        # extruder would be misinterpreted as a fault on this buffer's lane.
+        if cur_lane is not None:
+            active_extruder = self.afc.toolhead.get_extruder()
+            lane_extruder_name = getattr(cur_lane, 'extruder_name', None)
+            if lane_extruder_name and hasattr(active_extruder, 'name') and active_extruder.name != lane_extruder_name:
+                return eventtime + CHECK_RUNOUT_TIMEOUT
+
         extruder_pos = self.get_extruder_pos()
         # Check for filament problems
         if (self.afc.function.is_printing(check_movement=True)
@@ -616,7 +639,9 @@ class AFCTrigger:
         # Add current rotation distance if buffer is enabled and lane is loaded
         if self.enable:
             if (self.current_lane is not None
-                and self.current_lane.name in self.lanes):
+                and self.current_lane.name in self.lanes
+                and self.current_lane.extruder_stepper is not None
+                and self.current_lane.extruder_stepper.stepper is not None):
                 stepper = self.current_lane.extruder_stepper.stepper
                 self.response['rotation_distance'] = stepper.get_rotation_distance()[0]
                 self.response['active_lane'] = self.current_lane.name

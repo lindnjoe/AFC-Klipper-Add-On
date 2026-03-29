@@ -652,6 +652,30 @@ class afcUnit:
     def calibration_lane_message(self) -> str:
         return ""
 
+    def load_sequence(self, cur_lane, cur_hub, cur_extruder):
+        """Override in subclass for custom load logic. Return non-None to skip default AFC load."""
+        return None
+
+    def unload_sequence(self, cur_lane, cur_hub, cur_extruder):
+        """Override in subclass for custom unload logic. Return non-None to skip default AFC unload."""
+        return None
+
+    def lane_unload(self, cur_lane):
+        """Override in subclass for custom lane unload. Return non-None to skip default lane unload."""
+        return None
+
+    def prep_capture_td1(self, cur_lane):
+        """Override in subclass for custom TD-1 prep capture. Return non-None to skip default behavior."""
+        return None
+
+    def capture_td1_data(self, cur_lane):
+        """Override in subclass for custom TD-1 data capture. Return non-None to skip default behavior."""
+        return None
+
+    def get_lane_reset_command(self, lane, dis):
+        """Override in subclass for custom lane reset command. Return None to use default."""
+        return None
+
     def get_calibrated_lanes(self) -> Optional[list[str]]:
         """
         Helper method to return lanes in a unit that have already been calibrated and require
@@ -753,10 +777,9 @@ class afcUnit:
         self._print_function_not_defined(self.eject_lane.__name__)
 
     def move_to_hub(self, lane: AFCLane, dist: float,
-                    dir: MoveDirection, use_homing: bool=True,
-                    speed_mode: SpeedMode=SpeedMode.HUB,
-                    assist_active: AssistActive=AssistActive.DYNAMIC
-                ) -> tuple[bool, float|int, AFCMoveWarning]:
+                    dir:MoveDirection, use_homing=True,
+                    speed_mode=SpeedMode.HUB,
+                    assist_active=AssistActive.DYNAMIC) -> tuple[bool, float|int, AFCMoveWarning]:
         """
         Helper method to move filament to hub sensor, calls lanes move_to method with HUB as trigger
         point when homing is enabled.
@@ -784,9 +807,8 @@ class afcUnit:
                             endstop=lane.hub_endstop_name, use_homing=use_homing)
 
     def move_to_load(self, lane: AFCLane, dist: float,
-                     dir: MoveDirection, use_homing: bool=True,
-                     speed_mode: SpeedMode=SpeedMode.LONG
-                ) -> tuple[bool, float|int, AFCMoveWarning]:
+                     dir: MoveDirection, use_homing=True,
+                     speed_mode:SpeedMode=SpeedMode.LONG) -> tuple[bool, float|int, AFCMoveWarning]:
         """
         Helper method to move filament to load sensor, calls lane's move_to method with the load
         sensor endpoint (lane.load_es) as trigger point when homing is enabled.
@@ -815,8 +837,7 @@ class afcUnit:
                             assist_active=AssistActive.DYNAMIC, use_homing=use_homing)
 
     def load_then_home(self, lane: AFCLane|AFCExtruderStepper, distance: float,
-                       assist_active: AssistActive, endstop: AFCHomingPoints
-                    ) -> tuple[bool, float|int, AFCMoveWarning]:
+                       assist_active: AssistActive, endstop: AFCHomingPoints) -> tuple[bool, float|int, AFCMoveWarning]:
         """
         Helper method to move filament to toolhead. If load_then_home boolean is set, AFC will do
         a normal move without homing enabled for a distance of: distance - load_undershoot.
@@ -862,6 +883,9 @@ class afcUnit:
         When homing is enabled and enable_buffer_tool_check is enabled, this method will try to
         move the filament so that both advance and trail sensor in buffer are hit. If this is
         successful, then it's deemed that filament is actually loaded to the toolhead.
+
+        Works with both turtleneck buffers (hardware advance switch) and FPS buffers
+        (software endstop that triggers at high_point / 0.9).
 
         :param lane: Lane to check if filament is loaded to toolhead.
         :return: Returns true if check is successful.

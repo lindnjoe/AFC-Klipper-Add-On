@@ -440,7 +440,7 @@ class afcFunction:
             error_string = "Error: Cannot find [{}] in config, make sure led_index in config is correct".format(afc_object)
         return error_string, led
 
-    def _get_led_indexes(self, index_values: str) -> list[int]:
+    def _get_led_indexes(self, index_values: str) -> list[str]:
         """
         Helper function for creating a list for index values that have dashes and commas
         so the led's can be set correctly.
@@ -459,7 +459,7 @@ class afcFunction:
                 led_indexes += range(low, high+1)
         return led_indexes
 
-    def parse_led_groups(self, idx: str) -> list[tuple[str, str]]:
+    def parse_led_groups(self, idx: str) -> list[str, str]:
         """
         Parse an LED index string into groups of (led_name, index_string).
 
@@ -631,6 +631,7 @@ class afcFunction:
 
         :param eventtime: Current eventtime to calculate the position from, if time is not passed in uses current eventtime
         :param past_extruder_position: Previous extruder position to compare current position against.
+        :param extruder: Extruder object to get position from, if None uses current toolhead extruder
         :return float: Returns current extruder position if its greater than previous position, else returns previous position
         """
         if eventtime is None:
@@ -972,7 +973,11 @@ class afcFunction:
         text = f'{title} for {cali}. '
         if reset_lane:
             text += 'First: reset lane, Second: review messages and take necessary action and re-run calibration.'
-            buttons.append(("Reset lane", "AFC_LANE_RESET LANE={} DISTANCE={}".format(cali, dis), "primary"))
+            lane = self.afc.lanes.get(str(cali)) if cali is not None else None
+            if lane:
+                buttons.append(("Reset lane", self._lane_reset_command(lane, dis), "primary"))
+            else:
+                buttons.append(("Reset lane", "AFC_LANE_RESET LANE={} DISTANCE={}".format(cali, dis), "primary"))
 
         if fail_message:
             text += f"\nFail message: {fail_message}"
@@ -1449,6 +1454,15 @@ class afcFunction:
         fail_message    = gcmd.get("MSG", "")
         self._afc_cali_fail(cali, dis, reset_lane, title, fail_message, gcmd)
 
+    def _lane_reset_command(self, lane, dis):
+        """Return the GCode command to reset *lane*, using unit override if available."""
+        custom_command = lane.unit_obj.get_lane_reset_command(lane, dis)
+        if custom_command is not None:
+            return custom_command
+        if dis is not None:
+            return "AFC_LANE_RESET LANE={} DISTANCE={}".format(lane.name, dis)
+        return "AFC_LANE_RESET LANE={}".format(lane.name)
+
     cmd_AFC_RESET_help = 'Opens prompt to select lane to reset.'
     cmd_AFC_RESET_options = {"DISTANCE": {"default": "30", "type": "float"}}
     def cmd_AFC_RESET(self, gcmd):
@@ -1482,12 +1496,8 @@ class afcFunction:
         # Create buttons for each loaded lane
         for index, LANE in enumerate(self.afc.lanes.values()):
             if LANE.raw_load_state:
+                button_command = self._lane_reset_command(LANE, dis)
                 button_label = "{}".format(LANE.name)
-                if dis is not None:
-                    button_command = "AFC_LANE_RESET LANE={} DISTANCE={}".format(LANE.name, dis)
-                else:
-                    button_command = "AFC_LANE_RESET LANE={}".format(LANE.name)
-
                 button_style = "primary" if index % 2 == 0 else "secondary"
                 buttons.append((button_label, button_command, button_style))
 
@@ -1548,6 +1558,17 @@ class afcFunction:
                 return
 
         cur_lane: Union[AFCLane, AFCExtruderStepper] = self.afc.lanes[lane]
+
+        # Allow unit to provide custom lane reset command
+        custom_reset_command = cur_lane.unit_obj.get_lane_reset_command(cur_lane, long_dis)
+        if custom_reset_command is not None:
+            prompt.p_end()
+            self.afc.gcode.respond_info(
+                f"{lane} uses custom lane reset command: {custom_reset_command}"
+            )
+            self.afc.gcode.run_script_from_command(custom_reset_command)
+            return
+
         CUR_HUB: afc_hub = cur_lane.hub_obj
         short_move = cur_lane.short_move_dis * 2
 

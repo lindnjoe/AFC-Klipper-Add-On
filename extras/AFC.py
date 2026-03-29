@@ -155,7 +155,6 @@ class afc:
         # Auto spool switch settings
         self.auto_spool_switch: bool              = config.getboolean("auto_spool_switch", False)                    # Trigger spool switch based on remaining filament weight
         self.auto_spool_switch_threshold: float   = config.getfloat("auto_spool_switch_threshold", 25.0, minval=0.)  # Weight threshold in grams
-
         #LED SETTINGS
         # All variables use: (R,G,B,W) 0 = off, 1 = full brightness.
         self.ind_lights = None
@@ -235,14 +234,14 @@ class afc:
         self.full_weight            = config.getfloat("full_weight",1000, minval=1) # full weight of filament spool (not counting spool itself)
         self.enable_sensors_in_gui  = config.getboolean("enable_sensors_in_gui", False) # Set to True to show all sensor switches as filament sensors in mainsail/fluidd gui
         self.ignore_spoolman_material_temps = config.getboolean("ignore_spoolman_material_temps", False)  # When True, AFC will ignore temperatures set in Spoolman and use default_material_temps instead.
-        self.led_use_filament_color:bool = config.getboolean('led_use_filament_color', False)  # When True, uses filament color from color field for lane LEDs instead of configured LED colors
         self.restore_extruder_temp_on_load_or_unload = config.getboolean(
             "restore_extruder_temp_on_load_or_unload", False
         )  # Restore extruder target temp after tool load/unload when not printing
-        self.lower_extruder_temp_on_change = config.getboolean('lower_extruder_temp_on_change', True)  # When False, AFC will not lower extruder temp during filament change if already above target - 5
         self.toolchange_temp_drop: float = config.getfloat(
             "toolchange_temp_drop", 0
         )  # Degrees to drop the old extruder's temperature (no wait) after a successful toolchange when the extruder changes.
+        self.lower_extruder_temp_on_change = config.getboolean('lower_extruder_temp_on_change', True)  # When False, AFC will not lower extruder temp during filament change if already above target - 5
+        self.led_use_filament_color:bool = config.getboolean('led_use_filament_color', False)  # When True, uses filament color from color field for lane LEDs instead of configured LED colors
         self.load_to_hub            = config.getboolean("load_to_hub", True)        # Fast loads filament to hub when inserted, set to False to disable. This is a global setting and can be overridden at AFC_stepper
         self.disable_homing_check   = config.getboolean("disable_homing_check", False)# Disables homing check when doing toolchanges. Only use this if you are using a toolchanger and don't need to home to unload toolheads
         self.assisted_unload        = config.getboolean("assisted_unload", True)    # If True, the unload retract is assisted to prevent loose windings, especially on full spools. This can prevent loops from slipping off the spool
@@ -516,8 +515,8 @@ class afc:
             and self.moonraker is not None
             and (current_time - self._last_td1_query) > 30 ):
             if not self.function.is_printing(check_movement=True):
-                self._last_td1_query = current_time
                 present = self.moonraker.check_for_td1()[1]
+                self._last_td1_query = current_time
                 self._td1_present = present
 
         return present
@@ -665,9 +664,9 @@ class afc:
         """
         Helper function to restore toolhead target temperature after load/unload when not printing AND restore_extruder_temp_on_load_or_unload is True
 
-        :param temp_state: Dictionary containing extruder object and target_temp, or None
         :param async_restore: Set to True to restore while printing, this is useful for restoring
             other toolhead hotends on toolchangers.
+        :param temp_state: Dictionary containing extruder object and target_temp, or None
         """
         if not self.restore_extruder_temp_on_load_or_unload:
             return
@@ -1190,6 +1189,11 @@ class afc:
         self.LANE_UNLOAD( cur_lane )
 
     def LANE_UNLOAD(self, cur_lane: AFCLane):
+        # Allow unit to provide custom lane unload sequence
+        custom_result = cur_lane.unit_obj.lane_unload(cur_lane)
+        if custom_result is not None:
+            return custom_result
+
         # TODO: update this to unload from toolhead and move all the way back to load
         # when homing is enabled
 
@@ -1424,7 +1428,11 @@ class afc:
         :param cur_hub: The hub object associated with the lane.
         :param cur_extruder: The extruder object associated with the lane.
         """
-        # Placeholder for custom load sequence
+        # Allow unit to provide custom load sequence
+        custom_result = cur_lane.unit_obj.load_sequence(cur_lane, cur_hub, cur_extruder)
+        if custom_result is not None:
+            return custom_result
+
         if cur_lane.custom_load_cmd:
             self.logger.info("Running custom load command for lane {}".format(cur_lane.name))
             self.gcode.run_script_from_command(cur_lane.custom_load_cmd)
@@ -1762,6 +1770,11 @@ class afc:
         :param cur_hub: The hub object associated with the lane.
         :param cur_extruder: The extruder object associated with the lane.
         """
+        # Allow unit to provide custom unload sequence
+        custom_result = cur_lane.unit_obj.unload_sequence(cur_lane, cur_hub, cur_extruder)
+        if custom_result is not None:
+            return custom_result
+
         if cur_lane.custom_unload_cmd:
             self.logger.info("Running custom unload command for lane {}".format(cur_lane.name))
             cur_lane.status = AFCLaneState.TOOL_UNLOADING
@@ -2041,7 +2054,6 @@ class afc:
         current lane and loading the new lane.
 
         Optionally setting PURGE_LENGTH parameter to pass a value into poop macro.
-
         Optionally setting NEW_EXTRUDER_TEMP to set and wait for that temperature on the new extruder before
         performing the tool change.
 
@@ -2113,6 +2125,7 @@ class afc:
 
         self.next_lane_load = cur_lane.name
         next_extruder = cur_lane.extruder_obj.name
+
         infinite_runout: bool = cur_lane.status == AFCLaneState.INFINITE_RUNOUT
         adjusting_temperature: bool = new_extruder_temp is not None or \
             (infinite_runout and self.function.get_current_extruder() != next_extruder)

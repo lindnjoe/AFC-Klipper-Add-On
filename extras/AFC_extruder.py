@@ -47,6 +47,9 @@ except: raise error(ERROR_STR.format(import_lib="AFC", trace=traceback.format_ex
 try: from extras.AFC_stats import AFCStats_var
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
+try: from extras.AFC_stats import AFCStats_var
+except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
+
 LARGE_TIME_OFFSET = 99999.9
 
 class AFCExtruderStats:
@@ -214,6 +217,7 @@ class AFCExtruder:
 
         self.toolhead_extruder: PrinterExtruder
         self.fullname                   = config.get_name()
+        self.mutex                      = self.reactor.mutex()
 
         self.name: str                  = self.fullname.split(' ')[-1]
         self.tool_start                 = config.get('pin_tool_start', None)                                            # Pin for sensor before(pre) extruder gears
@@ -234,10 +238,10 @@ class AFCExtruder:
         self.toolhead_status_index      = config.get('status_led_idx', None)
         self.toolhead_nozzle_index      = config.get('nozzle_led_idx', None)
         self.toolhead_led_obj           = None
+        self._captured_toolhead_temp: Optional[dict] = None
         self.set_status_color_fn        = None
         self.check_transmit_status_fn   = None
         self.status_led_count:int       = 0
-        self._captured_toolhead_temp: Optional[dict] = None
 
         if self.toolhead_status_index:
             self.toolhead_status_index  = self.afc.function._get_led_indexes(self.toolhead_status_index)
@@ -365,6 +369,7 @@ class AFCExtruder:
                     f"buffer is not valid config for pin_tool_start when using {self.name} as a standalone extruder"
                 )
 
+
     def handle_connect(self):
         """
         Handle the connection event.
@@ -467,25 +472,26 @@ class AFCExtruder:
         :param eventtime: Event time from the button press
         :param state: Boolean indicating sensor state (True = filament present, False = runout)
         """
-        if state != self.tool_start_state:
-            if self.tc_unit_name and self.is_standalone():
-                self.tc_lane._load_state = state
-                self.tc_lane.prep_state = state
+        with self.mutex:
+            if state != self.tool_start_state:
+                if self.tc_unit_name and self.is_standalone():
+                    self.tc_lane._load_state = state
+                    self.tc_lane.prep_state = state
 
-                if (self.printer.state_message == READY and
-                    self.tc_lane._afc_prep_done):
-                    if state:
-                        if not self.load_active:
-                            self.load_unload_sequence(self.tool_stn)
-                    else:
-                        self.tc_lane.set_tool_unloaded()
-                        self.tc_lane.set_unloaded()
+                    if (self.printer.state_message == READY and
+                        self.tc_lane._afc_prep_done):
+                        if state:
+                            if not self.load_active:
+                                self.load_unload_sequence(self.tool_stn)
+                        else:
+                            self.tc_lane.set_tool_unloaded()
+                            self.tc_lane.set_unloaded()
 
-                    self.afc.save_vars()
-        else:
-            self.logger.info("Not loading State matches tool_start_state")
+                        self.afc.save_vars()
+            else:
+                self.logger.info("Not loading State matches tool_start_state")
 
-        self.tool_start_state = state
+            self.tool_start_state = state
 
 
     def buffer_trailing_callback(self, eventtime, state):

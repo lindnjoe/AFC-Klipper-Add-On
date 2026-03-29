@@ -19,7 +19,7 @@ except:
     raise_string = "Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc())
     raise error(raise_string)
 
-try: from extras.AFC_lane import AFCLane, AFCHomingPoints, VALID_DIRECT_HUB
+try: from extras.AFC_lane import AFCLane, AFCHomingPoints
 except: raise error(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.format_exc()))
 
 if TYPE_CHECKING:
@@ -433,7 +433,8 @@ class AFCExtruderStepper(AFCLane):
         self._qes = qes
 
         # Built-ins from AFCLane config
-        self._add_endstop('load', self.load, 'load')
+        if not self._reuse_lane_endstop('load', AFCHomingPoints.LOAD):
+            self._add_endstop('load', self.load, 'load')
         # Extra raw pins declared in config
         for raw_pin in list(self._extra_homing_pins):
             r = raw_pin.strip()
@@ -452,7 +453,7 @@ class AFCExtruderStepper(AFCLane):
         hub_pin = self.hub_endstop
         if hub_pin is None:
             hub_name = getattr(self, 'hub', None)
-            if not hub_name or hub_name in VALID_DIRECT_HUB:
+            if not hub_name or 'direct' in hub_name:
                 hub_name = self._inherit_from_unit('hub')
             hub_pin = self._get_section_value('AFC_hub', hub_name, 'switch_pin')
 
@@ -465,20 +466,53 @@ class AFCExtruderStepper(AFCLane):
         buffer_name = getattr(self, 'buffer_name', None)
         if not buffer_name:
             buffer_name = self._get_section_value('AFC_extruder', extruder_name, 'buffer') or self._inherit_from_unit('buffer')
-        buffer_adv_pin   = self._get_section_value('AFC_buffer', buffer_name, 'advance_pin')
-        buffer_trail_pin = self._get_section_value('AFC_buffer', buffer_name, 'trailing_pin')
+        buffer_adv_pin   = self._get_buffer_value(buffer_name, 'advance_pin')
+        buffer_trail_pin = self._get_buffer_value(buffer_name, 'trailing_pin')
 
         # Check to verify that hub is not a virtual sensor
         if (hub_pin
             and hub_pin.lower() != "virtual"):
-            self._add_endstop('hub', hub_pin, 'hub')
-        if tool_start_pin != 'buffer':
+            if not self._reuse_lane_endstop('hub', AFCHomingPoints.HUB):
+                self._add_endstop('hub', hub_pin, 'hub')
+        if tool_start_pin == 'buffer':
+            # When tool_start uses the buffer (hardware or FPS), reuse the
+            # endstop already created by AFCLane.__init__ to avoid duplicate
+            # pin registration or missing FPS software endstop.
+            if not self._reuse_lane_endstop('tool_start', AFCHomingPoints.BUFFER):
+                self._add_endstop('tool_start', buffer_adv_pin, 'tool_start')
+        elif tool_start_pin:
             self._add_endstop('tool_start', tool_start_pin, 'tool_start')
-        else:
-            self._add_endstop('tool_start', buffer_adv_pin, 'tool_start')
         self._add_endstop('tool_end', tool_end_pin, 'tool_end')
-        self._add_endstop('buffer_advance', buffer_adv_pin, 'buffer_adv')
-        self._add_endstop('buffer_trailing', buffer_trail_pin, 'buffer_trailing')
+        # Reuse lane-level endstops for buffer pins when already registered
+        if not self._reuse_lane_endstop('buffer_advance', AFCHomingPoints.BUFFER):
+            self._add_endstop('buffer_advance', buffer_adv_pin, 'buffer_adv')
+        if not self._reuse_lane_endstop('buffer_trailing', AFCHomingPoints.BUFFER_TRAIL):
+            self._add_endstop('buffer_trailing', buffer_trail_pin, 'buffer_trailing')
+
+        # FPS buffer: if no hardware advance pin, register the software endstop
+        if buffer_adv_pin is None and buffer_name:
+            self._add_fps_endstop(buffer_name)
+
+    def _reuse_lane_endstop(self, stepper_key: str, lane_key: str) -> bool:
+        """
+        Try to reuse an endstop already registered by AFCLane.__init__() to
+        avoid duplicate pin registration failures.
+
+        :param stepper_key: Key to store in self._endstops (e.g. 'tool_start')
+        :param lane_key: Key in self.endstops from AFCLane (e.g. AFCHomingPoints.BUFFER)
+        :return: True if an existing endstop was reused, False otherwise
+        """
+        entry = self.endstops.get(lane_key)
+        if entry is None:
+            return False
+        mcu_es = entry['endstop']
+        es_name = entry['endstop_name']
+        try:
+            mcu_es.add_stepper(self.extruder_stepper.stepper)
+        except Exception:
+            pass
+        self._endstops[stepper_key] = (mcu_es, es_name)
+        return True
 
     def _inherit_from_unit(self, target_key: str) -> Optional[str]:
         """
@@ -516,6 +550,17 @@ class AFCExtruderStepper(AFCLane):
             self.logger.debug(err_str)
 
         return None
+
+    def _get_buffer_value(self, buffer_name: str, key: str, default=None) -> Optional[str]:
+        """
+        Fetch a config value from a buffer section.
+
+        :param buffer_name: Buffer name to look up
+        :param key: Config key to fetch (e.g. 'advance_pin')
+        :param default: Default if not found
+        :return: Config value or default
+        """
+        return self._get_section_value('AFC_buffer', buffer_name, key) or default
 
     def _get_section_value(self, section_prefix: str, name: str, key: str, default=None) -> Optional[str]:
         """
@@ -579,6 +624,64 @@ class AFCExtruderStepper(AFCLane):
             pass
         self.logger.debug(f"{self.name} adding endstop {key}:{name}:{pin}") # TODO:remove once fully tested on toolchanger
         self._endstops[key] = (mcu_endstop, name)
+
+    def _add_fps_endstop(self, buffer_name):
+        """Register FPS buffer software endstops as buffer_advance and buffer_trailing.
+
+        Called when the buffer has no hardware advance_pin (FPS buffer type).
+        Advance endstop triggers when smoothed_fps >= high_point (default 0.9).
+        Trailing endstop triggers when smoothed_fps <= low_point (default 0.1).
+
+        :param buffer_name: Name of the AFC_FPS buffer to look up
+        """
+        try:
+            buffer_obj = self.printer.lookup_object(f'AFC_buffer {buffer_name}')
+        except Exception:
+            buffer_obj = None
+        if buffer_obj is None:
+            try:
+                afc = self.printer.lookup_object('AFC')
+                buffer_obj = afc.buffers.get(buffer_name)
+            except Exception:
+                pass
+        if buffer_obj is None or buffer_obj.advance_pin is not None:
+            return
+
+        # FPS buffer exposes register_lane_endstops for lane-level registration.
+        # For stepper-level, directly access the software endstop wrappers.
+        endstop = getattr(buffer_obj, 'fps_endstop', None)
+        if endstop is None:
+            return
+
+        # Register advance endstop (high_point)
+        name = 'buffer_adv'
+        try:
+            endstop.add_stepper(self.extruder_stepper.stepper)
+        except Exception:
+            self.logger.info(f"Error adding stepper to FPS endstop for {self.name}")
+            return
+        try:
+            self._qes.register_endstop(endstop, name)
+        except Exception:
+            pass
+        self.logger.debug(f"{self.name} adding FPS software endstop buffer_advance:{buffer_name}")
+        self._endstops['buffer_advance'] = (endstop, name)
+
+        # Register trailing endstop (low_point)
+        trail_endstop = getattr(buffer_obj, 'fps_trailing_endstop', None)
+        if trail_endstop is not None:
+            trail_name = 'buffer_trailing'
+            try:
+                trail_endstop.add_stepper(self.extruder_stepper.stepper)
+            except Exception:
+                self.logger.info(f"Error adding stepper to FPS trailing endstop for {self.name}")
+                return
+            try:
+                self._qes.register_endstop(trail_endstop, trail_name)
+            except Exception:
+                pass
+            self.logger.debug(f"{self.name} adding FPS software endstop buffer_trailing:{buffer_name}")
+            self._endstops['buffer_trailing'] = (trail_endstop, trail_name)
 
     def do_homing_move(self, movepos: int, speed: int, accel: int, endstop_spec:str,
                        triggered=True, check_trigger=True, assist_active=True) -> tuple[bool, float]:
