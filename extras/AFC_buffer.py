@@ -110,7 +110,6 @@ class AFCTrigger:
         """
         return self.name
 
-
     def get_fps_value(self):
         """Get current FPS pressure value. Always None for hardware buffers.
 
@@ -239,7 +238,7 @@ class AFCTrigger:
         :return float: Next scheduled event time (eventtime + CHECK_RUNOUT_TIMEOUT)
         """
         # Skip fault detection for lanes without an extruder stepper
-        cur_lane = self.current_lane
+        cur_lane = getattr(self, 'current_lane', None)
         if cur_lane is not None and getattr(cur_lane, 'extruder_stepper', None) is None:
             return eventtime + CHECK_RUNOUT_TIMEOUT
 
@@ -490,6 +489,7 @@ class AFCTrigger:
             if chg_multiplier is None:
                 self.logger.info("Multiplier must be provided, HIGH or LOW")
                 return
+            chg_multiplier = chg_multiplier.upper()
             chg_factor = gcmd.get_float('FACTOR')
             if chg_factor <= 0:
                 self.logger.info("FACTOR must be greater than 0")
@@ -648,6 +648,10 @@ class AFCTrigger:
         else:
             self.response['rotation_distance'] = None
             self.response['active_lane'] = None
+
+        # Add in multiplier information for automated testing
+        self.response['multiplier_high'] = self.multiplier_high
+        self.response['multiplier_low'] = self.multiplier_low
 
         # Add fault detection information
         self.response['fault_detection_enabled'] = self.error_sensitivity > 0

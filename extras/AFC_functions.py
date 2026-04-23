@@ -440,7 +440,7 @@ class afcFunction:
             error_string = "Error: Cannot find [{}] in config, make sure led_index in config is correct".format(afc_object)
         return error_string, led
 
-    def _get_led_indexes(self, index_values: str) -> list[str]:
+    def _get_led_indexes(self, index_values: str) -> list[int]:
         """
         Helper function for creating a list for index values that have dashes and commas
         so the led's can be set correctly.
@@ -459,7 +459,7 @@ class afcFunction:
                 led_indexes += range(low, high+1)
         return led_indexes
 
-    def parse_led_groups(self, idx: str) -> list[str, str]:
+    def parse_led_groups(self, idx: str) -> list[tuple[str, str]]:
         """
         Parse an LED index string into groups of (led_name, index_string).
 
@@ -631,7 +631,6 @@ class afcFunction:
 
         :param eventtime: Current eventtime to calculate the position from, if time is not passed in uses current eventtime
         :param past_extruder_position: Previous extruder position to compare current position against.
-        :param extruder: Extruder object to get position from, if None uses current toolhead extruder
         :return float: Returns current extruder position if its greater than previous position, else returns previous position
         """
         if eventtime is None:

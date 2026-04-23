@@ -163,7 +163,6 @@ class afcPrep:
                             cur_lane.filament_diameter= units[cur_lane.unit][cur_lane.name]["diameter"]
                         if 'empty_spool_weight' in units[cur_lane.unit][cur_lane.name]:
                             cur_lane.empty_spool_weight= units[cur_lane.unit][cur_lane.name]["empty_spool_weight"]
-
                         if 'bed_temp' in units[cur_lane.unit][cur_lane.name]: cur_lane.bed_temp = units[cur_lane.unit][cur_lane.name]['bed_temp']
                         if 'extruder_temp' in units[cur_lane.unit][cur_lane.name]: cur_lane.extruder_temp = units[cur_lane.unit][cur_lane.name]['extruder_temp']
 

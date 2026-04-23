@@ -62,6 +62,9 @@ class afcError:
         self.pause= True
         self.afc = self.printer.lookup_object('AFC')
         error_handled = False
+        if isinstance(LANE, str):
+            LANE = self.afc.lanes.get(LANE, None)
+
         if problem is None:
             self.PauseUserIntervention('Paused for unknown error')
         if problem=='toolhead':

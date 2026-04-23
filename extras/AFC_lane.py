@@ -212,7 +212,7 @@ class AFCLane:
         # lane triggers
         buttons = self.printer.load_object(config, "buttons")
         self.prep = config.get('prep', None)                                    # MCU pin for prep trigger
-        self._prep_state = False
+        self.prep_state = False
         if self.prep is not None:
             buttons.register_buttons([self.prep], self.prep_callback)
 
@@ -589,15 +589,8 @@ class AFCLane:
         if self.buffer_name is not None:
             self._get_buffer_object()
 
-        # If unit has a buffer configured but hasn't resolved it yet, look it up directly
-        elif self.buffer_obj is None and self.unit_obj.buffer_name is not None:
-            try:
-                self.buffer_obj = self.printer.lookup_object("AFC_buffer {}".format(self.unit_obj.buffer_name))
-            except:
-                pass
-
         # Checking if buffer was defined in extruder if not defined in unit/stepper
-        if (self.buffer_obj is None
+        elif (self.buffer_obj is None
               and self.extruder_obj.tool_start == "buffer"
               and len(self.extruder_obj.lanes) > 1):
             if self.extruder_obj.buffer_name is not None:
@@ -957,6 +950,19 @@ class AFCLane:
             # Set LED to not ready
             self.unit_obj.lane_not_ready(self)
 
+    def _handle_auto_spool_switch(self):
+        """
+        Handle automatic spool switch triggered by weight threshold.
+        Called via reactor.register_callback from update_weight_callback.
+        """
+        if self.afc.error_state or not self.afc.function.is_printing():
+            return
+
+        if self.runout_lane is not None:
+            self._perform_infinite_runout()
+        else:
+            self._perform_pause_runout()
+
     def _perform_pause_runout(self):
         """
         Common function to pause print when runout occurs, fully unloads and ejects spool if specified by user
@@ -981,19 +987,6 @@ class AFCLane:
         self.unit_obj.lane_not_ready(self)
         self.afc.error.AFC_error(msg)
 
-    def _handle_auto_spool_switch(self):
-        """
-        Handle automatic spool switch triggered by weight threshold.
-        Called via reactor.register_callback from update_weight_callback.
-        """
-        if self.afc.error_state or not self.afc.function.is_printing():
-            return
-
-        if self.runout_lane is not None:
-            self._perform_infinite_runout()
-        else:
-            self._perform_pause_runout()
-
     def _prep_capture_td1(self):
         """
         Common function to grab TD-1 data once user inserts filament into a lane. Only happens if user has specified
@@ -1011,17 +1004,8 @@ class AFCLane:
                 self.logger.info(f"Cannot get TD-1 data for {self.name}, either toolhead is loaded or hub shows filament in path")
 
     @property
-    def _hub_is_virtual(self) -> bool:
-        """True when the lane's hub uses a virtual sensor (no physical switch_pin)."""
-        hub = getattr(self, "hub_obj", None)
-        if hub is None:
-            return True
-        pin = getattr(hub, "switch_pin", "virtual")
-        return str(pin).lower() == "virtual"
-
-    @property
     def load_state(self) -> bool:
-        if self.unit_obj.type in ("ViViD",) and self._hub_is_virtual:
+        if self.unit_obj.type == "ViViD":
             return self.loaded_to_hub
         else:
             return bool(self._load_state)
@@ -1029,14 +1013,6 @@ class AFCLane:
     @property
     def raw_load_state(self) -> bool:
         return bool(self._load_state)
-
-    @property
-    def prep_state(self) -> bool:
-        return self._prep_state
-
-    @prep_state.setter
-    def prep_state(self, state):
-        self._prep_state = bool(state)
 
     def selector_callback(self, eventtime: float, state):
         self._selector_state = state
@@ -1143,38 +1119,38 @@ class AFCLane:
                         self.status = AFCLaneState.NONE
                         self.logger.debug(f"Prep: Load Done-{self.name}")
 
-                    # Verify that load state is still true as this would still trigger if prep sensor was triggered and then filament was removed
-                    #   This is only really a issue when using direct_load and still using load sensor
-                    if self.hub == 'direct_load' and self.prep_state:
-                        self.logger.debug(f"Prep: direct load logic-{self.name}-{self.hub}")
-                        self.afc.TOOL_LOAD(self)
-                        self.afc.spool._set_values(self)
-                        self.logger.debug(f"Prep: direct load logic done-{self.name}-{self.hub}")
-                        break
+                        # Verify that load state is still true as this would still trigger if prep sensor was triggered and then filament was removed
+                        #   This is only really a issue when using direct_load and still using load sensor
+                        if self.hub == 'direct_load' and self.prep_state:
+                            self.logger.debug(f"Prep: direct load logic-{self.name}-{self.hub}")
+                            self.afc.TOOL_LOAD(self)
+                            self.afc.spool._set_values(self)
+                            self.logger.debug(f"Prep: direct load logic done-{self.name}-{self.hub}")
+                            break
 
-                    self.unit_obj.prep_post_load(self)
+                        self.unit_obj.prep_post_load(self)
 
-                    self.do_enable(False)
-                    if (self.load_state
-                        and self.prep_state):
-                        self.set_loaded()
-                        self._post_prep_user_macro()
-                        # Check if user wants to get TD-1 data when loading
-                        # TODO: When implementing multi-extruder this could still happen if a lane is loaded for a
-                        # different extruder/hub
-                        if self.td1_device_id:
-                            self._prep_capture_td1()
+                        self.do_enable(False)
+                        if (self.load_state
+                            and self.prep_state):
+                            self.set_loaded()
+                            self._post_prep_user_macro()
+                            # Check if user wants to get TD-1 data when loading
+                            # TODO: When implementing multi-extruder this could still happen if a lane is loaded for a
+                            # different extruder/hub
+                            if self.td1_device_id:
+                                self._prep_capture_td1()
 
-                elif (self.prep_state == True
-                      and self.raw_load_state == True
-                      and not self.afc.function.is_printing()):
-                    message = 'Cannot load {} load sensor is triggered.'.format(self.name)
-                    message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
-                    if self.unit_obj.type == "ViViD":
-                        message += f'\n    If filament is not stuck in sensor run AFC_RECOVER_LANE LANE={self.name}'
-                        message += " to reset internal AFC state."
-                    message += '\n    Once cleared try loading again'
-                    self.afc.error.AFC_error(message, pause=False)
+                    elif (self.prep_state == True
+                        and self.raw_load_state == True
+                        and not self.afc.function.is_printing()):
+                        message = 'Cannot load {} load sensor is triggered.'.format(self.name)
+                        message += '\n    Make sure filament is not stuck in load sensor or check to make sure load sensor is not stuck triggered.'
+                        if self.unit_obj.type == "ViViD":
+                            message += f'\n    If filament is not stuck in sensor run AFC_RECOVER_LANE LANE={self.name}'
+                            message += " to reset internal AFC state."
+                        message += '\n    Once cleared try loading again'
+                        self.afc.error.AFC_error(message, pause=False)
         self.prep_active = False
         self.afc.save_vars()
 

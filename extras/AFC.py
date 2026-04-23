@@ -155,6 +155,7 @@ class afc:
         # Auto spool switch settings
         self.auto_spool_switch: bool              = config.getboolean("auto_spool_switch", False)                    # Trigger spool switch based on remaining filament weight
         self.auto_spool_switch_threshold: float   = config.getfloat("auto_spool_switch_threshold", 25.0, minval=0.)  # Weight threshold in grams
+
         #LED SETTINGS
         # All variables use: (R,G,B,W) 0 = off, 1 = full brightness.
         self.ind_lights = None
@@ -234,14 +235,14 @@ class afc:
         self.full_weight            = config.getfloat("full_weight",1000, minval=1) # full weight of filament spool (not counting spool itself)
         self.enable_sensors_in_gui  = config.getboolean("enable_sensors_in_gui", False) # Set to True to show all sensor switches as filament sensors in mainsail/fluidd gui
         self.ignore_spoolman_material_temps = config.getboolean("ignore_spoolman_material_temps", False)  # When True, AFC will ignore temperatures set in Spoolman and use default_material_temps instead.
+        self.led_use_filament_color:bool = config.getboolean('led_use_filament_color', False)  # When True, uses filament color from color field for lane LEDs instead of configured LED colors
         self.restore_extruder_temp_on_load_or_unload = config.getboolean(
             "restore_extruder_temp_on_load_or_unload", False
         )  # Restore extruder target temp after tool load/unload when not printing
+        self.lower_extruder_temp_on_change = config.getboolean('lower_extruder_temp_on_change', True)  # When False, AFC will not lower extruder temp during filament change if already above target - 5
         self.toolchange_temp_drop: float = config.getfloat(
             "toolchange_temp_drop", 0
         )  # Degrees to drop the old extruder's temperature (no wait) after a successful toolchange when the extruder changes.
-        self.lower_extruder_temp_on_change = config.getboolean('lower_extruder_temp_on_change', True)  # When False, AFC will not lower extruder temp during filament change if already above target - 5
-        self.led_use_filament_color:bool = config.getboolean('led_use_filament_color', False)  # When True, uses filament color from color field for lane LEDs instead of configured LED colors
         self.load_to_hub            = config.getboolean("load_to_hub", True)        # Fast loads filament to hub when inserted, set to False to disable. This is a global setting and can be overridden at AFC_stepper
         self.disable_homing_check   = config.getboolean("disable_homing_check", False)# Disables homing check when doing toolchanges. Only use this if you are using a toolchanger and don't need to home to unload toolheads
         self.assisted_unload        = config.getboolean("assisted_unload", True)    # If True, the unload retract is assisted to prevent loose windings, especially on full spools. This can prevent loops from slipping off the spool
@@ -515,8 +516,8 @@ class afc:
             and self.moonraker is not None
             and (current_time - self._last_td1_query) > 30 ):
             if not self.function.is_printing(check_movement=True):
-                present = self.moonraker.check_for_td1()[1]
                 self._last_td1_query = current_time
+                present = self.moonraker.check_for_td1()[1]
                 self._td1_present = present
 
         return present
@@ -580,8 +581,11 @@ class afc:
         except:
             temp_value = self.heater.min_extrude_temp + 5
 
-        using_min_value = True  # Set it true if default temp/spoolman temps are not being used
-        if cur_lane.extruder_temp is not None:
+        # True when using a fallback/default/min-derived temp instead of an explicit lane or
+        # material-specific temp
+        using_min_value = True
+        if (cur_lane.extruder_temp is not None
+            and cur_lane.extruder_temp > self.heater.min_extrude_temp):
             temp_value = cur_lane.extruder_temp
             using_min_value = False
         elif self.default_material_temps is not None and cur_lane.material is not None:
@@ -664,9 +668,9 @@ class afc:
         """
         Helper function to restore toolhead target temperature after load/unload when not printing AND restore_extruder_temp_on_load_or_unload is True
 
+        :param temp_state: Dictionary containing extruder object and target_temp, or None
         :param async_restore: Set to True to restore while printing, this is useful for restoring
             other toolhead hotends on toolchangers.
-        :param temp_state: Dictionary containing extruder object and target_temp, or None
         """
         if not self.restore_extruder_temp_on_load_or_unload:
             return
@@ -2054,6 +2058,7 @@ class afc:
         current lane and loading the new lane.
 
         Optionally setting PURGE_LENGTH parameter to pass a value into poop macro.
+
         Optionally setting NEW_EXTRUDER_TEMP to set and wait for that temperature on the new extruder before
         performing the tool change.
 
@@ -2119,95 +2124,107 @@ class afc:
         self.CHANGE_TOOL(self.lanes[self.tool_cmds[Tcmd]], purge_length, new_extruder_temp=new_extruder_temp)
 
     def CHANGE_TOOL(self, cur_lane: AFCLane, purge_length: Optional[float]=None, restore_pos: bool=True, new_extruder_temp: Optional[float]=None) -> None:
-        self.afcDeltaTime.set_start_time()
-        # Check if the bypass filament sensor detects filament; if so, abort the tool change.
-        if self._check_bypass(unload=False): return
-
-        self.next_lane_load = cur_lane.name
-        next_extruder = cur_lane.extruder_obj.name
-
-        infinite_runout: bool = cur_lane.status == AFCLaneState.INFINITE_RUNOUT
-        adjusting_temperature: bool = new_extruder_temp is not None or \
-            (infinite_runout and self.function.get_current_extruder() != next_extruder)
-
-        if adjusting_temperature:
-            # Heat the next extruder FIRST so that _heat_next_extruder reads the
-            # current target temperature before it is changed by the cooldown below.
-            next_temp = None if infinite_runout else new_extruder_temp
-            result = self._heat_next_extruder(wait=False, next_temp=next_temp)
-            if not result:
-                self.error.fix("Failed to select or heat next extruder", self.next_lane_load)
+        try:
+            self.afcDeltaTime.set_start_time()
+            # Check if the bypass filament sensor detects filament; if so, abort the tool change.
+            if self._check_bypass(unload=False):
                 return
-            if infinite_runout:
-                cur_lane.status = AFCLaneState.LOADED
-            next_extruder_obj = result[0]
-            target_temp = result[1]
 
-            # Now cool down the old extruder (self.current changes during the toolchange,
-            # so capture the reference here after heating is already queued).
-            if self.current is not None:
-                _last_lane = self.lanes.get(self.current)
-                if _last_lane is not None and _last_lane.extruder_obj.name != next_extruder:
-                    self._cooldown_last_extruder(_last_lane.extruder_obj, infinite_runout)
-
-        # If the requested lane is not the current lane, proceed with the tool change.
-        if cur_lane.name != self.current:
-            # Save the current toolhead position to allow restoration after the tool change.
-            self.save_pos()
-            # Set the in_toolchange flag to prevent overwriting the saved position during potential failures.
-            self.in_toolchange = True
-
-            # Check if the lane has completed the preparation process required for tool changes.
-            if cur_lane._afc_prep_done:
-                # Log the tool change operation for debugging or informational purposes.
-                self.logger.info("Tool Change - {} -> {}".format(self.current, cur_lane.name))
-                if not self.error_state and self.number_of_toolchanges != 0 and self.current_toolchange != self.number_of_toolchanges:
-                    self.current_toolchange += 1
-                    self.logger.raw("//      Change {} out of {}".format(self.current_toolchange, self.number_of_toolchanges))
-
-                # If a current lane is loaded, unload it first.
-                if self.current is not None:
-                    if self.current not in self.lanes:
-                        self.error.AFC_error('{} Unknown'.format(self.current))
-                        return
-                    if not self.TOOL_UNLOAD(self.lanes[self.current], set_start_time=False):
-                        # Abort if the unloading process fails.
-                        msg = (' UNLOAD ERROR NOT CLEARED')
-                        self.error.fix(msg, self.lanes[self.current])  #send to error handling
-                        return
+            self.next_lane_load = cur_lane.name
+            next_extruder = cur_lane.extruder_obj.name
+            infinite_runout: bool = cur_lane.status == AFCLaneState.INFINITE_RUNOUT
+            adjusting_temperature: bool = new_extruder_temp is not None or \
+                (infinite_runout and self.function.get_current_extruder() != next_extruder)
 
             if adjusting_temperature:
-                self.logger.info("Heating and waiting for {} for {}".format(next_extruder_obj.name,
-                    "infinite runout" if infinite_runout else "tool change"))
-                next_heater = next_extruder_obj.get_heater()
-                self._wait_for_temp_within_tolerance(next_heater, target_temp, next_extruder_obj.deadband)
-                self.logger.info("{} heated and ready to print".format(next_extruder_obj.name))
+                # Heat the next extruder FIRST so that _heat_next_extruder reads the
+                # current target temperature before it is changed by the cooldown below.
+                next_temp = None if infinite_runout else new_extruder_temp
+                result = self._heat_next_extruder(wait=False, next_temp=next_temp)
+                if not result:
+                    self.error.fix("Failed to select or heat next extruder", self.next_lane_load)
+                    return
+                if infinite_runout:
+                    cur_lane.status = AFCLaneState.LOADED
+                next_extruder_obj = result[0]
+                target_temp = result[1]
 
-            # Load the new lane and restore the toolhead position if successful.
-            if self.TOOL_LOAD(cur_lane, purge_length, set_start_time=False) and not self.error_state:
-                if restore_pos:
-                    self.restore_pos()
-                total_time = self.afcDeltaTime.log_total_time("Total change time:")
-                self.afc_stats.average_toolchange_time.average_time(total_time)
-                self.in_toolchange = False
-                cur_lane.extruder_obj.estats.increase_toolcount_change()
+                # Now cool down the old extruder (self.current changes during the toolchange,
+                # so capture the reference here after heating is already queued).
+                if self.current is not None:
+                    _last_lane = self.lanes.get(self.current)
+                    if _last_lane is not None and _last_lane.extruder_obj.name != next_extruder:
+                        self._cooldown_last_extruder(_last_lane.extruder_obj, infinite_runout)
+
+            # If the requested lane is not the current lane, proceed with the tool change.
+            if cur_lane.name != self.current:
+                # Save the current toolhead position to allow restoration after the tool change.
+                self.save_pos()
+                # Set the in_toolchange flag to prevent overwriting the saved position during potential failures.
+                self.in_toolchange = True
+
+                # Check if the lane has completed the preparation process required for tool changes.
+                if cur_lane._afc_prep_done:
+                    # Log the tool change operation for debugging or informational purposes.
+                    self.logger.info("Tool Change - {} -> {}".format(self.current, cur_lane.name))
+                    if not self.error_state and self.number_of_toolchanges != 0 and self.current_toolchange != self.number_of_toolchanges:
+                        self.current_toolchange += 1
+                        self.logger.raw("//      Change {} out of {}".format(self.current_toolchange, self.number_of_toolchanges))
+
+                    # If a current lane is loaded, unload it first.
+                    current_lane_name = self.current
+                    if current_lane_name is not None:
+                        unload_lane = self.lanes.get(current_lane_name, None)
+                        if unload_lane is None:
+                            self.error.AFC_error('{} Unknown'.format(current_lane_name))
+                            return
+                        if not self.TOOL_UNLOAD(unload_lane, set_start_time=False):
+                            # Abort if the unloading process fails.
+                            msg = (' UNLOAD ERROR NOT CLEARED')
+                            self.error.fix(msg, unload_lane)  #send to error handling
+                            return
+
+                if adjusting_temperature:
+                    self.logger.info("Heating and waiting for {} for {}".format(next_extruder_obj.name,
+                        "infinite runout" if infinite_runout else "tool change"))
+                    next_heater = next_extruder_obj.get_heater()
+                    self._wait_for_temp_within_tolerance(next_heater, target_temp, next_extruder_obj.deadband)
+                    self.logger.info("{} heated and ready to print".format(next_extruder_obj.name))
+
+                # Load the new lane and restore the toolhead position if successful.
+                if self.TOOL_LOAD(cur_lane, purge_length, set_start_time=False) and not self.error_state:
+                    if restore_pos:
+                        self.restore_pos()
+                    total_time = self.afcDeltaTime.log_total_time("Total change time:")
+                    self.afc_stats.average_toolchange_time.average_time(total_time)
+                    self.in_toolchange = False
+                    cur_lane.extruder_obj.estats.increase_toolcount_change()
+                else:
+                    # Error happened, reset toolchanges without error count
+                    if not self.testing:
+                        self.afc_stats.reset_toolchange_wo_error()
             else:
-                # Error happened, reset toolchanges without error count
-                if not self.testing:
-                    self.afc_stats.reset_toolchange_wo_error()
-        else:
-            # Calling handle activate extruder just to make sure lanes are synced as tool
-            # could have been changed with KTC SELECT_TOOL and lane might not be synced
-            # properly
-            # Take call out once transitioned away from KTC
-            self.function._handle_activate_extruder(0)
-            self.logger.info("{} already loaded".format(cur_lane.name))
-            if not self.error_state and self.current_toolchange == -1:
-                self.current_toolchange += 1
-
-        self.next_lane_load = None
-        self.function.log_toolhead_pos("Final Change Tool: Error State: {}, Is Paused {}, Position_saved {}, in toolchange: {}, POS: ".format(
-                self.error_state, self.function.is_paused(), self.position_saved, self.in_toolchange ))
+                # Calling handle activate extruder just to make sure lanes are synced as tool
+                # could have been changed with KTC SELECT_TOOL and lane might not be synced
+                # properly
+                # Take call out once transitioned away from KTC
+                self.function._handle_activate_extruder(0)
+                self.logger.info("{} already loaded".format(cur_lane.name))
+                if not self.error_state and self.current_toolchange == -1:
+                    self.current_toolchange += 1
+        # Copilot yes this is a bare exception, ignore please since this is being done on purpose
+        # to make sure all exceptions are catched
+        except Exception:
+            trace = traceback.format_exc()
+            self.logger.error("Unexpected error during CHANGE_TOOL:\n", traceback=trace)
+            self.error.AFC_error(
+                "An unexpected error occurred during CHANGE_TOOL. Please check the logs and report this issue to developers.",
+                pause=self.function.in_print()
+            )
+        finally:
+            self.next_lane_load = None
+            self.function.log_toolhead_pos("Final Change Tool: Error State: {}, Is Paused {}, Position_saved {}, in toolchange: {}, POS: ".format(
+                    self.error_state, self.function.is_paused(), self.position_saved, self.in_toolchange ))
 
     def _get_message(self, clear=False):
         """

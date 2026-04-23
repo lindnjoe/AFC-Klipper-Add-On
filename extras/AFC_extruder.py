@@ -47,9 +47,6 @@ except: raise error(ERROR_STR.format(import_lib="AFC", trace=traceback.format_ex
 try: from extras.AFC_stats import AFCStats_var
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-try: from extras.AFC_stats import AFCStats_var
-except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
-
 LARGE_TIME_OFFSET = 99999.9
 
 class AFCExtruderStats:
@@ -238,10 +235,10 @@ class AFCExtruder:
         self.toolhead_status_index      = config.get('status_led_idx', None)
         self.toolhead_nozzle_index      = config.get('nozzle_led_idx', None)
         self.toolhead_led_obj           = None
-        self._captured_toolhead_temp: Optional[dict] = None
         self.set_status_color_fn        = None
         self.check_transmit_status_fn   = None
         self.status_led_count:int       = 0
+        self._captured_toolhead_temp: Optional[dict] = None
 
         if self.toolhead_status_index:
             self.toolhead_status_index  = self.afc.function._get_led_indexes(self.toolhead_status_index)
@@ -368,7 +365,6 @@ class AFCExtruder:
                 raise error(
                     f"buffer is not valid config for pin_tool_start when using {self.name} as a standalone extruder"
                 )
-
 
     def handle_connect(self):
         """
