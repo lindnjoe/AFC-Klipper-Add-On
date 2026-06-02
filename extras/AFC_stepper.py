@@ -11,6 +11,7 @@ import traceback
 from kinematics import extruder
 from configfile import error
 from extras.force_move import calc_move_time
+from functools import cached_property
 
 from typing import Optional, TYPE_CHECKING, Dict
 
@@ -34,6 +35,61 @@ DRIP_TIME=0.100
 STEPCOMPRESS_FLUSH_TIME=0.050
 BUFFER_TIME_HIGH=1.0
 DRIP_SEGMENT_TIME=0.050
+
+class TrapqAppendWrapper:
+    """
+    Wraps trapq_append to handle signature differences between standard
+    Klipper and Snapmaker U1 Klipper.
+
+    On initialization, inspects the FFI signature of trapq_append and
+    sets `snapmaker_trapq_append_sig` to True if the Snapmaker extended
+    signature (15 args) is detected. The `trapq_append` method uses this
+    flag to append a trailing zero to the args tuple when needed.
+
+    Attributes:
+        SNAPMAKER_TRAPQ_APPEND_LEN (int): Expected argument count for the
+            Snapmaker variant of trapq_append (15).
+        snapmaker_trapq_append_sig (bool): True if the Snapmaker 15-arg
+            signature is detected; False otherwise.
+    """
+    SNAPMAKER_TRAPQ_APPEND_LEN = 15
+    def __init__(self):
+        self.snapmaker_trapq_append_sig
+    @cached_property
+    def snapmaker_trapq_append_sig(self) -> bool:
+        """
+        Detect whether the loaded FFI library exposes the Snapmaker variant
+        of trapq_append.
+
+        :returns bool: True if the Snapmaker 15-arg signature is present.
+        """
+        ffi_main, ffi_lib = chelper.get_ffi()
+        trapq_append_sig = ffi_main.typeof(ffi_lib.trapq_append)
+        return len(trapq_append_sig.args) == self.SNAPMAKER_TRAPQ_APPEND_LEN
+
+    def trapq_append(self, trapq_append_fn, trapq, print_time:float, accel_t:float, cruise_t:float,
+                     decel_t: float, start_pos_x: float, start_pos_y: float, t_pos_z: float,
+                     axes_r_x: float, axes_r_y: float, axes_r_z: float, start_v: float,
+                     cruise_v: float, accel: float ) -> None:
+        """
+        Wrapper method for checking if Snapmakers signature exists and pads trapq_append args
+        with zero to satisfy the extra 'line' parameter expected by the Snapmaker
+        FFI variant.
+
+        :param trapq_append_fn: The resolved FFI function object for trapq_append.
+        :param args: Normal Klipper trapq_append arguments to send to trapq_append,
+            arguments should be in the following order:
+                trapq, print_time, accel_t, cruise_t, decel_t, start_pos_x, start_pos_y,
+                start_pos_z, axes_r_x, axes_r_y, axes_r_z, start_v, cruise_v, accel
+        """
+        trapq_append_args = (trapq, print_time, accel_t, cruise_t, decel_t, start_pos_x,
+                             start_pos_y, t_pos_z, axes_r_x, axes_r_y, axes_r_z, start_v,
+                             cruise_v, accel)
+        if self.snapmaker_trapq_append_sig == True:
+            trapq_append_args = trapq_append_args + (0,)
+
+        trapq_append_fn(*trapq_append_args)
+
 
 class AFCExtruderStepper(AFCLane):
     def __init__(self, config):
@@ -71,13 +127,16 @@ class AFCExtruderStepper(AFCLane):
         self.stepper_kinematics = ffi_main.gc(
             ffi_lib.cartesian_stepper_alloc(b'x'), ffi_lib.free)
 
+        trapq_append_wrapper = TrapqAppendWrapper()
         if self.motion_queuing is not None:
             self.trapq          = self.motion_queuing.allocate_trapq()
-            self.trapq_append   = self.motion_queuing.lookup_trapq_append()
+            _trapq_append       = self.motion_queuing.lookup_trapq_append()
         else:
             self.trapq                  = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
-            self.trapq_append           = ffi_lib.trapq_append
+            _trapq_append               = ffi_lib.trapq_append
             self.trapq_finalize_moves   = ffi_lib.trapq_finalize_moves
+
+        self.trapq_append = lambda *args: trapq_append_wrapper.trapq_append(_trapq_append, *args)
 
         self.assist_activate=False
 
@@ -117,8 +176,10 @@ class AFCExtruderStepper(AFCLane):
         """
         self.extruder_stepper.stepper.set_position((0., 0., 0.))
         axis_r, accel_t, cruise_t, cruise_v = calc_move_time(distance, speed, accel)
+
         self.trapq_append(self.trapq, movetime, accel_t, cruise_t, accel_t,
-                              0., 0., 0., axis_r, 0., 0., 0., cruise_v, accel)
+                          0., 0., 0., axis_r, 0., 0., 0., cruise_v, accel)
+
         return accel_t + cruise_t + accel_t
 
     def _move(self, distance: float, speed: float, accel: float, assist_active: bool=False,
