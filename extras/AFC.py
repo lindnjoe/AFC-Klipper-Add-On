@@ -8,7 +8,9 @@ import json
 import re
 import traceback
 import inspect
+from functools import cached_property
 from configfile import error
+from klippy import Printer
 
 from typing import Dict, TYPE_CHECKING, Union, Any, Optional, Tuple
 
@@ -60,7 +62,6 @@ def load_config(config):
     return afc(config)
 
 class afc:
-    SNAPMAKER_TRAPQ_APPEND_LEN = 15
     def __init__(self, config: ConfigWrapper):
         self.config  = config
         self.printer = config.get_printer()
@@ -342,6 +343,15 @@ class afc:
                 else : self.logger.info("TRSYNC_SINGLE_MCU_TIMEOUT does not exist in mcu file, not updating")
             except Exception as e:
                 self.logger.info("Unable to update TRSYNC_TIMEOUT: {}".format(e))
+
+    @cached_property
+    def snapmaker_printer(self):
+        """
+        Property to check get_snapmaker_config_dir method exists in klippy Printer Class.
+
+        :return bool: Returns True of get_snapmaker_config_dir method is found in Printer class
+        """
+        return hasattr(Printer, "get_snapmaker_config_dir")
 
     def register_config_callback(self, option):
         # Function needed for virtual pins, does nothing
@@ -2087,6 +2097,22 @@ class afc:
         CHANGE_TOOL LANE=lane1 PURGE_LENGTH=100 NEW_EXTRUDER_TEMP=220
         ```
         """
+        # Following code originally by J0eB0l
+        # U1 power resume and temperature commands pass A=0 to activate the
+        # extruder without a full tool change.  Rebuild in extended-param
+        # format (A=<val>) because the renamed handler (_T0) is registered
+        # as a non-traditional command and expects key=value syntax.
+        a_param: str = gcmd.get('A', None)
+        if (a_param is not None
+            and self.snapmaker_printer):
+            cmd: str = gcmd.get_commandline().split()[0].upper()
+            renamed = f"_{cmd}"
+            if renamed in self.gcode.ready_gcode_handlers:
+                sm_command = f"{renamed} A={a_param}"
+                self.logger.info(f"Calling snapmakers T(n) command: {sm_command}")
+                self.gcode.run_script_from_command(sm_command)
+                return
+
         # Check if the bypass filament sensor detects filament; if so, abort the tool change.
         if self._check_bypass(unload=False): return
 
@@ -2394,16 +2420,32 @@ class afc:
         """
 
         # TODO: this currently does not work correctly when lanes are remapped and KTC calls M109
-        toolnum  = gcmd.get_int('T', None, minval=0)
-        temp     = gcmd.get_float('S', 0.0)
-        deadband = gcmd.get_float('D', None)
+        toolnum: int = gcmd.get_int('T', None, minval=0)
+        temp: float  = gcmd.get_float('S', 0.0)
+        deadband: float = gcmd.get_float('D', None)
+        snapmaker_param_a: int = gcmd.get_int('A', None)
 
         curr_extruder = self.function.get_current_extruder_obj()
 
         if toolnum is not None:
             map = "T{}".format(toolnum)
             lane = self.function.get_lane_by_map(map)
-            if lane is not None:
+            # If A(n) is in commandline and AFC is running on a snapmaker printer lookup extruder
+            # by T param. For snapmaker printers M109/M104 normally passes in `A0` when resuming, or
+            # resuming from power loss.
+            #
+            # Example command: M104 S220 T0 A0
+            # Result, AFC will heat hotend for extruder instead of the TO lane that could be mapped
+            # to a different toolhead.
+            if (snapmaker_param_a is not None
+                and self.snapmaker_printer):
+                extruder_name = "extruder"
+                if toolnum > 0:
+                    extruder_name = f"extruder{toolnum}"
+                self.logger.debug(f"Snapmaker Temp extruder name {extruder_name}")
+
+                extruder = self.tools.get(extruder_name, self.toolhead.get_extruder())
+            elif lane is not None:
                 extruder = lane.extruder_obj
 
                 # Checking if slicer is trying to set temperature(ooze prevention) for another lane

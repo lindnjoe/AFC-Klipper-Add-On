@@ -28,6 +28,7 @@ import pytest
 
 from extras.AFC import afc, State, AFC_VERSION
 from extras.AFC_lane import AFCLaneState
+from klippy import Printer
 
 
 # ── State constants ───────────────────────────────────────────────────────────
@@ -588,6 +589,7 @@ def _make_afc_for_change_tool(lane_name="lane2", next_extruder_name="extruder1",
     obj._cooldown_last_extruder = MagicMock()
     obj._wait_for_temp_within_tolerance = MagicMock()
     obj.error = MagicMock()
+    obj.printer = Printer
 
     # Current (old) lane/extruder
     current_extruder = MagicMock()
@@ -1327,6 +1329,73 @@ class TestCmdChangeTool_NewExtruderTempParsing:
         assert "PURGE_LENGTH" in error_msg
         obj.CHANGE_TOOL.assert_not_called()
 
+class TestCmdChange_ToolCheckBypass_CheckHomed():
+    def _make_gcmd(self):
+        gcmd = MagicMock()
+        # Use a T0 command line so cmd_CHANGE_TOOL takes the simple else-branch
+        # (no "CHANGE" in command) and Tcmd = "T0" directly.
+        gcmd.get_commandline.return_value = "T0"
+        return gcmd
+
+    def test_check_bypass_True(self):
+        obj, _, _ = _make_afc_for_change_tool()
+        gcmd = self._make_gcmd()
+        obj._check_bypass.return_value = True
+
+        ret = obj.cmd_CHANGE_TOOL(gcmd)
+        assert not ret
+
+    def test_check_homed_False(self):
+        obj, _, _ = _make_afc_for_change_tool()
+        gcmd = self._make_gcmd()
+        obj.function.check_homed.return_value = False
+
+        ret = obj.cmd_CHANGE_TOOL(gcmd)
+        assert not ret
+
+class TestCmdChangeTool_SnapmakerPath:
+    def _make_gcmd(self, tcmd="T0"):
+        gcmd = MagicMock()
+        # Use a T0 command line so cmd_CHANGE_TOOL takes the simple else-branch
+        # (no "CHANGE" in command) and Tcmd = "T0" directly.
+        gcmd.get_commandline.return_value = f"{tcmd} A0"
+        gcmd.get.side_effect = lambda key, default=None: {
+            "A": "0"
+        }.get(key, default)
+        return gcmd
+    def get_snapmaker_config_dir():
+            pass
+
+    def test_setting_A_param(self, monkeypatch):
+        obj, _, _ = _make_afc_for_change_tool()
+        monkeypatch.setattr(Printer, "get_snapmaker_config_dir", True, raising=False)
+        gcmd = self._make_gcmd()
+        obj.gcode = MagicMock()
+        obj.gcode.ready_gcode_handlers = {"_T0": MagicMock()}
+        ret = obj.cmd_CHANGE_TOOL(gcmd)
+        obj.gcode.run_script_from_command.assert_called_once()
+    
+    def test_setting_A_param_snapmaker_false(self):
+        obj, _, _ = _make_afc_for_change_tool()
+        obj.function.check_homed.return_value = False
+        gcmd = self._make_gcmd()
+        obj.gcode = MagicMock()
+        obj.gcode.ready_gcode_handlers = {"_T0": MagicMock()}
+        ret = obj.cmd_CHANGE_TOOL(gcmd)
+        obj.gcode.run_script_from_command.assert_not_called()
+        assert not ret
+
+    def test_setting_A_param_not_in_ready_gcode_handlers(self, monkeypatch):
+        obj, _, _ = _make_afc_for_change_tool()
+        obj.function.check_homed.return_value = False
+        monkeypatch.setattr(Printer, "get_snapmaker_config_dir", True, raising=False)
+        obj.function.check_homed.return_value = False
+        gcmd = self._make_gcmd("T5")
+        obj.gcode = MagicMock()
+        obj.gcode.ready_gcode_handlers = {"_T0": MagicMock()}
+        ret = obj.cmd_CHANGE_TOOL(gcmd)
+        obj.gcode.run_script_from_command.assert_not_called()
+        assert not ret
 
 # ── TOOL_LOAD: destination extruder already has a different lane loaded ───────
 
@@ -2320,3 +2389,15 @@ class TestCmdLaneMove:
         obj.cmd_LANE_MOVE(gcmd)
         args = lane.move_advanced.call_args.args
         assert args[1] == SpeedMode.LONG
+
+class TestCheckForSnapmakerSignature:
+    def test_check_snapmaker_printer_property_false(self):
+        obj = _make_afc()
+        obj.printer = Printer
+        assert not obj.snapmaker_printer
+    
+    def test_check_snapmaker_printer_property_true(self, monkeypatch):
+        obj = _make_afc()
+        obj.printer = Printer
+        monkeypatch.setattr(Printer, "get_snapmaker_config_dir", True, raising=False)
+        assert obj.snapmaker_printer
