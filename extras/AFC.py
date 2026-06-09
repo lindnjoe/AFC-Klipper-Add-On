@@ -44,7 +44,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.1.16"
+AFC_VERSION="1.1.18"
 
 # Class for holding different states so its clear what all valid states are
 class State:
@@ -1635,7 +1635,7 @@ class afc:
                 cur_lane.sync_to_extruder()
 
         # Update tool and lane status.
-        cur_lane.set_tool_loaded()
+        cur_lane.set_tool_loaded(normal_toolchange=True)
         # Setting disable_fault so that fault detection is turned off for users
         # that utilize poop
         cur_lane.enable_buffer(disable_fault=True)
@@ -1678,13 +1678,16 @@ class afc:
         # User manually unloaded spool from toolhead, remove spool from active status
         self.spool.set_active_spool(None)
 
-    def TOOL_UNLOAD(self, cur_lane: AFCLane, set_start_time=True):
+    def TOOL_UNLOAD(self, cur_lane: AFCLane, set_start_time=True, force_unload=False):
         """
         This function handles the unloading of a specified lane from the tool. It performs
         several checks and movements to ensure the lane is properly unloaded.
 
         :param cur_lane: The lane object to be unloaded from the tool.
-        :param set_start_time: Set true to set a starting time for afcDeltaTime.
+        :param set_start_time: Set True to set a starting time for afcDeltaTime.
+        :param force_unload: Set to True to always force unload a lane, needed for infinite runout
+                             to unload the lane so lane can be ejected before swapping to another
+                             toolhead.
 
         :return bool: True if unloading was successful, False if an error occurred.
         """
@@ -1723,43 +1726,47 @@ class afc:
         # toolhead wait is needed here as it will cause TTC for some if wait does not occur
         self.move_z_pos(pos[2], "Tool_Unload quick pull", wait_moves=True)
 
-        # Check if the current extruder is loaded with the lane to be unloaded.
-        next_lookup_lane_name = cur_lane.name
-        if self.next_lane_load is not None:
-            next_lookup_lane_name = self.next_lane_load
-
-        next_lane       = self.lanes.get(next_lookup_lane_name)
-        if next_lane is None:
-            self.error.AFC_error(f"Lane '{next_lookup_lane_name}' not found in AFC lane mapping during unload operation.",
-                                 pause=self.function.in_print())
-            return False
-
-        next_extruder   = next_lane.extruder_obj.name
-        # TODO: need to check if its just a tool swap, or tool swap with a lane unload
-
-        # If the next extruder is specified and it is not the current extruder, perform a tool swap.
-        if next_extruder is not None and self.function.get_current_extruder() != next_extruder:
-            next_lane.tool_swap()
-
-            # Lookup the current extruder and lane objects based on the next lane to load.
-            # This is necessary to ensure the correct extruder and lane are used for unloading.
-            cur_extruder = self.function.get_current_extruder_obj()
-            if cur_extruder and cur_extruder.lane_loaded is not None:
-                cur_lane = self.function.get_current_lane_obj()
-            else:
-                cur_lane = None
-
-            self.logger.debug(f"Current extruder: {cur_extruder}, current lane:{cur_lane}")
-
         # Default to true
         unload_toolhead = True
-        if self.next_lane_load is not None:
-            if self.next_lane_load in cur_extruder.lanes and self.next_lane_load != cur_extruder.lane_loaded:
-                unload_toolhead = True
-            else:
-                unload_toolhead = False
+        if not force_unload:
+            # Check if the current extruder is loaded with the lane to be unloaded.
+            next_lookup_lane_name = cur_lane.name
+            if self.next_lane_load is not None:
+                next_lookup_lane_name = self.next_lane_load
 
-        self.logger.debug(f"Next lane load:{self.next_lane_load}, lanes:{cur_extruder.lanes}, current lane:{cur_lane}, unload_toolhead:{unload_toolhead}")
+            next_lane       = self.lanes.get(next_lookup_lane_name)
+            if next_lane is None:
+                self.error.AFC_error(f"Lane '{next_lookup_lane_name}' not found in AFC lane mapping during unload operation.",
+                                    pause=self.function.in_print())
+                return False
+
+            next_extruder   = next_lane.extruder_obj.name
+            # TODO: need to check if its just a tool swap, or tool swap with a lane unload
+
+            # If the next extruder is specified and it is not the current extruder, perform a tool swap.
+            if (next_extruder is not None
+                and self.function.get_current_extruder() != next_extruder):
+                next_lane.tool_swap()
+
+                # Lookup the current extruder and lane objects based on the next lane to load.
+                # This is necessary to ensure the correct extruder and lane are used for unloading.
+                cur_extruder = self.function.get_current_extruder_obj()
+                if cur_extruder and cur_extruder.lane_loaded is not None:
+                    cur_lane = self.function.get_current_lane_obj()
+                else:
+                    cur_lane = None
+
+                self.logger.debug(f"Current extruder: {cur_extruder}, current lane:{cur_lane}")
+
+            if self.next_lane_load is not None:
+                if (self.next_lane_load in cur_extruder.lanes
+                    and self.next_lane_load != cur_extruder.lane_loaded):
+                    unload_toolhead = True
+                    # TODO: Also force unload here for infinite runout...
+                else:
+                    unload_toolhead = False
+
+            self.logger.debug(f"Next lane load:{self.next_lane_load}, lanes:{cur_extruder.lanes}, current lane:{cur_lane}, unload_toolhead:{unload_toolhead}")
 
         if self.current is not None and unload_toolhead:
             self.current_state  = State.UNLOADING
@@ -1800,7 +1807,7 @@ class afc:
             self.logger.info("Running custom unload command for lane {}".format(cur_lane.name))
             cur_lane.status = AFCLaneState.TOOL_UNLOADING
             self.gcode.run_script_from_command(cur_lane.custom_unload_cmd)
-            cur_lane.set_tool_unloaded()
+            cur_lane.set_tool_unloaded(normal_toolchange=True)
             cur_lane.status = AFCLaneState.NONE
             self.save_vars()
         else:
@@ -1981,7 +1988,7 @@ class afc:
             self.afcDeltaTime.log_with_time("Long retract done")
 
             # Clear toolhead's loaded state for easier error handling later.
-            cur_lane.set_tool_unloaded()
+            cur_lane.set_tool_unloaded(normal_toolchange=True)
             self.save_vars()
 
             # Ensure filament is fully cleared from the hub.
@@ -2177,6 +2184,7 @@ class afc:
             adjusting_temperature: bool = new_extruder_temp is not None or \
                 (infinite_runout and self.function.get_current_extruder() != next_extruder)
 
+            _last_lane = None
             if adjusting_temperature:
                 # Heat the next extruder FIRST so that _heat_next_extruder reads the
                 # current target temperature before it is changed by the cooldown below.
@@ -2190,11 +2198,14 @@ class afc:
                 next_extruder_obj = result[0]
                 target_temp = result[1]
 
-                # Now cool down the old extruder (self.current changes during the toolchange,
+                # Capture the old extruder (self.current changes during the toolchange,
                 # so capture the reference here after heating is already queued).
                 if self.current is not None:
                     _last_lane = self.lanes.get(self.current)
-                    if _last_lane is not None and _last_lane.extruder_obj.name != next_extruder:
+                    # Now cool down the old extruder when not doing infinite runout
+                    if (_last_lane is not None
+                        and not infinite_runout
+                        and _last_lane.extruder_obj.name != next_extruder):
                         self._cooldown_last_extruder(_last_lane.extruder_obj, infinite_runout)
 
             # If the requested lane is not the current lane, proceed with the tool change.
@@ -2219,18 +2230,50 @@ class afc:
                         if unload_lane is None:
                             self.error.AFC_error('{} Unknown'.format(current_lane_name))
                             return
-                        if not self.TOOL_UNLOAD(unload_lane, set_start_time=False):
+                        force_unload = (infinite_runout and not unload_lane.extruder_obj.is_standalone())
+                        if not self.TOOL_UNLOAD(unload_lane, set_start_time=False,
+                                                force_unload=force_unload):
                             # Abort if the unloading process fails.
                             msg = (' UNLOAD ERROR NOT CLEARED')
                             self.error.fix(msg, unload_lane)  #send to error handling
                             return
 
+                        if (force_unload
+                            and not unload_lane.is_direct_hub()):
+                            # Eject spool before loading next lane for infinite rollover
+                            self.LANE_UNLOAD(unload_lane)
+
                 if adjusting_temperature:
+                    # Now cool down last lanes extruder only when doing infinite runout since
+                    # TOOL_UNLOAD should now be done
+                    if (_last_lane is not None
+                        and infinite_runout
+                        and _last_lane.extruder_obj.name != next_extruder):
+                        self._cooldown_last_extruder(_last_lane.extruder_obj, infinite_runout)
+
                     self.logger.info("Heating and waiting for {} for {}".format(next_extruder_obj.name,
-                        "infinite runout" if infinite_runout else "tool change"))
+                        "infinite runout" if infinite_runout else "tool change."))
+                    if (current_lane_name is not None
+                        and infinite_runout
+                        and self.park
+                        and self.park_cmd is not None):
+                        self.logger.info("Parking while waiting for extruder to heat.")
+                        self.gcode.run_script_from_command(
+                            f"{self.park_cmd} EXTRUDER={unload_lane.extruder_obj.name}"
+                        )
+
                     next_heater = next_extruder_obj.get_heater()
                     self._wait_for_temp_within_tolerance(next_heater, target_temp, next_extruder_obj.deadband)
                     self.logger.info("{} heated and ready to print".format(next_extruder_obj.name))
+
+                    if (current_lane_name is not None
+                        and infinite_runout
+                        and self.wipe
+                        and self.wipe_cmd is not None):
+                        self.logger.info("Wiping ooze...")
+                        self.gcode.run_script_from_command(
+                            f"{self.wipe_cmd} EXTRUDER={unload_lane.extruder_obj.name}"
+                        )
 
                 # Load the new lane and restore the toolhead position if successful.
                 if self.TOOL_LOAD(cur_lane, purge_length, set_start_time=False) and not self.error_state:

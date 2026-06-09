@@ -392,6 +392,10 @@ class MockAFC:
         self.function.HexConvert = lambda x: x
         self.toolhead = MagicMock()
 
+        self.save_pos = MagicMock()
+        self.CHANGE_TOOL = MagicMock()
+        self.restore_pos = MagicMock()
+
 
 class MockPrinter:
     """Mock for Klipper's printer object."""
