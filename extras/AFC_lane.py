@@ -122,6 +122,7 @@ class AFCLane:
         self.loaded_to_hub      = False
         self.spool_id           = None
         self.color              = None
+        self.multi_color        = []
         self.weight             = 0
         self.auto_switch_triggered = False
         self._material          = None
