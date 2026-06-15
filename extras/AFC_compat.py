@@ -7,8 +7,8 @@
 # AFC compatibility shims.
 #
 # Runtime guards that let our serial-driven units (ACE, OpenAMS) run on the
-# FROZEN upstream AFC core without editing upstream files. They re-express
-# behaviour our deviated fork had (steppermless [AFC_lane] lanes on virtual
+# FROZEN upstream AFC core without editing upstream files. They re-express the
+# behaviour our serial units need (steppermless [AFC_lane] lanes on virtual
 # hubs, two-phase unload) against upstream's classes.
 #
 # Each shim is idempotent (a flag on the target class) and safe to apply from
@@ -207,9 +207,9 @@ def _patch_afc_bowden_serial_unit():
     sensor, OpenAMS OAMS_CALIBRATE_PTFE_LENGTH), so the toolhead-sensor guard
     doesn't apply to them. For such a BOWDEN lane, temporarily satisfy the guard
     (a tool_start sentinel) so upstream proceeds straight to
-    unit.calibrate_bowden(), then restore tool_start. This reproduces the
-    custom-calibration bypass our deviated fork carried, without editing
-    upstream. The guard value is never consumed past the check on this path, and
+    unit.calibrate_bowden(), then restore tool_start. This lets a serial unit
+    run its self-contained calibration without editing upstream. The guard value
+    is never consumed past the check on this path, and
     our serial calibrate_bowden implementations ignore tool_start entirely."""
     try:
         from extras import AFC_functions as _fn_mod
@@ -256,7 +256,7 @@ def _patch_afc_lane_load_runout():
       * it gates the load/insert/runout body on type == "HTLF", so AMS/ACE never
         run their own insert/runout handling.
 
-    Reproduce our deviated fork's generalized callback: guard the optional
+    Generalize the callback for serial units: guard the optional
     physical-switch objects, extend the gate to the serial unit types (and any
     unit exposing the on_filament_* hooks), and route a runout through the unit's
     own handler when it provides one (e.g. OAMS can't unload once F1S is empty).

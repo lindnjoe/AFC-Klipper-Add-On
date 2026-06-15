@@ -51,19 +51,16 @@ class AFC_U1_RFID:
         self._backed_off: bool = False
         self._backoff_cycles: int = 0
         self._fd_cb_registered: bool = False
-        # Lane->channel map and scanner lanes are configured in THIS section.
-        # On our deviated core these were per-lane options (u1_rfid_channel /
-        # spool_scanner on [AFC_stepper ...]) read by AFC_lane, and the reader
-        # was wired up by AFC_prep. Upstream AFC_lane/AFC_prep are frozen and do
-        # neither, so the reader owns its config and lifecycle (fully decoupled
-        # from the core).
+        # The reader owns its own config and lifecycle: the lane->channel map
+        # and scanner channels are configured in THIS section, and the reader
+        # wires up its own polling — fully decoupled from the AFC core.
         #   [AFC_U1_rfid]
         #   lane_channels: lane4:1, lane5:2, lane6:3   # tag -> assign to lane
         #   scanner_channels: 0                         # tag -> stage next spool
         #   scanner_auto_create: True   # opt-in (default False): create scanned
         #                               # spools in Spoolman when no match exists
         # lane_channels: a loadable AFC lane reads its RFID channel and the tag
-        # is assigned to THAT lane. (Legacy alias: 'channels'.)
+        # is assigned to THAT lane. (Alias: 'channels'.)
         self._cfg_channels: Dict[str, int] = {}        # lane_name -> channel
         lane_chan_str = config.get('lane_channels', None)
         if lane_chan_str is None:

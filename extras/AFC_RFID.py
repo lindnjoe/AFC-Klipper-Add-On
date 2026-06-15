@@ -143,8 +143,8 @@ class SpoolmanClient:
     # are JSON-encoded per Spoolman (float -> "1.23", text -> "\"abc\"").
     SPOOL_EXTRA_FLOW_K = "afc_flow_k"     # field_type: float
     SPOOL_EXTRA_UID = "afc_rfid_uid"      # field_type: text
-    # Legacy: K used to be stored as an "afc_flow_k=<value>" comment tag. Kept
-    # only so read_flow_k can migrate old spools; write_flow_k strips it.
+    # Legacy comment tag ("afc_flow_k=<value>"): read_flow_k still accepts it to
+    # migrate spools that carry it, and write_flow_k strips it.
     SPOOLMAN_FLOW_K_TAG = "afc_flow_k"
 
     def _ensure_spool_fields(self):
@@ -223,8 +223,8 @@ class SpoolmanClient:
         return None
 
     def write_flow_k(self, spool_id, k):
-        """Persist a calibrated flow K to the afc_flow_k extra field. Also strips
-        the legacy comment tag if present (we no longer store K in the comment)."""
+        """Persist a calibrated flow K to the afc_flow_k extra field (K lives in
+        the extra field, not the comment) and strip any legacy comment tag."""
         self._ensure_spool_fields()
         spool = self.get_spool(spool_id)
         if not spool:

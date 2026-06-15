@@ -1599,7 +1599,8 @@ class afcACE(afcUnit):
         # per extruder is tool_loaded at a time) loaded lane on that extruder.
         # The fallback matters at print start when a lane is "already loaded":
         # the load sequence is skipped so extruder.lane_loaded can lag behind
-        # tool_loaded, which used to make this return None and leave assist off.
+        # tool_loaded; the fallback keeps this from returning None and leaving
+        # assist off.
         candidate = None
         for lane in self.lanes.values():
             ext_obj = getattr(lane, 'extruder_obj', None)
