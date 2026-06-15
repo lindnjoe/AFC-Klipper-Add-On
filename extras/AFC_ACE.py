@@ -124,6 +124,46 @@ from extras.AFC_compat import apply_compat_patches
 apply_compat_patches()
 
 
+
+def _ams_box_logo(title, n_slots, name):
+    """AMS-style unit logo: a titled box with one spool bay per slot, fronted by
+    the R/E/A/D/Y banner (prep console output). ASCII borders for portability."""
+    n = max(1, int(n_slots) if n_slots else 1)
+    bay_w = 3
+    while n * bay_w + (n - 1) < len(title):
+        bay_w += 1
+    inner = n * bay_w + (n - 1)
+    bar = "-" * bay_w
+    spool = "O".center(bay_w)
+    rows = [
+        "+" + "-" * inner + "+",
+        "|" + title.center(inner) + "|",
+        "+" + "+".join([bar] * n) + "+",
+        "|" + "|".join([spool] * n) + "|",
+        "+" + "+".join([bar] * n) + "+",
+    ]
+    body = "\n".join("%s  %s" % (L, r) for L, r in zip("READY", rows))
+    return "<span class=success--text>%s</span>\n   %s\n" % (body, name)
+
+
+def _ams_box_logo_error(title, n_slots, name):
+    """Error variant of the AMS-style logo (red box, ERROR banner)."""
+    n = max(1, int(n_slots) if n_slots else 1)
+    bay_w = 3
+    while n * bay_w + (n - 1) < len(title):
+        bay_w += 1
+    inner = max(n * bay_w + (n - 1), len("X ERROR"))
+    rows = [
+        "+" + "-" * inner + "+",
+        "|" + title.center(inner) + "|",
+        "+" + "-" * inner + "+",
+        "|" + "X ERROR".center(inner) + "|",
+        "+" + "-" * inner + "+",
+    ]
+    body = "\n".join("%s  %s" % (L, r) for L, r in zip("ERROR", rows))
+    return "<span class=error--text>%s</span>\n   %s\n" % (body, name)
+
+
 class afcACE(afcUnit):
     SLOTS_PER_UNIT = 4
 
@@ -230,19 +270,8 @@ class afcACE(afcUnit):
     def handle_connect(self):
         super().handle_connect()
 
-        self.logo = '<span class=success--text>R  ACE PRO\n'
-        self.logo += 'E  ========\n'
-        self.logo += 'A  |      |\n'
-        self.logo += 'D  | {slots} |\n'.format(slots=''.join(['[{}]'.format(i) for i in range(len(self.lanes))]))
-        self.logo += 'Y  ========</span>\n'
-        self.logo += '  ' + self.name + '\n'
-
-        self.logo_error = '<span class=error--text>E  ACE PRO\n'
-        self.logo_error += 'R  ========\n'
-        self.logo_error += 'R  | ERR  |\n'
-        self.logo_error += 'O  |  <span class=secondary--text>X</span>   |\n'
-        self.logo_error += 'R  ========</span>\n'
-        self.logo_error += '  ' + self.name + '\n'
+        self.logo = _ams_box_logo("ACE PRO", len(self.lanes), self.name)
+        self.logo_error = _ams_box_logo_error("ACE PRO", len(self.lanes), self.name)
 
         # Build slot map (1-based config index → 0-based ACE slot)
         # and set custom load/unload commands
