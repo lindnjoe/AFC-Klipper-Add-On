@@ -142,16 +142,11 @@ class SpoolmanClient:
     # on demand), not the comment — so the comment stays free for the user. The
     # tag's manufacturing date goes to the built-in lot_nr. Extra-field values
     # are JSON-encoded per Spoolman (float -> "1.23", text -> "\"abc\"").
-    SPOOL_EXTRA_FLOW_K = "afc_flow_k"        # field_type: float (ours-only)
+    SPOOL_EXTRA_FLOW_K = "flow_k"            # field_type: float (name "Flow K")
     # NFC tag UIDs live in a 'card_uids' spool extra field as a comma-separated
     # list of uppercase-hex UIDs — matching the Snapmaker-Extended convention so
     # spools created by either tool interoperate (a spool can carry >1 tag).
     SPOOL_EXTRA_CARD_UIDS = "card_uids"      # field_type: text
-    # Legacy single-UID field from earlier AFC versions; still read for matching.
-    SPOOL_EXTRA_UID_LEGACY = "afc_rfid_uid"
-    # Legacy comment tag ("afc_flow_k=<value>"): read_flow_k still accepts it to
-    # migrate spools that carry it, and write_flow_k strips it.
-    SPOOLMAN_FLOW_K_TAG = "afc_flow_k"
     # The tag's filament sub-type / variant (e.g. "Matte", "Silk", "Basic") lives
     # in a 'variant' filament extra field (also matching Snapmaker-Extended).
     FILAMENT_EXTRA_VARIANT = "variant"
@@ -172,7 +167,7 @@ class SpoolmanClient:
         if self.SPOOL_EXTRA_FLOW_K not in keys:
             self._spoolman_proxy(
                 "POST", f"/v1/field/spool/{self.SPOOL_EXTRA_FLOW_K}",
-                body={"name": "AFC Flow K", "field_type": "float"})
+                body={"name": "Flow K", "field_type": "float"})
         if self.SPOOL_EXTRA_CARD_UIDS not in keys:
             self._spoolman_proxy(
                 "POST", f"/v1/field/spool/{self.SPOOL_EXTRA_CARD_UIDS}",
@@ -247,8 +242,7 @@ class SpoolmanClient:
         return self._mr.get_spool(spool_id)
 
     def read_flow_k(self, spool_id):
-        """Read flow K from the afc_flow_k extra field; fall back to the legacy
-        afc_flow_k=<value> comment tag for spools not yet migrated."""
+        """Read flow K from the 'flow_k' extra field."""
         spool = self.get_spool(spool_id)
         if not spool:
             return None
@@ -258,32 +252,18 @@ class SpoolmanClient:
                 return float(json.loads(raw))
             except (ValueError, TypeError):
                 pass
-        # Migration fallback: old comment tag.
-        m = re.search(r'\b' + self.SPOOLMAN_FLOW_K_TAG + r'=([\d.]+)',
-                      spool.get("comment") or "")
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                return None
         return None
 
     def write_flow_k(self, spool_id, k):
-        """Persist a calibrated flow K to the afc_flow_k extra field (K lives in
-        the extra field, not the comment) and strip any legacy comment tag."""
+        """Persist a calibrated flow K to the 'flow_k' extra field."""
         self._ensure_spool_fields()
         spool = self.get_spool(spool_id)
         if not spool:
             return None
         extra = dict(spool.get("extra") or {})
         extra[self.SPOOL_EXTRA_FLOW_K] = json.dumps(round(float(k), 6))
-        body = {"extra": extra}
-        comment = spool.get("comment") or ""
-        stripped = re.sub(r'\s*\b' + re.escape(self.SPOOLMAN_FLOW_K_TAG) + r'=\S*',
-                          '', comment).strip()
-        if stripped != comment:
-            body["comment"] = stripped
-        return self._spoolman_proxy("PATCH", f"/v1/spool/{spool_id}", body=body)
+        return self._spoolman_proxy(
+            "PATCH", f"/v1/spool/{spool_id}", body={"extra": extra})
 
 # Max RGB Euclidean distance for two spool colours to be the SAME filament.
 # 0.0 = exact hex match (different colours -> different spools). Raise a little
@@ -609,10 +589,9 @@ def _norm_uid(uid) -> str:
     return re.sub(r'[\s:_\-]', '', str(uid or '')).strip().upper()
 
 
-# Spool UID extra-field keys, captured from the client class at import so this
+# Spool UID extra-field key, captured from the client class at import so this
 # doesn't depend on the global SpoolmanClient name at call time.
 _CARD_UIDS_FIELD = SpoolmanClient.SPOOL_EXTRA_CARD_UIDS
-_LEGACY_UID_FIELD = SpoolmanClient.SPOOL_EXTRA_UID_LEGACY
 
 
 def _decode_extra(extra, key):
@@ -628,8 +607,7 @@ def _decode_extra(extra, key):
 
 def _spool_uids(spool: dict) -> set:
     """Set of normalized NFC UIDs stored on a spool: the 'card_uids'
-    comma-separated list (Snapmaker-Extended convention) plus the legacy single
-    'afc_rfid_uid' field (read for migration)."""
+    comma-separated list (Snapmaker-Extended convention)."""
     extra = spool.get("extra") or {}
     uids = set()
     val = _decode_extra(extra, _CARD_UIDS_FIELD)
@@ -638,19 +616,14 @@ def _spool_uids(spool: dict) -> set:
             n = _norm_uid(part)
             if n:
                 uids.add(n)
-    legacy = _decode_extra(extra, _LEGACY_UID_FIELD)
-    if legacy is not None:
-        n = _norm_uid(legacy)
-        if n:
-            uids.add(n)
     return uids
 
 
 def find_spool_by_uid(client, uid):
     """Find the Spoolman spool that carries this NFC tag UID (in its 'card_uids'
-    list, or the legacy field). The UID is the primary identity of a physical
-    spool: if it matches, it IS that spool. Spoolman can't query extra fields, so
-    we scan all spools once. Returns the spool dict or None.
+    list). The UID is the primary identity of a physical spool: if it matches, it
+    IS that spool. Spoolman can't query extra fields, so we scan all spools once.
+    Returns the spool dict or None.
     """
     target = _norm_uid(uid)
     if not target:
@@ -663,6 +636,36 @@ def find_spool_by_uid(client, uid):
         if target in _spool_uids(s):
             return s
     return None
+
+
+def find_spool_by_sku(client, sku):
+    """Find an existing Spoolman spool for a product SKU (filament
+    article_number). For readers that DON'T expose a per-tag UID (e.g. the ACE
+    Pro, which reports SKU/material but no unique tag id) the spool can't be
+    uniquely identified, so bind to the fullest non-archived spool of that exact
+    product. Returns the spool dict or None."""
+    if not sku:
+        return None
+    try:
+        filaments = client.search_filaments(article_number=sku)
+    except Exception:
+        return None
+    fids = [f.get("id") for f in filaments
+            if f.get("article_number", "") == sku and f.get("id") is not None]
+    best, best_remaining = None, -1.0
+    for fid in fids:
+        try:
+            spools = client.search_spools(filament_id=fid)
+        except Exception:
+            continue
+        for s in spools:
+            if s.get("archived"):
+                continue
+            rem = s.get("remaining_weight")
+            rem = float(rem) if rem is not None else 0.0
+            if rem > best_remaining:
+                best, best_remaining = s, rem
+    return best
 
 
 def density_for_material(material: str) -> float:
@@ -851,11 +854,13 @@ def sync_rfid_to_spoolman(afc, lane, slot_info: dict, logger, prefix: str,
                           spool_weight=None):
     """Sync an RFID tag to Spoolman, keyed on the tag UID.
 
-    The tag UID is unique per physical spool and is the ONLY spool-match
+    The tag UID is unique per physical spool and is the primary spool-match
     criterion: if a Spoolman spool already carries this UID, bind to it;
-    otherwise it is a new spool. When creating, the filament (product) is
-    resolved by exact SKU so spools of the same product share one filament
-    definition; a new filament is created only when there's no SKU match.
+    otherwise it is a new spool. Readers that don't expose a per-tag UID (e.g.
+    the ACE Pro) fall back to matching by exact product SKU. When creating, the
+    filament (product) is resolved by exact SKU so spools of the same product
+    share one filament definition; a new filament is created only when there's
+    no SKU match.
 
     :param afc: AFC main object (needs .spoolman, .moonraker, .spool).
     :param lane: Lane to assign the spool to.
@@ -902,11 +907,22 @@ def sync_rfid_to_spoolman(afc, lane, slot_info: dict, logger, prefix: str,
             logger.info(f"{prefix}: matched spool #{spool.get('id')} "
                         f"by tag UID {scanned_uid}")
 
+        if spool is None and not scanned_uid and sku:
+            # No tag UID (e.g. ACE Pro exposes SKU but no per-tag UID): fall back
+            # to matching by exact product SKU and bind to an existing spool of
+            # that product. The UID path above stays strict.
+            spool = find_spool_by_sku(moonraker, sku)
+            filament = (spool.get("filament") or None) if spool else filament
+            if spool is not None:
+                logger.info(f"{prefix}: matched spool #{spool.get('id')} "
+                            f"by SKU {sku} (no tag UID)")
+
         if spool is None:
-            # Unseen UID. Only create when permitted AND the tag carries a UID
-            # (without one the spool can't be re-identified). Otherwise leave the
+            # Still unmatched. Create only when permitted AND the spool can be
+            # re-identified on a later insert — by a tag UID, or (for no-UID
+            # readers like the ACE Pro) by its product SKU. Otherwise leave the
             # lane on the values apply_filament_defaults already set.
-            if not (allow_create and scanned_uid):
+            if not (allow_create and (scanned_uid or sku)):
                 return
             if not sku and not material:
                 return
@@ -994,7 +1010,7 @@ def sync_rfid_to_spoolman(afc, lane, slot_info: dict, logger, prefix: str,
 
         spool_id = spool.get("id")
 
-        # Stamp tag metadata: manufacturing date -> lot_nr, UID -> afc_rfid_uid.
+        # Stamp tag metadata: manufacturing date -> lot_nr, UID -> card_uids.
         try:
             mfg_date = slot_info.get("mfg_date")
             uid = slot_info.get("uid")

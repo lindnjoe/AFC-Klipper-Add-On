@@ -784,7 +784,7 @@ class AFC_U1_RFID:
             "extruder_temp": ext_temp,
             "bed_temp": int(bed_max) if bed_max else None,
             # Tag metadata for Spoolman: manufacturing date -> lot_nr, card UID
-            # -> afc_rfid_uid extra field. (MF_DATE is reliable on the OpenRFID
+            # -> card_uids extra field. (MF_DATE is reliable on the OpenRFID
             # webhook path; the filament_detect path often reports it unset.)
             "mfg_date": self._fmt_mfg_date(info.get("MF_DATE")),
             "uid": self._fmt_uid(info.get("CARD_UID")),
