@@ -135,8 +135,16 @@ copy_unit_files() {
     safe_copy "${afc_path}/templates/AFC_AMS_1.cfg" "${afc_config_dir}/AFC_AMS_1.cfg"
     ;;
 
+  "EMU")
+    export boxturtle_name="EMU_1"
+    safe_copy "${afc_path}/templates/AFC_Hardware-AFC.cfg" "${afc_config_dir}/AFC_Hardware.cfg"
+    generate_emu_config "$boxturtle_name" "$emu_num_lanes"
+    ;;
+
 esac
 }
+
+
 
 install_afc() {
   # Link the python extensions
@@ -253,6 +261,12 @@ elif [ "$installation_type" == "ViViD" ]; then
 - Ensure you enter your serial information in the ${afc_config_dir}/AFC_Vivid_1.cfg file
 
 - Review the ${afc_config_dir}/AFC_Hardware.cfg file to reference the proper buffer configuration and pins.
+  """
+elif [ "$installation_type" == "EMU" ]; then
+  message+="""
+- Ensure you enter either your CAN bus or serial information for each lane in the ${afc_config_dir}/AFC_${boxturtle_name}.cfg file
+
+- The MCU board_pins configuration is at ${afc_config_dir}/mcu/EMU_${boxturtle_name}.cfg
   """
 fi
 
