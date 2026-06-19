@@ -35,7 +35,9 @@ except: raise error(ERROR_STR.format(import_lib="AFC_assist", trace=traceback.fo
 try: from extras.AFC_stats import AFCStats_var
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-EXCLUDE_TYPES = ["HTLF", "ViViD"]
+# Unit types that only have load switch
+ONLY_LOAD_TYPES = ["HTLF", "Claymore"]
+EXCLUDE_TYPES = ONLY_LOAD_TYPES + [ "ViViD"]
 # Class for holding different states so its clear what all valid states are
 
 # Names to exclude from search when trying to find unit name in config file
@@ -885,11 +887,16 @@ class AFCLane:
         """
         warn = AFCMoveWarning.NONE
         extruder_stepper = getattr(self, "extruder_stepper", None)
+        drive_stepper_assist = None
         if (self.drive_stepper
             or extruder_stepper):
             if use_homing:
                 if self.drive_stepper:
                     home_to = self.drive_stepper.home_to
+                    # Capturing driver stepper assist_move method and replacing with lanes
+                    # assist move so spooler motors are driven when using drive/stepper based units
+                    drive_stepper_assist= self.drive_stepper.assist_move
+                    self.drive_stepper.assist_move = self.assist_move
                 else:
                     home_to = self.home_to
                 # Add extra distance to homing move to guarantee that endstop is hit
@@ -898,9 +905,15 @@ class AFCLane:
                     new_distance = distance - self.homing_overshoot
                 self.unit_obj.select_lane(self)
                 speed, accel = self.get_speed_accel(speed_mode)
-                homed, mov_dis, error = home_to(endstop, new_distance, speed, accel,
-                        distance > 0, assist_active=self.get_active_assist(distance, assist_active)
-                )
+                try:
+                    homed, mov_dis, error = home_to(endstop, new_distance, speed, accel,
+                            distance > 0, assist_active=self.get_active_assist(distance,
+                                                                               assist_active)
+                    )
+                finally:
+                    # Restoring drive stepper assist move method
+                    if drive_stepper_assist:
+                        self.drive_stepper.assist_move = drive_stepper_assist
                 if error:
                     warn = AFCMoveWarning.ERROR
                 elif (abs(distance) - mov_dis) > self.homing_delta:
@@ -1058,7 +1071,8 @@ class AFCLane:
 
     def load_callback(self, eventtime, state):
         self._load_state = state
-        if self.printer.state_message == 'Printer is ready' and self.unit_obj.type == "HTLF":
+        if (self.printer.state_message == 'Printer is ready'
+            and self.unit_obj.type in ONLY_LOAD_TYPES):
             self.prep_state = state
 
     def handle_load_runout(self, eventtime, load_state):
@@ -1078,9 +1092,9 @@ class AFCLane:
         except:
             self.load_debounce_button._old_note_filament_present(eventtime, load_state)
 
-        if (self.printer.state_message == 'Printer is ready' and
-            self.unit_obj.type == "HTLF" and
-            True == self._afc_prep_done):
+        if (self.printer.state_message == 'Printer is ready'
+            and self.unit_obj.type in ONLY_LOAD_TYPES
+            and True == self._afc_prep_done):
             if load_state:
                 self.set_loaded()
 
