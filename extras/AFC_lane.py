@@ -123,10 +123,12 @@ class AFCLane:
         self.tool_loaded        = False
         self.loaded_to_hub      = False
         self.spool_id           = None
-        self.color              = None
-        self.weight             = 0
+        self.color: str         = ""
+        self.multi_color: list  = []
+        self.spool_vendor       = ""
+        self.weight: float      = 0.
         self.auto_switch_triggered = False
-        self._material          = None
+        self._material: str     = None
         self.extruder_temp      = None
         self.bed_temp           = None
         self.td1_data           = {}
@@ -1459,6 +1461,7 @@ class AFCLane:
         if normal_toolchange:
             self.afc.current_loading = None
             self.afc.spool.set_active_spool(self.spool_id)
+        self.afc.spool.set_snapmaker_filament_params(self)
 
         self.unit_obj.lane_tool_loaded(self)
 
@@ -2126,6 +2129,9 @@ class AFCLane:
         response["remember_spool"]= bool(self.remember_spool)
         response["spool_id"]= int(self.spool_id) if self.spool_id else None
         response["color"]=self.color
+        if not save_to_file:
+            response["multi_color_hexes"] = self.multi_color
+
         response["weight"]=self.weight
         response["extruder_temp"] = self.extruder_temp
         response["bed_temp"] = self.bed_temp
