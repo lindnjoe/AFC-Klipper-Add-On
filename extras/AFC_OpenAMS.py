@@ -591,6 +591,15 @@ class afcAMS(afcUnit):
             # Same-FPS runout tracking — blocks sensor noise during reload
             lane._oams_runout_detected = False
 
+    def handle_ready(self):
+        # TODO: look into this, maybe this can be removed and update the load sensors correctly
+        # and use the virtual hub like the vivid
+        super().handle_ready()
+        for lane in self.lanes:
+            if hasattr(lane, "hub_obj"):
+                lane.hub_obj.set_state_driven()
+
+
     def _init_follower_and_monitor(self):
         """Set up follower motor controller and stuck/clog monitor."""
         if self.oams is None:

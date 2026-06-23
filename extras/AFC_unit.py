@@ -41,6 +41,8 @@ CALI_WARN = "The following lanes ({lanes}) have already been calibrated, if you 
 CALI_WARN += "with calibration then the filament for selected lanes will be ejected. "
 CALI_WARN += "Once filament is reinserted, then lanes will be calibrated.\n"
 
+SENSORLESS_UNITS = ["OpenAMS", "ACE"]
+
 class afcUnit:
     HOMING_DELTA = 300  # Delta for which to warn if homing move delta is not within this amount from
                         # command move distance.

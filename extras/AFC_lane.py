@@ -521,6 +521,10 @@ class AFCLane:
         :param pin: MCU pin to setup as endstop
         :param name: Name of endstop to register
         """
+        # Guarding against hub virtual pins
+        if pin is not None and pin.strip().lower() == "virtual":
+            return
+
         ppins.allow_multi_use_pin(pin.strip("!^"))
         ppins.parse_pin(pin, True, True)
         endstop = ppins.setup_pin('endstop', pin)

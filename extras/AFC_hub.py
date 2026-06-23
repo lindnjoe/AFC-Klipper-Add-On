@@ -16,6 +16,9 @@ except: raise config_error("Error when trying to import AFC_utils.ERROR_STR\n{tr
 try: from extras.AFC_utils import add_filament_switch
 except: raise config_error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.format_exc()))
 
+try: from extras.AFC_unit import SENSORLESS_UNITS
+except: raise config_error(ERROR_STR.format(import_lib="AFC_unit", trace=traceback.format_exc()))
+
 if TYPE_CHECKING:
     from extras.AFC_lane import AFCLane
 
@@ -23,6 +26,7 @@ class afc_hub:
     def __init__(self, config):
         self.printer    = config.get_printer()
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
         self.afc        = self.printer.load_object(config, 'AFC')
         self.reactor    = self.printer.get_reactor()
 
@@ -32,6 +36,7 @@ class afc_hub:
         self.unit = None
         self.lanes: Dict[str, AFCLane] = {}
         self._state: bool = False
+        self._state_driven = False
 
         self.switch_pin = config.get('switch_pin', None)
         # HUB Cut variables
@@ -114,11 +119,15 @@ class afc_hub:
 
         self.printer.send_event("afc_hub:register_macros", self)
 
+    def handle_ready(self):
         if self.is_virtual_pin():
             msg = "The following lanes need load sensors for virtual hub sensor to work correctly:"
             report_error = False
             for lane in self.lanes.values():
-                if lane.load is None:
+                if lane.unit_obj.type in SENSORLESS_UNITS:
+                    continue
+                if (lane.load is None
+                    and lane.prep is not None):
                     report_error = True
                     msg += f"\n{lane.fullname}"
 
@@ -132,9 +141,13 @@ class afc_hub:
         sensor is triggered.
         """
         state = self._state
-        if self.is_virtual_pin():
+        if (self.is_virtual_pin()
+            and not self._state_driven):
             state = any(lane.raw_load_state for lane in self.lanes.values())
         return state
+
+    def set_state_driven(self):
+        self._state_driven = True
 
     def switch_pin_callback(self, eventtime, state):
         self._state = state

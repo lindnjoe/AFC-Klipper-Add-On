@@ -43,70 +43,73 @@ from __future__ import annotations
 
 def _patch_afc_lane_virtual_hub():
     """1. AFC_lane: don't set up a homing endstop on a 'virtual' hub pin."""
-    try:
-        from extras import AFC_lane as _lane_mod
-    except Exception:
-        return
-    LaneCls = getattr(_lane_mod, 'AFCLane', None)
-    if LaneCls is None or getattr(LaneCls, '_afc_virtual_hub_patched', False):
-        return
-    _orig = LaneCls._set_homing_endstop
+    return
+    # try:
+    #     from extras import AFC_lane as _lane_mod
+    # except Exception:
+    #     return
+    # LaneCls = getattr(_lane_mod, 'AFCLane', None)
+    # if LaneCls is None or getattr(LaneCls, '_afc_virtual_hub_patched', False):
+    #     return
+    # _orig = LaneCls._set_homing_endstop
 
-    def _guarded(self, query_endstops, ppins, pin, name):
-        if pin is not None and str(pin).strip().lower() == "virtual":
-            return  # virtual hub has no physical pin; no homing endstop
-        return _orig(self, query_endstops, ppins, pin, name)
+    # def _guarded(self, query_endstops, ppins, pin, name):
+    #     if pin is not None and str(pin).strip().lower() == "virtual":
+    #         return  # virtual hub has no physical pin; no homing endstop
+    #     return _orig(self, query_endstops, ppins, pin, name)
 
-    LaneCls._set_homing_endstop = _guarded
-    LaneCls._afc_virtual_hub_patched = True
+    # LaneCls._set_homing_endstop = _guarded
+    # LaneCls._afc_virtual_hub_patched = True
 
 
 def _patch_afc_buffer_steppermless():
     """2. AFC_buffer: skip the fault timer for lanes with no extruder_stepper."""
-    try:
-        from extras import AFC_buffer as _buf_mod
-    except Exception:
-        return
-    BufCls = getattr(_buf_mod, 'AFCTrigger', None)
-    if BufCls is None or getattr(BufCls, '_afc_steppermless_patched', False):
-        return
-    _timeout = getattr(_buf_mod, 'CHECK_RUNOUT_TIMEOUT', 0.5)
-    _orig = BufCls.extruder_pos_update_event
+    return
+    # try:
+    #     from extras import AFC_buffer as _buf_mod
+    # except Exception:
+    #     return
+    # BufCls = getattr(_buf_mod, 'AFCTrigger', None)
+    # if BufCls is None or getattr(BufCls, '_afc_steppermless_patched', False):
+    #     return
+    # _timeout = getattr(_buf_mod, 'CHECK_RUNOUT_TIMEOUT', 0.5)
+    # _orig = BufCls.extruder_pos_update_event
 
-    def _guarded(self, eventtime):
-        cur = self.current_lane
-        if cur is not None and getattr(cur, 'extruder_stepper', None) is None:
-            return eventtime + _timeout  # no stepper to track; skip fault check
-        return _orig(self, eventtime)
+    # def _guarded(self, eventtime):
+    #     cur = self.current_lane
+    #     if cur is not None and getattr(cur, 'extruder_stepper', None) is None:
+    #         return eventtime + _timeout  # no stepper to track; skip fault check
+    #     return _orig(self, eventtime)
 
-    BufCls.extruder_pos_update_event = _guarded
-    BufCls._afc_steppermless_patched = True
+    # BufCls.extruder_pos_update_event = _guarded
+    # BufCls._afc_steppermless_patched = True
 
 
 def _patch_afc_hub_virtual_state():
     """3. AFC_hub: a driven virtual hub reports _state (hub HES), not F1S."""
-    try:
-        from extras import AFC_hub as _hub_mod
-    except Exception:
-        return
-    HubCls = getattr(_hub_mod, 'afc_hub', None)
-    if HubCls is None or getattr(HubCls, '_afc_virtual_state_patched', False):
-        return
-    _orig_prop = HubCls.state
-    _orig_cb = HubCls.switch_pin_callback
+    return
+    # try:
+    #     from extras import AFC_hub as _hub_mod
+    # except Exception:
+    #     return
+    # HubCls = getattr(_hub_mod, 'afc_hub', None)
+    # if HubCls is None or getattr(HubCls, '_afc_virtual_state_patched', False):
+    #     return
+    # _orig_prop = HubCls.state
+    # _orig_cb = HubCls.switch_pin_callback
 
-    def _state_getter(self):
-        if self.is_virtual_pin() and getattr(self, '_state_driven', False):
-            return bool(self._state)
-        return _orig_prop.fget(self)
+    # def _state_getter(self):
+    #     if self.is_virtual_pin() and getattr(self, '_state_driven', False):
+    #         return bool(self._state)
+    #     return _orig_prop.fget(self)
 
-    def _cb(self, eventtime, state):
-        self._state_driven = True
-        return _orig_cb(self, eventtime, state)
+    # def _cb(self, eventtime, state):
+    #     self._state_driven = True
+    #     return _orig_cb(self, eventtime, state)
 
-    HubCls.state = property(_state_getter)
-    HubCls.switch_pin_callback = _cb
-    HubCls._afc_virtual_state_patched = True
+    # HubCls.state = property(_state_getter)
+    # HubCls.switch_pin_callback = _cb
+    # HubCls._afc_virtual_state_patched = True
 
 
 def _patch_afc_unload_shared_phase():
@@ -131,9 +134,9 @@ def _patch_afc_unload_shared_phase():
 
     def _afc_shared_toolhead_unload(self, cur_lane, cur_extruder):
         # lane_unloading: LED + (ACE/OpenAMS) follower/assist stop.
-        cur_lane.unit_obj.lane_unloading(cur_lane)
-        if self._check_extruder_temp(cur_lane):
-            self.afcDeltaTime.log_with_time("Done heating toolhead")
+        # cur_lane.unit_obj.lane_unloading(cur_lane)
+        # if self._check_extruder_temp(cur_lane):
+        #     self.afcDeltaTime.log_with_time("Done heating toolhead")
         self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
                         wait_tool=False)
         cur_lane.disable_buffer()
@@ -167,28 +170,28 @@ def _patch_afc_unload_shared_phase():
         # Upstream runs post_unload_macro only in the stepper branch, so a custom
         # unload skips it (e.g. SNAPMAKER_EXIT_DISCARD_BIN). Run it here, after
         # the transport. (The load side already runs post_load_macro for both.)
-        if is_custom and self.post_unload_macro is not None:
-            try:
-                self.gcode.run_script_from_command(self.post_unload_macro)
-            except Exception as e:
-                self.logger.error("AFC post_unload_macro error: %s" % e)
+        # if is_custom and self.post_unload_macro is not None:
+        #     try:
+        #         self.gcode.run_script_from_command(self.post_unload_macro)
+        #     except Exception as e:
+        #         self.logger.error("AFC post_unload_macro error: %s" % e)
         return result
 
-    def _wrapped_load(self, cur_lane, cur_hub, cur_extruder):
-        # Upstream's custom_load_cmd branch skips _check_extruder_temp (only the
-        # stepper branch heats), so the post-load poop/purge runs cold. Heat
-        # (and wait) here before the custom transport.
-        if cur_lane.custom_load_cmd:
-            try:
-                if self._check_extruder_temp(cur_lane):
-                    self.afcDeltaTime.log_with_time("Done heating toolhead")
-            except Exception as e:
-                self.logger.error("AFC custom-load heat error: %s" % e)
-        return _orig_load(self, cur_lane, cur_hub, cur_extruder)
+    # def _wrapped_load(self, cur_lane, cur_hub, cur_extruder):
+    #     # Upstream's custom_load_cmd branch skips _check_extruder_temp (only the
+    #     # stepper branch heats), so the post-load poop/purge runs cold. Heat
+    #     # (and wait) here before the custom transport.
+    #     if cur_lane.custom_load_cmd:
+    #         try:
+    #             if self._check_extruder_temp(cur_lane):
+    #                 self.afcDeltaTime.log_with_time("Done heating toolhead")
+    #         except Exception as e:
+    #             self.logger.error("AFC custom-load heat error: %s" % e)
+    #     return _orig_load(self, cur_lane, cur_hub, cur_extruder)
 
     AFCcls._afc_shared_toolhead_unload = _afc_shared_toolhead_unload
     AFCcls.unload_sequence = _wrapped_unload
-    AFCcls.load_sequence = _wrapped_load
+    # AFCcls.load_sequence = _wrapped_load
     AFCcls._afc_custom_unload_phase_patched = True
 
 
@@ -211,37 +214,39 @@ def _patch_afc_bowden_serial_unit():
     run its self-contained calibration without editing upstream. The guard value
     is never consumed past the check on this path, and
     our serial calibrate_bowden implementations ignore tool_start entirely."""
-    try:
-        from extras import AFC_functions as _fn_mod
-    except Exception:
-        return
-    FnCls = getattr(_fn_mod, 'afcFunction', None)
-    if FnCls is None or getattr(FnCls, '_afc_bowden_serial_patched', False):
-        return
-    _orig = FnCls.cmd_CALIBRATE_AFC
-    _SENTINEL = "__afc_compat_serial_cal__"
 
-    def _wrapped(self, gcmd):
-        afc_bl = gcmd.get('BOWDEN', None)
-        cur_lane = self.afc.lanes.get(afc_bl) if afc_bl is not None else None
-        # Only step in for a steppermless serial lane whose extruder has no
-        # tool_start sensor (the exact case upstream wrongly rejects).
-        bypass = (cur_lane is not None
-                  and getattr(cur_lane, 'extruder_stepper', None) is None
-                  and getattr(cur_lane.extruder_obj, 'tool_start', None) is None)
-        if not bypass:
-            return _orig(self, gcmd)
-        ext = cur_lane.extruder_obj
-        ext.tool_start = _SENTINEL  # skip upstream's tool_start guard block
-        try:
-            return _orig(self, gcmd)
-        finally:
-            # Upstream never touches tool_start on this path; restore our None.
-            if ext.tool_start == _SENTINEL:
-                ext.tool_start = None
+    # Should not need this anymore, this must be an old check
+    # try:
+    #     from extras import AFC_functions as _fn_mod
+    # except Exception:
+    #     return
+    # FnCls = getattr(_fn_mod, 'afcFunction', None)
+    # if FnCls is None or getattr(FnCls, '_afc_bowden_serial_patched', False):
+    #     return
+    # _orig = FnCls.cmd_CALIBRATE_AFC
+    # _SENTINEL = "__afc_compat_serial_cal__"
 
-    FnCls.cmd_CALIBRATE_AFC = _wrapped
-    FnCls._afc_bowden_serial_patched = True
+    # def _wrapped(self, gcmd):
+    #     afc_bl = gcmd.get('BOWDEN', None)
+    #     cur_lane = self.afc.lanes.get(afc_bl) if afc_bl is not None else None
+    #     # Only step in for a steppermless serial lane whose extruder has no
+    #     # tool_start sensor (the exact case upstream wrongly rejects).
+    #     bypass = (cur_lane is not None
+    #               and getattr(cur_lane, 'extruder_stepper', None) is None
+    #               and getattr(cur_lane.extruder_obj, 'tool_start', None) is None)
+    #     if not bypass:
+    #         return _orig(self, gcmd)
+    #     ext = cur_lane.extruder_obj
+    #     ext.tool_start = _SENTINEL  # skip upstream's tool_start guard block
+    #     try:
+    #         return _orig(self, gcmd)
+    #     finally:
+    #         # Upstream never touches tool_start on this path; restore our None.
+    #         if ext.tool_start == _SENTINEL:
+    #             ext.tool_start = None
+
+    # FnCls.cmd_CALIBRATE_AFC = _wrapped
+    # FnCls._afc_bowden_serial_patched = True
 
 
 def _patch_afc_lane_load_runout():
@@ -367,6 +372,7 @@ def _patch_afc_unit_filament_hooks():
     if UnitCls is None or getattr(UnitCls, '_afc_filament_hooks_patched', False):
         return
 
+    # Bring over later
     if not hasattr(UnitCls, 'on_filament_insert'):
         def on_filament_insert(self, lane):
             # Fired after set_loaded() when filament is newly detected; the U1
@@ -395,45 +401,46 @@ def _patch_afc_hub_virtual_load_check():
     that has a prep switch but no load switch genuinely can't drive the virtual
     hub). This also makes the check order-independent: upstream only passed when
     a hub's handle_connect happened to run before its lanes registered."""
-    try:
-        from extras import AFC_hub as _hub_mod
-    except Exception:
-        return
-    HubCls = getattr(_hub_mod, 'afc_hub', None)
-    if HubCls is None or getattr(HubCls, '_afc_virtual_load_check_patched', False):
-        return
-    _config_error = getattr(_hub_mod, 'config_error', None)
+    return
+    # try:
+    #     from extras import AFC_hub as _hub_mod
+    # except Exception:
+    #     return
+    # HubCls = getattr(_hub_mod, 'afc_hub', None)
+    # if HubCls is None or getattr(HubCls, '_afc_virtual_load_check_patched', False):
+    #     return
+    # _config_error = getattr(_hub_mod, 'config_error', None)
 
-    def handle_connect(self):
-        self.gcode = self.afc.gcode
-        self.reactor = self.afc.reactor
-        self.printer.send_event("afc_hub:register_macros", self)
-        if self.is_virtual_pin():
-            msg = ("The following lanes need load sensors for virtual hub "
-                   "sensor to work correctly:")
-            report_error = False
-            for lane in self.lanes.values():
-                # Only a lane that HAS a prep switch but NO load switch breaks a
-                # virtual hub; fully sensorless serial lanes are fine.
-                if lane.load is None and lane.prep is not None:
-                    report_error = True
-                    msg += "\n%s" % lane.fullname
-            if report_error:
-                err = _config_error or self.printer.config_error
-                raise err(msg)
+    # def handle_connect(self):
+    #     self.gcode = self.afc.gcode
+    #     self.reactor = self.afc.reactor
+    #     self.printer.send_event("afc_hub:register_macros", self)
+    #     if self.is_virtual_pin():
+    #         msg = ("The following lanes need load sensors for virtual hub "
+    #                "sensor to work correctly:")
+    #         report_error = False
+    #         for lane in self.lanes.values():
+    #             # Only a lane that HAS a prep switch but NO load switch breaks a
+    #             # virtual hub; fully sensorless serial lanes are fine.
+    #             if lane.load is None and lane.prep is not None:
+    #                 report_error = True
+    #                 msg += "\n%s" % lane.fullname
+    #         if report_error:
+    #             err = _config_error or self.printer.config_error
+    #             raise err(msg)
 
-    HubCls.handle_connect = handle_connect
-    HubCls._afc_virtual_load_check_patched = True
+    # HubCls.handle_connect = handle_connect
+    # HubCls._afc_virtual_load_check_patched = True
 
 
 def apply_compat_patches():
     """Apply all AFC compatibility shims. Idempotent; safe to call repeatedly
     and from multiple unit modules."""
-    _patch_afc_lane_virtual_hub()
-    _patch_afc_buffer_steppermless()
-    _patch_afc_hub_virtual_state()
+    # _patch_afc_lane_virtual_hub()
+    # _patch_afc_buffer_steppermless()
+    # _patch_afc_hub_virtual_state()
     _patch_afc_unload_shared_phase()
-    _patch_afc_bowden_serial_unit()
+    # _patch_afc_bowden_serial_unit()
     _patch_afc_lane_load_runout()
     _patch_afc_unit_filament_hooks()
-    _patch_afc_hub_virtual_load_check()
+    # _patch_afc_hub_virtual_load_check()

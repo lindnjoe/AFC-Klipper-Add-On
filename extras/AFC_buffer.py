@@ -159,9 +159,18 @@ class AFCTrigger:
         Set up the fault detection timer and initialize error position tracking.
         """
         self.update_filament_error_pos()
+
+        # Check for stepper less motors
+        not_stepperless = bool(self.current_lane
+                               and getattr(self.current_lane, "extruder_stepper", None))
+
         # register timer that will run to check buffer state changes
-        if self.extruder_pos_timer is None:
+        if (self.extruder_pos_timer is None
+            and not_stepperless
+            ):
             self.extruder_pos_timer = self.reactor.register_timer(self.extruder_pos_update_event)
+        else:
+            self.logger.info("Stepperless unit not setting setup fault timer, remove before pushing to dev")
 
     def start_fault_timer(self, print_time):
         """
