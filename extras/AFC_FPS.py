@@ -613,7 +613,7 @@ class AFCFPSBuffer:
             # Restore the last multiplier for this extruder if the same lane
             # is coming back (tool change with no spool swap). If a different
             # lane is on this extruder, it's a new spool — start fresh at 1.0.
-            extruder_name = getattr(lane, 'extruder_name', None)
+            extruder_name = getattr(lane, 'afc_extruder_name', None)
             saved = self._saved_multipliers.get(extruder_name) if extruder_name else None
             if saved is not None and saved[0] == lane.name and saved[1] != 1.0:
                 self.set_multiplier(saved[1])
@@ -656,7 +656,7 @@ class AFCFPSBuffer:
         # Save the last multiplier for this extruder/lane so it can be
         # restored on the next tool change back to this same lane.
         if self._lane_has_rotation_control(self.current_lane):
-            extruder_name = getattr(self.current_lane, 'extruder_name', None)
+            extruder_name = getattr(self.current_lane, 'afc_extruder_name', None)
             if extruder_name:
                 self._saved_multipliers[extruder_name] = (
                     self.current_lane.name, self._last_multiplier
@@ -772,7 +772,7 @@ class AFCFPSBuffer:
 
         if cur_lane is not None:
             active_extruder = self.afc.toolhead.get_extruder()
-            lane_extruder_name = getattr(cur_lane, 'extruder_name', None)
+            lane_extruder_name = getattr(cur_lane, 'afc_extruder_name', None)
             if (lane_extruder_name
                     and hasattr(active_extruder, 'name')
                     and active_extruder.name != lane_extruder_name):

@@ -44,7 +44,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.1.18"
+AFC_VERSION="1.1.22"
 
 # Class for holding different states so its clear what all valid states are
 class State:
@@ -68,6 +68,7 @@ class afc:
         self.reactor = self.printer.get_reactor()
         self.webhooks = self.printer.load_object(config, 'webhooks')
         self.printer.register_event_handler("klippy:connect",self.handle_connect)
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
         self.logger  = AFC_logger(self.printer, self)
 
         self.spool: AFCSpool = self.printer.load_object(config, 'AFC_spool')
@@ -442,6 +443,53 @@ class afc:
         self._rename_macros()
 
         self.current_state = State.IDLE
+
+    def handle_ready(self):
+        """
+        Handle the ready event.
+
+        Sorts units base on lane numbering so that units/lanes show up in fluidd/mainsail panels
+        in the correct order.
+        """
+        def natural_lane_num(key: int, lane: AFCLane):
+            """
+            Helper function for returning lane number, if lane name matches extruder name then this
+            is a standalone toolhead and returns 9999 to force Tools to the bottom of this list
+
+            :param key: Key name to extract number from
+            :param lane: AFCLane to check if its extruder name matches its name
+            :return int: Lane integer if not standalone lane, 9999 if standalone lane
+            """
+            if lane.extruder_obj.name == lane.name:
+                return 9999
+
+            m = re.search(r'\d+', key)
+            return int(m.group()) if m else 9999
+
+        def unit_min_lane(unit_dict: dict):
+            """
+            Helper function for getting minimum lane number found in unit
+
+            :param unit_dict: Units lane dictionary to extract lane numbers from
+            :return int: Minimum integer found in units lanes, if no list returns float("inf")
+            """
+            nums = [
+                natural_lane_num(k, lanes) for k, lanes in unit_dict.lanes.items()
+            ]
+
+            minimum = float("inf")
+            if nums:
+                minimum = min(nums)
+            return minimum
+
+        sorted_units = dict(
+            sorted(
+                self.units.items(),
+                key=lambda x: unit_min_lane(x[1])
+            )
+        )
+
+        self.units = sorted_units
 
     def _rename_macros(self):
         self.function._rename(self.BASE_M104, self.RENAMED_M104, self.cmd_AFC_M104, self.cmd_AFC_M104_help)
@@ -1321,7 +1369,7 @@ class afc:
         self.function.check_absolute_mode("TOOL_LOAD")
 
         # If the current extruder is not the one associated with the lane, switch to it.
-        if self.function.get_current_extruder() != cur_lane.extruder_obj.name:
+        if self.function.get_current_extruder() != cur_lane.extruder_obj.th_extruder_name:
             cur_lane.tool_swap()
 
         # After a tool swap the newly active extruder may already have a different lane
@@ -1740,7 +1788,7 @@ class afc:
                                     pause=self.function.in_print())
                 return False
 
-            next_extruder   = next_lane.extruder_obj.name
+            next_extruder   = next_lane.extruder_obj.th_extruder_name
             # TODO: need to check if its just a tool swap, or tool swap with a lane unload
 
             # If the next extruder is specified and it is not the current extruder, perform a tool swap.
@@ -2179,7 +2227,7 @@ class afc:
                 return
 
             self.next_lane_load = cur_lane.name
-            next_extruder = cur_lane.extruder_obj.name
+            next_extruder = cur_lane.extruder_obj.th_extruder_name
             infinite_runout: bool = cur_lane.status == AFCLaneState.INFINITE_RUNOUT
             adjusting_temperature: bool = new_extruder_temp is not None or \
                 (infinite_runout and self.function.get_current_extruder() != next_extruder)
@@ -2205,7 +2253,7 @@ class afc:
                     # Now cool down the old extruder when not doing infinite runout
                     if (_last_lane is not None
                         and not infinite_runout
-                        and _last_lane.extruder_obj.name != next_extruder):
+                        and _last_lane.extruder_obj.th_extruder_name != next_extruder):
                         self._cooldown_last_extruder(_last_lane.extruder_obj, infinite_runout)
 
             # If the requested lane is not the current lane, proceed with the tool change.
@@ -2248,7 +2296,7 @@ class afc:
                     # TOOL_UNLOAD should now be done
                     if (_last_lane is not None
                         and infinite_runout
-                        and _last_lane.extruder_obj.name != next_extruder):
+                        and _last_lane.extruder_obj.th_extruder_name != next_extruder):
                         self._cooldown_last_extruder(_last_lane.extruder_obj, infinite_runout)
 
                     self.logger.info("Heating and waiting for {} for {}".format(next_extruder_obj.name,
@@ -2354,7 +2402,7 @@ class afc:
         str['units'] = list(unitdisplay)
         str['lanes'] = list(self.lanes.keys())
         str["maps"] = list(self.tool_cmds.keys())
-        str["extruders"] = list(self.tools.keys())
+        str["extruders"] = [e.name for e in self.tools.values()]
         str["hubs"] = list(self.hubs.keys())
         str["buffers"] = list(self.buffers.keys())
         str["message"] = self._get_message()
@@ -2482,12 +2530,12 @@ class afc:
             # to a different toolhead.
             if (snapmaker_param_a is not None
                 and self.snapmaker_printer):
-                extruder_name = "extruder"
+                th_extruder_name = "extruder"
                 if toolnum > 0:
-                    extruder_name = f"extruder{toolnum}"
-                self.logger.debug(f"Snapmaker Temp extruder name {extruder_name}")
+                    th_extruder_name = f"extruder{toolnum}"
+                self.logger.debug(f"Snapmaker Temp extruder name {th_extruder_name}")
 
-                extruder = self.tools.get(extruder_name, self.toolhead.get_extruder())
+                extruder = self.tools.get(th_extruder_name, self.toolhead.get_extruder())
             elif lane is not None:
                 extruder = lane.extruder_obj
 

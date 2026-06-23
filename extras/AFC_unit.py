@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import traceback
+import re
 
 from configfile import error as config_error
 from datetime import datetime, timedelta
@@ -47,6 +48,7 @@ class afcUnit:
         self.printer        = config.get_printer()
         self.gcode          = self.printer.load_object(config, 'gcode')
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
         self.printer.register_event_handler("afc:moonraker_connect", self.handle_moonraker_connect)
         self.afc: afc       = self.printer.load_object(config, 'AFC')
         self.reactor        = self.printer.get_reactor()
@@ -237,6 +239,17 @@ class afcUnit:
         self.gcode.register_mux_command('UNIT_LANE_CALIBRATION', "UNIT", self.name, self.cmd_UNIT_LANE_CALIBRATION, desc=self.cmd_UNIT_LANE_CALIBRATION_help)
         self.gcode.register_mux_command('UNIT_BOW_CALIBRATION', "UNIT", self.name, self.cmd_UNIT_BOW_CALIBRATION, desc=self.cmd_UNIT_BOW_CALIBRATION_help)
 
+    def handle_ready(self):
+        """
+        Handles klippy:ready event, sorts lanes so they they will show up in the correct
+        natural order.
+        """
+        sorted_lanes = dict(sorted(
+            self.lanes.items(),
+            key=lambda x: int(m.group()) if (m := re.search(r"\d+", x[0])) else 9999
+        ))
+        self.lanes = sorted_lanes
+
     def handle_moonraker_connect(self):
         """
         Registers macros commands after moonrakers connection has been established so that endpoint can be queried successfully
@@ -254,7 +267,7 @@ class afcUnit:
 
         for lane in self.lanes.values():
             if lane.hub is not None and not lane.is_direct_hub() and lane.hub not in response["hubs"]: response["hubs"].append(lane.hub)
-            if lane.extruder_name is not None and lane.extruder_name not in response["extruders"]: response["extruders"].append(lane.extruder_name)
+            if lane.afc_extruder_name is not None and lane.afc_extruder_name not in response["extruders"]: response["extruders"].append(lane.afc_extruder_name)
             if lane.buffer_name is not None and lane.buffer_name not in response["buffers"]: response["buffers"].append(lane.buffer_name)
 
         return response

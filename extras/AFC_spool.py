@@ -19,6 +19,7 @@ class AFCSpool:
         self.printer = config.get_printer()
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
         self.SPOOLMAN_REMOTE_METHOD = 'spoolman_set_active_spool'
+        self.print_task_config_obj = None
 
         # Temporary status variables
         self.next_spool_id      = None
@@ -60,41 +61,59 @@ class AFCSpool:
         self.gcode.register_mux_command('AFC_SET_SPOOL_TEMP',   "LANE", lane_obj.name, self.cmd_AFC_SET_SPOOL_TEMP,     desc=self.cmd_AFC_SET_SPOOL_TEMP_help)
 
     def set_snapmaker_filament_params(self, lane: AFCLane):
+        """
+        This method is only for snapmaker printers, this method updates filament color, material,
+        vendor into snapmakers print_task_config object. This is needed so that the proper filament
+        reflects correctly per toolhead on the screen UI and its needed to be able to properly resume
+        a print. Without updating these values into print_task_config object snapmakers internal
+        python logic will not resume once paused.
+
+        Logic is based off this file in u1-klipper repo:
+            https://github.com/Snapmaker/u1-klipper/blob/main/klippy/extras/print_task_config.py
+
+        :param lane: AFC lane to update correct toolhead with color, material, vendor, etc information.
+        """
         if (self.afc.snapmaker_printer
+            and self.print_task_config_obj is not None
             and lane.tool_loaded
             and lane.name == lane.extruder_obj.lane_loaded):
             try:
                 # Below could also be done with the following macro for multi color spools
                 # SET_PRINT_FILAMENT_CONFIG CONFIG_EXTRUDER=3 COLORS=123456,654321 COLOR_NUMS=2 MULTI_MODE=1
                 from extras.print_task_config import DEFAULT_PRINT_TASK_CONFIG
-                extruder_num = "0" if lane.extruder_obj.name == "extruder" else lane.extruder_obj.name[-1]
-                extruder_num = 0 if not extruder_num.isdigit() else int(extruder_num)
+                extruder_num = lane.lane_extruder_index
 
-                tmp_print_task_config = copy.deepcopy(self.print_task_config_obj.print_task_config)
+                tmp_config = copy.deepcopy(self.print_task_config_obj.print_task_config)
 
-                tmp_print_task_config['filament_vendor'][extruder_num] = "Generic"
-                tmp_print_task_config['filament_type'][extruder_num] = lane.material
-                tmp_print_task_config['filament_sub_type'][extruder_num] = None
+                tmp_config['filament_vendor'][extruder_num] = (lane.spool_vendor or "Generic")
+                tmp_config['filament_type'][extruder_num] = (
+                    lane.material
+                    or getattr(self.afc, "default_material_type", None)
+                    or "NONE"
+                )
+                tmp_config['filament_sub_type'][extruder_num] = "NONE"
 
-                tmp_print_task_config['filament_color'][extruder_num] = "FFFFFFFF"
-                tmp_print_task_config['filament_color_rgba'][extruder_num] = "FFFFFFFF"
+                tmp_config['filament_color'][extruder_num] = int("FFFFFFFF", 16)
+                tmp_config['filament_color_rgba'][extruder_num] = "FFFFFFFF"
+                tmp_config['filament_color_multi'][extruder_num]["colors"] = ["FFFFFF"]
+                tmp_config['filament_color_multi'][extruder_num]["mode"] = 0
+                tmp_config['filament_color_multi'][extruder_num]["nums"] = 1
+
                 if lane.color:
-                  tmp_print_task_config['filament_color'][extruder_num] = int(lane.color.replace('#', ''), 16) | 0xFF000000
-                  tmp_print_task_config['filament_color_rgba'][extruder_num] = lane.color.replace('#', '') + "FF"
+                    tmp_config['filament_color'][extruder_num] = int(lane.color.replace('#', ''), 16) | 0xFF000000
+                    tmp_config['filament_color_rgba'][extruder_num] = lane.color.replace('#', '') + "FF"
+                    tmp_config['filament_color_multi'][extruder_num]["colors"] = [f"{lane.color.replace('#', '')}"]
 
                 if lane.multi_color:
-                    tmp_print_task_config['filament_color_multi'][extruder_num]["nums"] = len(lane.multi_color)
-                    tmp_print_task_config['filament_color_multi'][extruder_num]["colors"] = lane.multi_color
-                    tmp_print_task_config['filament_color_multi'][extruder_num]["mode"] = 1
-                else:
-                    tmp_print_task_config['filament_color_multi'][extruder_num]["colors"] = [f"{lane.color.replace('#', '')}"]
-                    tmp_print_task_config['filament_color_multi'][extruder_num]["mode"] = 0
-                    tmp_print_task_config['filament_color_multi'][extruder_num]["nums"] = 1
-                self.print_task_config_obj.print_task_config = tmp_print_task_config
+                    tmp_config['filament_color_multi'][extruder_num]["nums"] = len(lane.multi_color)
+                    tmp_config['filament_color_multi'][extruder_num]["colors"] = lane.multi_color
+                    tmp_config['filament_color_multi'][extruder_num]["mode"] = 1
+
+                self.print_task_config_obj.print_task_config = tmp_config
                 self.printer.update_snapmaker_config_file(self.print_task_config_obj.config_path,
                                                           self.print_task_config_obj.print_task_config,
                                                           DEFAULT_PRINT_TASK_CONFIG)
-            except Exception as e:
+            except Exception:
                 self.logger.error("Error when trying to update colors for snapmaker print_task_config")
                 self.logger.debug(traceback.format_exc())
 
@@ -202,6 +221,7 @@ class AFCSpool:
             return
         cur_lane = self.afc.lanes[lane]
         cur_lane.color = '#{}'.format(color.replace('#',''))
+        cur_lane.multi_color = []
         cur_lane.send_lane_data()
         # Refresh LED only if filament is loaded — empty lanes keep their state color
         if cur_lane.load_state and cur_lane.unit in self.afc.units:
@@ -382,7 +402,7 @@ class AFCSpool:
             self.next_spool_id = None
             self.set_spoolID(cur_lane, spool_id)
 
-    def clear_values(self, cur_lane):
+    def clear_values(self, cur_lane: AFCLane):
         """
         Helper function for clearing out lane spool values
         """
@@ -395,8 +415,9 @@ class AFCSpool:
         cur_lane.extruder_temp = None
         cur_lane.bed_temp = None
         cur_lane.clear_lane_data()
+        cur_lane.spool_vendor = ""
 
-    def set_spoolID(self, cur_lane, SpoolID, save_vars=True):
+    def set_spoolID(self, cur_lane: AFCLane, SpoolID: str, save_vars=True):
         if self.afc.spoolman is not None:
             if SpoolID not in ('', None):
                 try:
@@ -414,6 +435,11 @@ class AFCSpool:
                     cur_lane.weight             = self._get_filament_values(result, 'remaining_weight')
                     cur_lane.espooler.espooler_values.full_weight = self._get_filament_values(result, 'initial_weight', default=1000)
 
+                    vendor_result  = result["filament"].get("vendor", None)
+                    cur_lane.spool_vendor       = ""
+                    if vendor_result:
+                        cur_lane.spool_vendor   = self._get_filament_values(vendor_result, "name", None)
+
                     weight_check = self.disable_weight_check
 
                     self.afc.logger.info('Weight remaining for SpoolID {}: {}'.format(SpoolID, cur_lane.weight))
@@ -429,9 +455,10 @@ class AFCSpool:
 
                     # Check to see if filament is defined as multi-color and take the first color for now
                     # Once support for multicolor is added this needs to be updated
-                    if "multi_color_hexes" in result['filament']:
-                        cur_lane.color = '#{}'.format(self._get_filament_values(result['filament'], 'multi_color_hexes').split(",")[0])
-                        cur_lane.multi_color = self._get_filament_values(result['filament'], 'multi_color_hexes').split(",")
+                    multi_color_hex = self._get_filament_values(result['filament'], 'multi_color_hexes')
+                    if multi_color_hex:
+                        cur_lane.multi_color = multi_color_hex.split(",")
+                        cur_lane.color = f"#{cur_lane.multi_color[0]}"
                     else:
                         cur_lane.color = '#{}'.format(self._get_filament_values(result['filament'], 'color_hex'))
                         cur_lane.multi_color = []

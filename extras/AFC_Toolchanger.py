@@ -61,8 +61,12 @@ class AfcToolchanger(afcUnit):
         # Now that a T command is assigned, send lane data to moonraker
         cur_lane.send_lane_data()
         msg = ""
-        if( cur_lane.prep_state and cur_lane.load_state ):
-            msg = "<span class=success--text>LOADED</span> <span class=primary--text>in ToolHead</span>"
+        if( cur_lane.prep_state
+            and cur_lane.load_state
+            and cur_lane.extruder_obj.lane_loaded == cur_lane.name):
+            msg = "<span class=success--text>LOADED</span>"
+            msg += cur_lane.extruder_obj.prep_on_shuttle_check(cur_lane)
+
         self.logger.raw( '{lane_name} tool cmd: {tcmd:3} {msg}'.format(lane_name=cur_lane.name, tcmd=cur_lane.map, msg=msg))
         cur_lane.set_afc_prep_done()
         return True
@@ -199,7 +203,7 @@ class AfcToolchanger(afcUnit):
             self.afc.last_gcode_position[i] -= self.afc.gcode_move.base_position[i]
         # Perform a tool swap by selecting the appropriate extruder based on the lane's extruder object.
         self.afc.afcDeltaTime.log_with_time("Performing tool swap")
-        name = lane.extruder_obj.name
+        name = lane.extruder_obj.th_extruder_name
         tool_index = 0 if name == "extruder" else int(name.replace("extruder", ""))
 
         if lane.extruder_obj.custom_tool_swap:

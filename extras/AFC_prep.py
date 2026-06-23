@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from extras.AFC import afc
+    from extras.AFC_lane import AFCLane
+
+if TYPE_CHECKING:
+    from extras.AFC import afc
 
 class afcPrep:
     def __init__(self, config):
@@ -125,9 +129,9 @@ class afcPrep:
             extruder_obj.set_status_led( self.afc.led_tool_unloaded )
             if extruder_obj.on_shuttle():
                 # Calls ACTIVATE_EXTRUDER if current toolhead on shuttle is not the active extruder
-                if self.afc.function.get_current_extruder() != extruder_obj.name:
+                if self.afc.function.get_current_extruder() != extruder_obj.th_extruder_name:
                     self.afc.gcode.run_script_from_command(
-                        f"ACTIVATE_EXTRUDER EXTRUDER={extruder_obj.name}"
+                        f"ACTIVATE_EXTRUDER EXTRUDER={extruder_obj.th_extruder_name}"
                     )
             if 'system' in units and "extruders" in units["system"]:
                 # Check to see if lane_loaded is in dictionary and its not an empty string
@@ -268,6 +272,13 @@ class afcPrep:
                     self.logger.raw("<span class=warning--text>Warning: Both advance and trailing "
                                     "switches are triggered on Buffer {}. "
                                     "Please check your buffer switches or configuration.</span>".format(buffer_name))
+
+        if self.afc.snapmaker_printer:
+            for extruder in self.afc.tools.values():
+                lane: AFCLane = extruder.lanes.get(extruder.lane_loaded, None)
+                if (lane
+                    and lane.tool_loaded):
+                    self.afc.spool.set_snapmaker_filament_params(lane)
 
         # Verifying that user has macro positions set correctly for enabled park, cut, etc macros
         error_str = self.afc.verify_macro_positions()

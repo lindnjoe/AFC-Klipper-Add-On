@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from extras.AFC_Toolchanger import AfcToolchanger
     from extras.AFC_functions import afcFunction
     from extras.AFC_utils import AFC_moonraker
+    from extras.AFC_lane import AFCLane
 
 try: from extras.AFC_utils import ERROR_STR
 except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
@@ -219,7 +220,9 @@ class AFCExtruder:
         self.fullname                   = config.get_name()
 
         self.name: str                  = self.fullname.split(' ')[-1]
-        # self.extruder_name: str         = config.get("extruder_name", self.name)    # Add support for this, not sure where all this will have to be updated
+        self.th_extruder_name: str      = config.get("extruder_name", self.name)
+        self._check_extruder_name()
+
         self.tool_start                 = config.get('pin_tool_start', None)                                            # Pin for sensor before(pre) extruder gears
         self.tool_end                   = config.get('pin_tool_end', None)                                              # Pin for sensor after(post) extruder gears (optional)
         self.tool_stn                   = config.getfloat("tool_stn", 72)                                               # Distance in mm from the toolhead sensor to the tip of the nozzle in mm, if `tool_end` is defined then distance is from this sensor
@@ -275,7 +278,7 @@ class AFCExtruder:
         self.lanes: Dict                = {}
         self.load_active                = False
         self.current_move_distance: float = 0
-        self.estats = AFCExtruderStats(self.name, self, self.afc.tool_cut_threshold)
+        self.estats = AFCExtruderStats(self.th_extruder_name, self, self.afc.tool_cut_threshold)
 
         # U1 only related variables
         self.park_detector_obj   = None
@@ -321,6 +324,7 @@ class AFCExtruder:
             config.fileconfig.set(config.section, "unit", self.tc_unit_name.split()[-1])
             config.fileconfig.set(config.section, "extruder", self.name)
             config.fileconfig.set(config.section, "hub", "direct")
+            config.fileconfig.set(config.section, "standalone", "True")
             self.tc_lane = AFCLane(config)
             self.printer.objects[f"AFC_lane {self.name}"] = self.tc_lane
             # TODO: Once homing is in create common function for this and AFC_stepper
@@ -363,6 +367,19 @@ class AFCExtruder:
     def __str__(self):
         return self.name
 
+    def _check_extruder_name(self):
+        """
+        Helper method the verify that "extruder" exists in either the config name or in
+        extruder_name variable. If "extruder" is not found, raises a ConfigParser.Error with
+        a message to display to the user.
+        """
+        if "extruder" not in self.th_extruder_name:
+            error_str = (f"Missing extruder reference in [{self.fullname}] section. The word " \
+                         "extruder must appear either in the section name " \
+                         "([AFC_extruder extruder(n)]) or in the extruder_name variable " \
+                         "(extruder_name: extruder(n)).")
+            raise error(error_str)
+
     def check_lanes(self):
         # Checks to see if there are multiple lanes per toolhead, remove self created lane if
         # there are more than 1 lanes registered
@@ -401,11 +418,18 @@ class AFCExtruder:
         and assigns it to the instance variable `self.AFC`.
         """
         self.reactor = self.afc.reactor
-        self.afc.tools[self.name] = self
+        existing = self.afc.tools.get(self.th_extruder_name)
+        if (existing is not None
+            and existing is not self):
+            error_str = (f"Duplicate toolhead extruder mapping '{self.th_extruder_name}' "
+                         f"between [{existing.fullname}] and [{self.fullname}]. "
+                         "Each AFC_extruder section must map to a unique toolhead extruder.")
+            raise error(error_str)
+        self.afc.tools[self.th_extruder_name] = self
 
-        self.toolhead_extruder = self.printer.lookup_object(self.name, None)
+        self.toolhead_extruder = self.printer.lookup_object(self.th_extruder_name, None)
         if not self.toolhead_extruder:
-            error_str = self.common_error.format(self.name, self.fullname)
+            error_str = self.common_error.format(self.th_extruder_name, self.fullname)
             raise error(error_str)
 
         if self.tool:
@@ -672,7 +696,7 @@ class AFCExtruder:
         if self.motion_queuing is not None:
             self.motion_queuing.wipe_trapq(self.trapq)
 
-        self.function.do_enable(False, self.name)
+        self.function.do_enable(False, self.th_extruder_name)
         self.load_active = False
 
         self.afc.restore_toolhead_temp(temp_state=self._captured_toolhead_temp, async_restore=True)
@@ -707,7 +731,7 @@ class AFCExtruder:
             and current_temp <= target_temp + self.afc.temp_wait_tolerance):
             if self.tool_start_state:
                 info_str = "loading to" if self.current_move_distance > 0 else "unloading from"
-                self.logger.info(f"{self.name} temp within range, {info_str} nozzle")
+                self.logger.info(f"{self.th_extruder_name} temp within range, {info_str} nozzle")
                 self.move_extruder(self.current_move_distance)
                 if self.current_move_distance > 0:
                     self.tc_lane.set_loaded()
@@ -724,7 +748,7 @@ class AFCExtruder:
                 )
             return self.reactor.NEVER
         else:
-            self.logger.debug(f"{self.name}: waiting for temp: {current_temp}")
+            self.logger.debug(f"{self.th_extruder_name}: waiting for temp: {current_temp}")
 
         return self.reactor.monotonic() + 1
 
@@ -868,6 +892,28 @@ class AFCExtruder:
             return status.get('state') == 'ACTIVATE'
         else:
             return False
+
+    def prep_on_shuttle_check(self, lane: AFCLane) -> str:
+        """
+        This helper method should only be called during PREP as it's a helper to check
+        if toolhead is on the shuttle or not and will set toolhead leds correctly.
+
+        This method also already assumes that current extruder lane_loaded matches
+        current lane name.
+
+        :param lane: AFCLane for current extruder to easily set leds though its unit object
+        :return str: Message string if lane is loaded to toolhead or in toolhead and on shuttle
+        """
+        msg = ""
+        on_shuttle = ""
+        if (self.tool_obj
+            and self.tc_unit_name):
+            lane.unit_obj.lane_tool_loaded_idle(lane)
+            if self.on_shuttle():
+                on_shuttle = " and toolhead on shuttle"
+                lane.unit_obj.lane_tool_loaded(lane)
+        msg += f"<span class=primary--text> in ToolHead{on_shuttle}</span>"
+        return msg
 
     def is_standalone(self):
         """

@@ -59,7 +59,7 @@ def _make_lane(name="lane1", hub="hub1", extruder="ext1", buffer_name="buf1"):
     lane.unit_obj = MagicMock()
     lane.name = name
     lane.hub = hub
-    lane.extruder_name = extruder
+    lane.afc_extruder_name = extruder
     lane.buffer_name = buffer_name
     lane.led_ready = "0,1,0,0"
     lane.led_not_ready = "0,0,0,0.25"
@@ -388,3 +388,15 @@ class TestBufferToolheadLoadCheck:
         call_args = lane.move.call_args[0]
         assert result is True
         assert call_args[0] == (SIDE_EFFECT_DIST * MoveDirection.NEG)
+
+
+class TestLaneOrdering:
+    def test_lane_in_correct_order(self):
+        # Tests to verify that lanes are in correct natural number order
+        unit = _make_unit()
+        lane = _make_lane()
+
+        unit.lanes = {"lane2": lane, "lane1": lane, "custom_name4":lane, "lane3": lane, "lane10": lane}
+        unit.handle_ready()
+
+        assert list(unit.lanes.keys()) == ["lane1", "lane2", "lane3", "custom_name4", "lane10"]

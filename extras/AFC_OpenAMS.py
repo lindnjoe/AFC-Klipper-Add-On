@@ -983,7 +983,9 @@ class afcAMS(afcUnit):
                 if (cur_lane.tool_loaded
                     and cur_lane.extruder_obj.lane_loaded == cur_lane.name):
                     cur_lane.sync_to_extruder()
-                    msg += "<span class=primary--text> in ToolHead</span>"
+
+                    msg += cur_lane.extruder_obj.prep_on_shuttle_check(cur_lane)
+
                     if self.afc.current == cur_lane.name:
                         self.afc.spool.set_active_spool(cur_lane.spool_id)
                         self.lane_tool_loaded(cur_lane)

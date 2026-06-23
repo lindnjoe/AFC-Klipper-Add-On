@@ -11,15 +11,14 @@ Covers:
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+from configparser import Error as KlipperError
 import pytest
 import sys
 import types
 
 from extras.AFC_extruder import AFCExtruderStats, AFCExtruder
 from tests.test_AFC_lane import _make_afc_lane, AFCLane
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────
 
 def _make_extruder_obj(name="extruder"):
     """Minimal AFCExtruder-like mock."""
@@ -27,7 +26,7 @@ def _make_extruder_obj(name="extruder"):
     afc = MockAFC()
     afc.afc_stats = MagicMock()
     obj = MagicMock()
-    obj.name = name
+    obj.th_extruder_name = obj.name = name
     obj.afc = afc
     obj.logger = MockLogger()
     obj.park_detector_obj = None
@@ -224,7 +223,7 @@ def _make_afc_extruder(name="extruder"):
     ext.logger = MockLogger()
     ext.reactor = reactor
     ext.fullname = f"AFC_extruder {name}"
-    ext.name = name
+    ext.th_extruder_name = ext.name = name
     # Toolchanger fields – default mirrors single-toolhead state
     ext.tool_obj     = None
     ext.tc_unit_name = None
@@ -336,6 +335,15 @@ class TestAFCExtruderHandleConnect:
         ext.reactor = None
         ext.handle_connect()
         assert ext.reactor is ext.afc.reactor
+    
+    def test_handel_connect_duplicate_entry(self):
+        ext1 = _make_afc_extruder("extruder")
+        ext2 = _make_afc_extruder("extruder")
+        ext2.afc = ext1.afc
+        ext1.afc.tools[ext1.th_extruder_name] = ext1
+        with pytest.raises(KlipperError) as exc:
+            ext2.handle_connect()
+        assert "Duplicate toolhead extruder mapping" in str(exc.value)
 
 
 # ── handle_moonraker_connect ───────────────────────────────────────────────────
@@ -1196,3 +1204,84 @@ class TestNoteToolStartCallback:
         ext.note_tool_start_callback(True)
         args = ext.tool_start_callback.call_args.args
         assert args[1]
+
+class TestCheckExtruderName:
+    def test_no_extruder_in_config_name(self):
+        ext = _make_afc_extruder(name="e0")
+        with pytest.raises(KlipperError) as exc:
+            ext._check_extruder_name()
+        assert "Missing extruder reference" in str(exc.value)
+
+    def test_no_extruder_in_extruder_name_variable(self):
+        ext = _make_afc_extruder(name="extruder")
+        ext.th_extruder_name = "e0"
+        with pytest.raises(KlipperError) as exc:
+            ext._check_extruder_name()
+        assert "Missing extruder reference" in str(exc.value)
+    
+    def test_extruder_in_config_name(self):
+        ext = _make_afc_extruder(name="extruder")
+        ext._check_extruder_name()
+
+    def test_extruder_in_extruder_name_variable(self):
+        ext = _make_afc_extruder(name="e0")
+        ext.th_extruder_name = "extruder1"
+        ext._check_extruder_name()
+
+class TestPrepOnShuttleCheck:
+
+    @pytest.fixture(autouse=True)
+    def patch_toolchanger_module(self):
+        """Inject a fake extras.toolchanger so the in-method import resolves."""
+        fake_mod = _make_toolchanger_module()
+        with patch.dict(sys.modules, {"extras.toolchanger": fake_mod}):
+            yield
+
+    def test_in_toolhead(self):
+        ext = _make_afc_extruder()
+        lane = MagicMock()
+        msg = ext.prep_on_shuttle_check(lane)
+
+        assert "<span class=primary--text> in ToolHead</span>" in msg
+        lane.unit_obj.lane_tool_loaded.assert_not_called()
+        lane.unit_obj.lane_tool_loaded_idle.assert_not_called()
+    
+    def test_in_toolhead_tool_obj(self):
+        ext = _make_afc_extruder()
+        ext.tool_obj = MagicMock()
+        lane = MagicMock()
+        msg = ext.prep_on_shuttle_check(lane)
+
+        lane.unit_obj.lane_tool_loaded.assert_not_called()
+        lane.unit_obj.lane_tool_loaded_idle.assert_not_called()
+
+    def test_in_toolhead_tc_unit_name(self):
+        ext = _make_afc_extruder()
+        ext.tc_unit_name = MagicMock()
+        lane = MagicMock()
+        msg = ext.prep_on_shuttle_check(lane)
+
+        lane.unit_obj.lane_tool_loaded.assert_not_called()
+        lane.unit_obj.lane_tool_loaded_idle.assert_not_called()
+    
+    def test_in_toolhead_tc_unit_name_tool_obj_not_on_shuttle(self):
+        ext = _make_afc_extruder()
+        ext.tc_unit_name = MagicMock()
+        ext.tool_obj = MagicMock()
+        lane = MagicMock()
+        msg = ext.prep_on_shuttle_check(lane)
+
+        lane.unit_obj.lane_tool_loaded.assert_not_called()
+        lane.unit_obj.lane_tool_loaded_idle.assert_called_once_with(lane)
+    
+    def test_in_toolhead_tc_unit_name_tool_obj_on_shuttle(self):
+        ext = _make_afc_extruder()
+        ext.tc_unit_name = MagicMock()
+        ext.tool_obj = MagicMock()
+        ext.tool_obj.detect_state = "mounted"
+        lane = MagicMock()
+        msg = ext.prep_on_shuttle_check(lane)
+
+        lane.unit_obj.lane_tool_loaded.assert_called_once_with(lane)
+        lane.unit_obj.lane_tool_loaded_idle.assert_called_once_with(lane)
+        assert "<span class=primary--text> in ToolHead and toolhead on shuttle</span>" in msg
