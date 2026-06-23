@@ -47,6 +47,12 @@ class TemperatureOAMS:
     """HDC1080-based temperature and humidity sensor for OpenAMS units."""
 
     def __init__(self, config):
+        """
+        Initialize the HDC1080 temperature/humidity sensor driver.
+
+        :param config: ConfigWrapper providing the sensor name, I2C bus settings,
+                       reporting interval, resolution, offsets, and heater option.
+        """
         self.printer = config.get_printer()
         self.name = config.get_name().split()[-1]
         self.reactor = self.printer.get_reactor()
@@ -86,20 +92,44 @@ class TemperatureOAMS:
         self._last_good_temp = 0.0
 
     def handle_connect(self):
+        """Initialize the device and start the sampling timer on klippy:connect."""
         self._init_device()
         self.reactor.update_timer(self.sample_timer, self.reactor.NOW)
 
     def setup_minmax(self, min_temp, max_temp):
+        """
+        Store the allowed temperature range used for shutdown protection.
+
+        :param min_temp: Minimum allowed temperature in degrees Celsius.
+        :param max_temp: Maximum allowed temperature in degrees Celsius.
+        """
         self.min_temp = min_temp
         self.max_temp = max_temp
 
     def setup_callback(self, cb):
+        """
+        Register the heaters callback used to report measured temperatures.
+
+        :param cb: Callable invoked as ``cb(print_time, temperature)``.
+        """
         self._callback = cb
 
     def get_report_time_delta(self):
+        """
+        Return the sensor reporting interval.
+
+        :return: Reporting interval in seconds.
+        """
         return self.report_time
 
     def _init_device(self):
+        """
+        Configure the HDC1080: set resolutions, optional heater, and read IDs.
+
+        Reads the manufacturer/device IDs, applies the configured temperature and
+        humidity resolutions, enables the heater when requested, and marks the
+        device as initialized so sampling can begin.
+        """
         data = [CONF_REG, 1 << 4, 0x00]
         self.i2c.i2c_write(data)
         manufacturer_id = self._read_register_16(MFID_REG)
@@ -116,6 +146,12 @@ class TemperatureOAMS:
         self.init_sent = True
 
     def _read_register_16(self, reg):
+        """
+        Read a 16-bit big-endian value from an HDC1080 register.
+
+        :param reg: Register address to read from.
+        :return: The 16-bit register value as an integer.
+        """
         self.i2c.i2c_write([reg])
         self.reactor.pause(self.reactor.monotonic() + 0.0635)
         read = self.i2c.i2c_read([], 2)
@@ -123,6 +159,13 @@ class TemperatureOAMS:
         return (data[0] << 8) | data[1]
 
     def _set_resolution(self, reg, mask, value):
+        """
+        Update the resolution bits of a configuration register.
+
+        :param reg: Configuration register address.
+        :param mask: Bit mask selecting the resolution field to clear.
+        :param value: Resolution bits to write into the masked field.
+        """
         config = self._read_register_16(reg)
         config = (config & ~mask) | value
         data = [reg, config >> 8, 0x00]
@@ -130,6 +173,12 @@ class TemperatureOAMS:
         self.reactor.pause(self.reactor.monotonic() + 0.015)
 
     def _set_config_bit(self, bit, enable):
+        """
+        Set or clear a single bit in the HDC1080 configuration register.
+
+        :param bit: Bit mask of the configuration flag to modify.
+        :param enable: When True the bit is set, otherwise it is cleared.
+        """
         config = self._read_register_16(CONF_REG)
         if enable:
             config |= bit
@@ -140,6 +189,12 @@ class TemperatureOAMS:
         self.reactor.pause(self.reactor.monotonic() + 0.015)
 
     def _read_temp(self):
+        """
+        Read and convert the current temperature from the HDC1080.
+
+        :return: Tuple of (temperature in degrees Celsius, success flag). On an
+                 I2C failure returns (0.0, False).
+        """
         try:
             self.i2c.i2c_write([TEMP_REG])
             self.reactor.pause(self.reactor.monotonic() + 0.0635)
@@ -153,6 +208,12 @@ class TemperatureOAMS:
             return 0.0, False
 
     def _read_humidity(self):
+        """
+        Read and convert the current relative humidity from the HDC1080.
+
+        :return: Tuple of (relative humidity in percent, success flag). On an
+                 I2C failure returns (0.0, False).
+        """
         try:
             self.i2c.i2c_write([HUMI_REG])
             self.reactor.pause(self.reactor.monotonic() + 0.0635)
@@ -166,6 +227,17 @@ class TemperatureOAMS:
             return 0.0, False
 
     def _sample(self, eventtime):
+        """
+        Reactor timer callback that samples temperature and humidity.
+
+        Reads both values, applies offsets, tracks consecutive I2C errors and
+        backs off the report interval when too many occur, triggers a printer
+        shutdown if a valid temperature is outside the configured range, and
+        forwards good temperatures to the registered heaters callback.
+
+        :param eventtime: Reactor event time at which the timer fired.
+        :return: The reactor time at which the timer should next fire.
+        """
         if not self.init_sent:
             return eventtime + self.report_time
 
@@ -205,6 +277,12 @@ class TemperatureOAMS:
         return measured_time + self.report_time
 
     def get_status(self, eventtime):
+        """
+        Return the latest measured temperature and humidity.
+
+        :param eventtime: Reactor event time (unused).
+        :return: Dict with rounded ``temperature`` and ``humidity`` values.
+        """
         return {
             'temperature': round(self.temp, 2),
             'humidity': round(self.humidity, 2),
@@ -212,5 +290,10 @@ class TemperatureOAMS:
 
 
 def load_config(config):
+    """
+    Register ``temperature_oams`` as a heaters sensor factory.
+
+    :param config: ConfigWrapper used to look up the heaters object.
+    """
     pheater = config.get_printer().lookup_object("heaters")
     pheater.add_sensor_factory("temperature_oams", TemperatureOAMS)

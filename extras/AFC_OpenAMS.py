@@ -42,18 +42,30 @@ apply_compat_patches()
 # ── Support classes used by external oams.py module ────────────────
 
 class AMSEventBus:
+    """Process-wide singleton publish/subscribe bus for OpenAMS events.
+
+    Subscribers are stored per event type ordered by descending priority and
+    invoked synchronously on ``publish``. A bounded, TTL-pruned history of
+    recent events is retained for diagnostics.
+    """
     _instance = None
     _lock = threading.RLock()
     _MAX_HISTORY = 500
     _HISTORY_TTL = 3600.0
 
     def __init__(self):
+        """Initialize an empty subscriber map, event history, and logger slot."""
         self._subscribers = {}
         self._event_history = []
         self.logger = None
 
     @classmethod
     def get_instance(cls, logger=None):
+        """Return the shared event bus singleton, creating it on first call.
+
+        :param logger: optional logger attached if the singleton has none yet.
+        :return AMSEventBus: the process-wide event bus instance.
+        """
         with cls._lock:
             if cls._instance is None:
                 cls._instance = cls()
@@ -62,6 +74,12 @@ class AMSEventBus:
             return cls._instance
 
     def subscribe(self, event_type, callback, *, priority=0):
+        """Register a callback for an event type, ordered by priority.
+
+        :param event_type: event name to listen for.
+        :param callback: callable invoked as ``callback(event_type=..., **kwargs)``.
+        :param priority: higher priority callbacks run earlier (default 0).
+        """
         with self._lock:
             if event_type not in self._subscribers:
                 self._subscribers[event_type] = []
@@ -75,6 +93,15 @@ class AMSEventBus:
             subscribers.insert(insert_idx, (callback, priority))
 
     def publish(self, event_type, **kwargs):
+        """Record an event in history and dispatch it to all subscribers.
+
+        Exceptions raised by individual subscribers are swallowed so one bad
+        callback cannot block the others.
+
+        :param event_type: event name to publish.
+        :param kwargs: event payload; ``eventtime`` defaults to ``time.time()``.
+        :return int: number of subscribers that handled the event successfully.
+        """
         eventtime = kwargs.get('eventtime', time.time())
         with self._lock:
             self._event_history.append((event_type, eventtime, dict(kwargs)))
@@ -97,9 +124,26 @@ class AMSEventBus:
 
 
 class LaneInfo:
+    """Immutable-ish record describing one registered OpenAMS lane.
+
+    Bundles the identifiers and optional hardware associations (FPS, hub, LED,
+    custom load/unload commands) used by ``LaneRegistry`` for lookups.
+    """
     def __init__(self, lane_name, unit_name, spool_index, extruder,
                  fps_name=None, hub_name=None, led_index=None,
                  custom_load_cmd=None, custom_unload_cmd=None):
+        """Store the lane's identifiers and optional hardware associations.
+
+        :param lane_name: AFC lane name.
+        :param unit_name: owning OpenAMS unit name.
+        :param spool_index: zero-based spool bay index within the unit.
+        :param extruder: extruder name the lane feeds.
+        :param fps_name: optional FPS buffer name.
+        :param hub_name: optional hub name.
+        :param led_index: optional LED index for the lane.
+        :param custom_load_cmd: optional gcode command used to load this lane.
+        :param custom_unload_cmd: optional gcode command used to unload this lane.
+        """
         self.lane_name = lane_name
         self.unit_name = unit_name
         self.spool_index = spool_index
@@ -112,10 +156,21 @@ class LaneInfo:
 
 
 class LaneRegistry:
+    """Per-printer registry mapping OpenAMS lanes to spools and extruders.
+
+    Maintains lookup indexes (by lane name, by (unit, spool) pair, by extruder)
+    so the hardware service can resolve lane identities from firmware events.
+    One instance exists per printer object.
+    """
     _instances = {}
     _lock = threading.RLock()
 
     def __init__(self, printer, logger=None):
+        """Initialize empty lane lists and lookup indexes.
+
+        :param printer: Klipper printer object this registry serves.
+        :param logger: optional AFC logger instance.
+        """
         self.printer = printer
         self.logger = logger
         self._lanes = []
@@ -127,6 +182,12 @@ class LaneRegistry:
 
     @classmethod
     def for_printer(cls, printer, logger=None):
+        """Return the registry for a printer, creating it on first use.
+
+        :param printer: Klipper printer object used as the instance key.
+        :param logger: optional logger attached/updated on the instance.
+        :return LaneRegistry: the per-printer registry singleton.
+        """
         with cls._lock:
             key = id(printer)
             if key not in cls._instances:
@@ -138,6 +199,21 @@ class LaneRegistry:
     def register_lane(self, lane_name, unit_name, spool_index, extruder, *,
                       fps_name=None, hub_name=None, led_index=None,
                       custom_load_cmd=None, custom_unload_cmd=None):
+        """Register (or re-register) a lane and index it for fast lookup.
+
+        Any existing registration for ``lane_name`` is removed first.
+
+        :param lane_name: AFC lane name.
+        :param unit_name: owning OpenAMS unit name.
+        :param spool_index: zero-based spool bay index.
+        :param extruder: extruder name the lane feeds.
+        :param fps_name: optional FPS buffer name.
+        :param hub_name: optional hub name.
+        :param led_index: optional LED index.
+        :param custom_load_cmd: optional load gcode command.
+        :param custom_unload_cmd: optional unload gcode command.
+        :return LaneInfo: the newly created lane record.
+        """
         with self._lock:
             existing = self._by_lane_name.get(lane_name)
             if existing is not None:
@@ -158,6 +234,10 @@ class LaneRegistry:
             return info
 
     def _unregister_lane(self, info):
+        """Remove a lane record from all lookup indexes.
+
+        :param info: the LaneInfo record to remove.
+        """
         if info in self._lanes:
             self._lanes.remove(info)
         self._by_lane_name.pop(info.lane_name, None)
@@ -170,30 +250,70 @@ class LaneRegistry:
                 self._by_extruder.pop(info.extruder, None)
 
     def get_by_lane(self, lane_name):
+        """Return the LaneInfo for a lane name, or None.
+
+        :param lane_name: AFC lane name to look up.
+        :return LaneInfo: matching record or None.
+        """
         with self._lock:
             return self._by_lane_name.get(lane_name)
 
     def get_by_spool(self, unit_name, spool_index):
+        """Return the LaneInfo for a (unit, spool) pair, or None.
+
+        :param unit_name: owning OpenAMS unit name.
+        :param spool_index: spool bay index.
+        :return LaneInfo: matching record or None.
+        """
         with self._lock:
             return self._by_spool.get((unit_name, spool_index))
 
     def resolve_lane_token(self, token):
+        """Resolve a lane name case-insensitively.
+
+        :param token: lane name token (any case).
+        :return LaneInfo: matching record or None.
+        """
         with self._lock:
             return self._by_lane_name_lower.get(token.lower())
 
     def resolve_lane_name(self, unit_name, spool_index):
+        """Return the lane name for a (unit, spool) pair, or None.
+
+        :param unit_name: owning OpenAMS unit name.
+        :param spool_index: spool bay index.
+        :return str: lane name or None.
+        """
         info = self.get_by_spool(unit_name, spool_index)
         return info.lane_name if info else None
 
     def resolve_extruder(self, lane_name):
+        """Return the extruder name a lane feeds, or None.
+
+        :param lane_name: AFC lane name.
+        :return str: extruder name or None.
+        """
         info = self.get_by_lane(lane_name)
         return info.extruder if info else None
 
 
 class AMSHardwareService:
+    """Per-(printer, unit) façade over the [oams] hardware controller.
+
+    Resolves and caches the ``[oams <name>]`` controller, polls its sensors on
+    a reactor timer, caches the latest status and per-lane snapshots, and
+    publishes f1s/hub/spool change events on the shared ``AMSEventBus``. One
+    instance exists per (printer, unit name) pair.
+    """
     _instances = {}
 
     def __init__(self, printer, name, logger=None):
+        """Initialize service state, lookup the AFC logger, and wire shared singletons.
+
+        :param printer: Klipper printer object.
+        :param name: OpenAMS unit name (matches the ``[oams <name>]`` section).
+        :param logger: optional logger; falls back to the AFC object's logger.
+        """
         self.printer = printer
         self.name = name
         if logger is not None:
@@ -221,6 +341,13 @@ class AMSHardwareService:
 
     @classmethod
     def for_printer(cls, printer, name="default", logger=None):
+        """Return the cached service for a (printer, name) pair, creating it if needed.
+
+        :param printer: Klipper printer object.
+        :param name: OpenAMS unit name.
+        :param logger: optional logger attached/updated on the instance.
+        :return AMSHardwareService: the per-(printer, name) service singleton.
+        """
         key = (id(printer), name)
         try:
             service = cls._instances[key]
@@ -233,6 +360,10 @@ class AMSHardwareService:
         return service
 
     def attach_controller(self, controller):
+        """Bind an [oams] controller and seed the status cache from it.
+
+        :param controller: the resolved ``[oams]`` controller object, or None.
+        """
         with self._lock:
             self._controller = controller
         if controller is not None:
@@ -244,6 +375,10 @@ class AMSHardwareService:
                 self._update_status(status)
 
     def resolve_controller(self):
+        """Return the [oams] controller, looking it up and caching it if needed.
+
+        :return: the ``[oams <name>]`` controller object, or None if not found.
+        """
         with self._lock:
             controller = self._controller
         if controller is not None:
@@ -258,11 +393,16 @@ class AMSHardwareService:
         return controller
 
     def _monotonic(self):
+        """Return the reactor monotonic time, caching the reactor on first use.
+
+        :return float: current reactor monotonic timestamp.
+        """
         if self._reactor is None:
             self._reactor = self.printer.get_reactor()
         return self._reactor.monotonic()
 
     def start_polling(self):
+        """Register the periodic sensor-poll timer (idempotent)."""
         if self._polling_timer is not None:
             return
         if self._reactor is None:
@@ -274,12 +414,21 @@ class AMSHardwareService:
             self._polling_callback, self._reactor.NOW + 1.0)
 
     def stop_polling(self):
+        """Disable polling and unregister the poll timer if running."""
         self._polling_enabled = False
         if self._polling_timer is not None and self._reactor is not None:
             self._reactor.unregister_timer(self._polling_timer)
             self._polling_timer = None
 
     def _polling_callback(self, eventtime):
+        """Reactor timer callback: poll status and publish sensor-change events.
+
+        Publishes ``f1s_changed``/``hub_changed`` events on transitions and
+        backs the poll interval off to the idle rate when nothing changes.
+
+        :param eventtime: reactor time the timer fired.
+        :return float: next scheduled reactor time, or ``NEVER`` if disabled.
+        """
         if not self._polling_enabled:
             return self._reactor.NEVER
         try:
@@ -317,6 +466,10 @@ class AMSHardwareService:
             return eventtime + self._polling_interval_idle
 
     def poll_status(self):
+        """Read the controller status (falling back to attribute reads) and cache it.
+
+        :return dict: the latest status mapping, or None if no controller.
+        """
         controller = self.resolve_controller()
         if controller is None:
             return None
@@ -337,10 +490,18 @@ class AMSHardwareService:
         return status
 
     def _update_status(self, status):
+        """Replace the cached status snapshot under lock.
+
+        :param status: status mapping to copy into the cache.
+        """
         with self._lock:
             self._status = dict(status)
 
     def latest_status(self):
+        """Return a copy of the most recently cached controller status.
+
+        :return dict: copy of the cached status mapping.
+        """
         with self._lock:
             return dict(self._status)
 
@@ -348,6 +509,20 @@ class AMSHardwareService:
                              hub_state, eventtime, *,
                              spool_index=None, tool_state=None,
                              emit_spool_event=True):
+        """Update the cached snapshot for a lane and emit spool load/unload events.
+
+        On a lane_state transition (with a known spool index) a
+        ``spool_loaded``/``spool_unloaded`` event is published unless suppressed.
+
+        :param unit_name: owning OpenAMS unit name.
+        :param lane_name: AFC lane name.
+        :param lane_state: truthy if filament is present in the lane.
+        :param hub_state: hub occupancy (None leaves it unset).
+        :param eventtime: timestamp recorded with the snapshot.
+        :param spool_index: optional spool index; negatives are ignored.
+        :param tool_state: optional tool-loaded flag to record.
+        :param emit_spool_event: set False to skip publishing spool events.
+        """
         key = f"{unit_name}:{lane_name}"
         normalized_index = None
         if spool_index is not None:
@@ -382,12 +557,24 @@ class AMSHardwareService:
                                   eventtime=eventtime)
 
     def latest_lane_snapshot(self, unit_name, lane_name):
+        """Return a copy of the cached snapshot for a lane, or None.
+
+        :param unit_name: owning OpenAMS unit name.
+        :param lane_name: AFC lane name.
+        :return dict: copy of the lane snapshot or None.
+        """
         key = f"{unit_name}:{lane_name}"
         with self._lock:
             snapshot = self._lane_snapshots.get(key)
         return dict(snapshot) if snapshot else None
 
     def resolve_lane_for_spool(self, unit_name, spool_index):
+        """Resolve a lane name for a (unit, spool) pair via the registry.
+
+        :param unit_name: owning OpenAMS unit name.
+        :param spool_index: spool index (coerced to int).
+        :return str: lane name or None.
+        """
         if spool_index is None:
             return None
         try:
@@ -397,12 +584,27 @@ class AMSHardwareService:
         return self.registry.resolve_lane_name(unit_name, normalized)
 
     def resolve_lane_for_spool_with_afc(self, unit_name, spool_index):
+        """Resolve a lane name for a spool, falling back to scanning AFC units.
+
+        :param unit_name: owning OpenAMS unit name.
+        :param spool_index: spool index.
+        :return str: lane name or None.
+        """
         lane_name = self.resolve_lane_for_spool(unit_name, spool_index)
         if lane_name is not None:
             return lane_name
         return self._resolve_lane_name_from_afc(unit_name, spool_index)
 
     def _resolve_lane_name_from_afc(self, unit_name, spool_index):
+        """Find a lane name by scanning AFC units when the registry has no entry.
+
+        Matches the unit by ``oams_name`` and the lane by its ``unit:slot``
+        suffix (slot = spool_index + 1).
+
+        :param unit_name: owning OpenAMS unit name.
+        :param spool_index: spool index.
+        :return str: lane name or None.
+        """
         if spool_index is None:
             return None
         try:
@@ -436,7 +638,13 @@ class AMSHardwareService:
 
 def _ams_box_logo(title, n_slots, name):
     """AMS-style unit logo: a titled box with one spool bay per slot, fronted by
-    the R/E/A/D/Y banner (prep console output). ASCII borders for portability."""
+    the R/E/A/D/Y banner (prep console output). ASCII borders for portability.
+
+    :param title: text centered in the box header.
+    :param n_slots: number of spool bays to draw.
+    :param name: unit name appended below the box.
+    :return str: HTML/markup logo string (success styling).
+    """
     n = max(1, int(n_slots) if n_slots else 1)
     bay_w = 3
     while n * bay_w + (n - 1) < len(title):
@@ -456,7 +664,13 @@ def _ams_box_logo(title, n_slots, name):
 
 
 def _ams_box_logo_error(title, n_slots, name):
-    """Error variant of the AMS-style logo (red box, ERROR banner)."""
+    """Error variant of the AMS-style logo (red box, ERROR banner).
+
+    :param title: text centered in the box header.
+    :param n_slots: number of spool bays to size the box for.
+    :param name: unit name appended below the box.
+    :return str: HTML/markup logo string (error styling).
+    """
     n = max(1, int(n_slots) if n_slots else 1)
     bay_w = 3
     while n * bay_w + (n - 1) < len(title):
@@ -478,6 +692,14 @@ class afcAMS(afcUnit):
     and clog detection via FPS + encoder monitoring."""
 
     def __init__(self, config):
+        """Initialize an OpenAMS unit from its config section.
+
+        Reads the hardware name, stuck-spool/clog/engagement options, registers
+        the unit's custom load/unload and calibration gcode commands, and wires
+        up the ``temperature_oams`` sensor factory.
+
+        :param config: ConfigWrapper for this unit's ``[AFC_OpenAMS ...]`` section.
+        """
         super().__init__(config)
         self.type = config.get('type', 'OpenAMS')
 
@@ -559,10 +781,17 @@ class afcAMS(afcUnit):
         except Exception:
             pass
 
-        # Defer hardware resolution until reactor is running
-        self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        # klippy:ready is registered by afcUnit.__init__ (upstream core) and
+        # dispatches to our handle_ready override below — don't register it
+        # again here or it would run twice (double poll timer / monitor init).
 
     def handle_connect(self):
+        """Build logos, the lane->slot spool map, and per-lane engagement params.
+
+        Runs at klippy:connect after lanes exist: assigns each lane its custom
+        load/unload commands and seeds its virtual sensor/runout state to False
+        until ``handle_ready`` syncs from hardware.
+        """
         super().handle_connect()
 
         self.logo = _ams_box_logo("OpenAMS", len(self.lanes), self.name)
@@ -590,15 +819,6 @@ class afcAMS(afcUnit):
 
             # Same-FPS runout tracking — blocks sensor noise during reload
             lane._oams_runout_detected = False
-
-    def handle_ready(self):
-        # TODO: look into this, maybe this can be removed and update the load sensors correctly
-        # and use the virtual hub like the vivid
-        super().handle_ready()
-        for lane in self.lanes:
-            if hasattr(lane, "hub_obj"):
-                lane.hub_obj.set_state_driven()
-
 
     def _init_follower_and_monitor(self):
         """Set up follower motor controller and stuck/clog monitor."""
@@ -644,6 +864,15 @@ class afcAMS(afcUnit):
 
     def handle_ready(self):
         """Resolve OAMS hardware and start sensor polling once reactor is running."""
+        # Let the upstream afcUnit ready handler run first (natural-orders the
+        # lanes for the Mainsail/Fluidd panels).
+        try:
+            super().handle_ready()
+        except Exception as e:
+            self.logger.debug(f"afcUnit.handle_ready: {e}")
+        # Vivid-style hub: each lane's raw_load_state carries the hub HES and the
+        # native AFC_hub reports any(lane.raw_load_state). The hub stays
+        # non-driven (_state_driven False) — no set_state_driven needed.
         self.oams = self.printer.lookup_object(f"oams {self.oams_name}", None)
 
         if self.oams is None:
@@ -663,23 +892,31 @@ class afcAMS(afcUnit):
             self.afc.reactor.monotonic() + 1.0)
 
     def _is_virtual_hub(self, lane) -> bool:
+        """Return whether a lane's hub is a virtual (pin-backed) hub.
+
+        :param lane: the AFCLane whose hub is inspected.
+        :return bool: True if the lane has a hub that reports a virtual pin.
+        """
         hub = lane.hub_obj
         return (hub is not None
                 and hasattr(hub, 'is_virtual_pin')
                 and hub.is_virtual_pin())
 
     def _sync_lanes_from_hardware(self):
-        """Read current OAMS sensor values and seed tracking arrays.
+        """Read current OAMS sensor values and seed lane state.
 
-        loaded_to_hub is a logical state managed by load/unload
-        operations and restored from the vars file — it is NOT derived
-        from hub HES here.  We only seed the hub object's virtual
-        switch so AFC sees the physical sensor at startup.
+        Vivid-style virtual hub: F1S (feeder) -> prep_state (filament inserted
+        in the lane); hub HES -> raw_load_state, which the native AFC_hub
+        aggregates as any(lane.raw_load_state). No switch_pin_callback /
+        set_state_driven needed.
+
+        NOTE: assumes hub HES is a steady-state "filament at hub" indicator. An
+        earlier revision treated it as transit-only and used F1S for the hub;
+        validate against hardware.
         """
         if self.oams is None:
             return
 
-        eventtime = self.afc.reactor.monotonic()
         f1s_values = getattr(self.oams, 'f1s_hes_value', None) or []
         hub_values = getattr(self.oams, 'hub_hes_value', None) or []
 
@@ -691,17 +928,15 @@ class afcAMS(afcUnit):
             f1s_present = bool(f1s_values[slot]) if slot < len(f1s_values) else False
             hub_present = bool(hub_values[slot]) if slot < len(hub_values) else False
 
-            lane._load_state = f1s_present
+            # Vivid model: prep_state = F1S (filament inserted in lane);
+            # raw_load_state = live hub HES (hub-junction occupancy, trips while
+            # filament is at the junction, 0 at idle). loaded_to_hub is a LATCHED
+            # logical flag — seeded here from F1S (a present spool is staged at
+            # the hub), then held until load/unload or the spool is removed; it
+            # is never clobbered by the transient hub HES.
             lane.prep_state = f1s_present
+            lane._load_state = hub_present
             lane.loaded_to_hub = f1s_present
-
-            # Seed hub virtual switch from hardware
-            hub = getattr(lane, 'hub_obj', None)
-            if hub is not None and hasattr(hub, 'switch_pin_callback'):
-                try:
-                    hub.switch_pin_callback(eventtime, hub_present)
-                except Exception:
-                    pass
 
             if slot < len(f1s_values):
                 self._last_f1s[slot] = f1s_present
@@ -727,13 +962,16 @@ class afcAMS(afcUnit):
             if slot < 0:
                 continue
 
-            # F1S sensor (filament in spool bay)
+            # F1S -> prep_state (filament inserted in lane). When the spool is
+            # removed (F1S lost) the lane can no longer be loaded to hub, so clear
+            # the latched loaded_to_hub (mirrors Vivid clearing it when the prep
+            # sensor is lost). loaded_to_hub is otherwise NOT sensor-derived.
             if slot < len(f1s_values):
                 new_f1s = bool(f1s_values[slot])
 
-                lane._load_state = new_f1s
                 lane.prep_state = new_f1s
-                lane.loaded_to_hub = new_f1s
+                if not new_f1s:
+                    lane.loaded_to_hub = False
 
                 if resync_prev:
                     self._last_f1s[slot] = new_f1s
@@ -751,21 +989,12 @@ class afcAMS(afcUnit):
 
                     self._last_f1s[slot] = new_f1s
 
-            # Hub HES sensor — update the hub object's virtual switch so
-            # AFC sees the physical sensor state.  loaded_to_hub is a
-            # separate logical state managed by load/unload operations.
+            # Hub HES -> raw_load_state: live hub-junction occupancy aggregated by
+            # the native virtual hub (any(lane.raw_load_state)). 0 at idle is
+            # correct — filament is staged clear of the junction.
             if slot < len(hub_values):
                 new_hub = bool(hub_values[slot])
-                old_hub = self._last_hub[slot] if slot < len(self._last_hub) else None
-
-                if resync_prev or (old_hub is not None and new_hub != old_hub):
-                    hub = getattr(lane, 'hub_obj', None)
-                    if hub is not None and hasattr(hub, 'switch_pin_callback'):
-                        try:
-                            hub.switch_pin_callback(eventtime, new_hub)
-                        except Exception:
-                            pass
-
+                lane._load_state = new_hub
                 self._last_hub[slot] = new_hub
 
         return eventtime + 2.0
@@ -773,13 +1002,27 @@ class afcAMS(afcUnit):
     # ── Engagement verification ─────────────────────────────────────
 
     def get_engagement_params(self, lane_name: str) -> tuple:
-        """Return (engagement_length, engagement_speed) for a lane."""
+        """Return (engagement_length, engagement_speed) for a lane.
+
+        Falls back to the unit-level defaults when the lane has no override.
+
+        :param lane_name: lane name to look up.
+        :return tuple: (engagement_length, engagement_speed).
+        """
         if lane_name in self._engagement_params:
             return self._engagement_params[lane_name]
         return (self._engagement_length, self._engagement_speed)
 
     def _verify_engagement(self, cur_lane) -> bool:
-        """Verify filament engagement by extruding and checking encoder/FPS movement."""
+        """Verify filament engagement by extruding and checking encoder/FPS movement.
+
+        Keeps the follower feeding forward, extrudes the configured engagement
+        length in two phases, and confirms the encoder advanced (with one brief
+        retry).
+
+        :param cur_lane: the lane being loaded/verified.
+        :return bool: True if encoder movement confirmed engagement.
+        """
         engagement_length, engagement_speed = self.get_engagement_params(cur_lane.name)
 
         self.logger.info(
@@ -848,14 +1091,25 @@ class afcAMS(afcUnit):
                 self._monitor.notify_engagement_end()
 
     def _oams_extrude(self, length: float, speed: float, label: str = ""):
-        """Extrude filament via gcode for engagement/retraction."""
+        """Extrude filament via gcode for engagement/retraction.
+
+        :param length: extrusion distance in mm (negative to retract).
+        :param speed: feedrate in mm/min.
+        :param label: optional descriptive label (unused in the move itself).
+        """
         self.afc.gcode.run_script_from_command(
             f"G92 E0\nG1 E{length:.3f} F{speed:.0f}\nM400")
 
     # ── Stuck spool / clog detection callbacks ──────────────────────
 
     def _on_stuck_spool_detected(self, fps_name: str = None, message: str = None):
-        """Called by OAMSMonitor when stuck spool detected during print."""
+        """Called by OAMSMonitor when stuck spool detected during print.
+
+        Attempts auto-recovery if enabled, otherwise pauses the print.
+
+        :param fps_name: FPS channel name reporting the condition.
+        :param message: optional pre-formatted message.
+        """
         msg = message or "OpenAMS stuck spool detected"
         if fps_name and fps_name not in msg:
             msg = f"{msg} (FPS: {fps_name})"
@@ -869,7 +1123,13 @@ class afcAMS(afcUnit):
             self.afc.error.AFC_error(msg, pause=True)
 
     def _on_clog_detected(self, fps_name: str = None, message: str = None):
-        """Called by OAMSMonitor when clog detected during print."""
+        """Called by OAMSMonitor when clog detected during print.
+
+        Pauses the print with an explanatory message.
+
+        :param fps_name: FPS channel name reporting the condition.
+        :param message: optional pre-formatted message.
+        """
         msg = message or "OpenAMS clog detected"
         if fps_name and fps_name not in msg:
             msg = f"{msg} (FPS: {fps_name})"
@@ -878,33 +1138,56 @@ class afcAMS(afcUnit):
         self.afc.error.AFC_error(msg, pause=True)
 
     def _on_stuck_spool_cleared(self, fps_name: str = None):
-        """Called by OAMSMonitor when stuck spool condition clears."""
+        """Called by OAMSMonitor when stuck spool condition clears.
+
+        :param fps_name: FPS channel name whose stuck condition cleared.
+        """
         self.logger.info(f"Stuck spool cleared{' on ' + fps_name if fps_name else ''}")
 
     # ── Unit interface overrides ────────────────────────────────────
 
     def prep_load(self, lane: AFCLane):
-        """No-op: OpenAMS firmware drives filament to load sensor directly."""
+        """No-op: OpenAMS firmware drives filament to load sensor directly.
+
+        :param lane: the lane being prepped (unused).
+        """
         pass
 
     def prep_post_load(self, lane: AFCLane):
-        """No-op: OpenAMS handles hub staging internally."""
+        """No-op: OpenAMS handles hub staging internally.
+
+        :param lane: the lane just loaded (unused).
+        """
         pass
 
     def eject_lane(self, lane: AFCLane):
-        """OpenAMS does not support stepper-based eject."""
+        """OpenAMS does not support stepper-based eject.
+
+        Logs guidance to remove the spool physically.
+
+        :param lane: the lane requested for eject.
+        """
         self.logger.info(
             f"Eject not supported for OpenAMS lane {lane.name}. "
             "Remove spool physically or use TOOL_UNLOAD.")
 
     def lane_move(self, cur_lane, distance, speed_mode):
-        """OpenAMS has no stepper — log warning."""
+        """OpenAMS has no stepper — log warning.
+
+        :param cur_lane: the lane requested to move.
+        :param distance: requested move distance (ignored).
+        :param speed_mode: requested speed mode (ignored).
+        """
         self.logger.info(
             f"Lane move not supported for OpenAMS lane {cur_lane.name}. "
             "OpenAMS firmware controls filament movement.")
 
     def lane_unload(self, cur_lane):
-        """Custom lane unload via OAMS hardware."""
+        """Custom lane unload via OAMS hardware.
+
+        :param cur_lane: the lane to unload.
+        :return: True after the hardware unload, or None if no OAMS hardware.
+        """
         if self.oams is None:
             return None
         try:
@@ -918,7 +1201,10 @@ class afcAMS(afcUnit):
         return True
 
     def abort_load(self, cur_lane):
-        """Cancel in-progress OpenAMS load."""
+        """Cancel in-progress OpenAMS load.
+
+        :param cur_lane: the lane whose load is being aborted.
+        """
         if self.oams is not None:
             try:
                 self.oams.abort_current_action(wait=True)
@@ -926,18 +1212,31 @@ class afcAMS(afcUnit):
                 pass
 
     def get_lane_reset_command(self, lane, dis):
-        """OpenAMS lanes don't support distance-based reset."""
+        """OpenAMS lanes don't support distance-based reset.
+
+        :param lane: the lane (unused).
+        :param dis: requested reset distance (unused).
+        :return: always None (no reset command available).
+        """
         return None
 
     def get_current_lane_fallback(self, tool_obj):
-        """Return the loaded lane name for this unit's extruder when on_shuttle is False."""
+        """Return the loaded lane name for this unit's extruder when on_shuttle is False.
+
+        :param tool_obj: the toolhead/extruder object (unused; scans own lanes).
+        :return str: name of the tool-loaded lane, or None.
+        """
         for lane_name, lane in self.lanes.items():
             if getattr(lane, 'tool_loaded', False):
                 return lane_name
         return None
 
     def on_lane_unset_loaded(self, lane, extruder_name):
-        """Cleanup after lane is unset — stop follower, clear runout state."""
+        """Cleanup after lane is unset — stop follower, clear runout state.
+
+        :param lane: the lane being unset.
+        :param extruder_name: name of the extruder it was loaded to.
+        """
         lane._oams_runout_detected = False
         if self._follower is not None and self.oams:
             try:
@@ -948,7 +1247,17 @@ class afcAMS(afcUnit):
                 pass
 
     def system_Test(self, cur_lane, delay, assignTcmd, enable_movement):
-        """OpenAMS system test — query hardware sensors for lane state."""
+        """OpenAMS system test — query hardware sensors for lane state.
+
+        Reads the lane's F1S/hub sensors, updates lane/tool state and LEDs, and
+        re-establishes the follower/monitor when the lane is tool-loaded.
+
+        :param cur_lane: the lane to test.
+        :param delay: prep delay (unused by OpenAMS).
+        :param assignTcmd: when True, (re)assign the lane's T-command.
+        :param enable_movement: movement-enable flag (unused; no stepper).
+        :return bool: True if the test succeeded (OAMS connected).
+        """
         msg = ''
         succeeded = True
 
@@ -958,29 +1267,17 @@ class afcAMS(afcUnit):
         else:
             slot = self._spool_map.get(cur_lane.name, -1)
 
-            # Read state directly from OAMS hardware sensors
+            # Read OAMS sensors. prep_state = F1S (inserted); raw_load_state =
+            # live hub HES. loaded_to_hub is latched: seed it from F1S (a present
+            # spool is staged at the hub), force True if the lane is tool-loaded.
             f1s_values = getattr(self.oams, 'f1s_hes_value', None) or []
             hub_values = getattr(self.oams, 'hub_hes_value', None) or []
-
             f1s_present = bool(f1s_values[slot]) if 0 <= slot < len(f1s_values) else False
             hub_present = bool(hub_values[slot]) if 0 <= slot < len(hub_values) else False
 
-            # Update lane state from hardware.
-            # loaded_to_hub = True when a spool is present (F1S) — OAMS
-            # feeds to hub on demand so a loaded bay is "at the hub."
-            # Hub HES is a transit sensor, not an idle-state indicator.
-            cur_lane._load_state = f1s_present
             cur_lane.prep_state = f1s_present
+            cur_lane._load_state = hub_present
             cur_lane.loaded_to_hub = f1s_present
-
-            # Seed hub virtual switch from hardware sensor
-            hub = getattr(cur_lane, 'hub_obj', None)
-            if hub is not None and hasattr(hub, 'switch_pin_callback'):
-                try:
-                    hub.switch_pin_callback(
-                        self.afc.reactor.monotonic(), hub_present)
-                except Exception:
-                    pass
 
             if f1s_present:
                 self.lane_loaded(cur_lane)
@@ -992,9 +1289,7 @@ class afcAMS(afcUnit):
                 if (cur_lane.tool_loaded
                     and cur_lane.extruder_obj.lane_loaded == cur_lane.name):
                     cur_lane.sync_to_extruder()
-
                     msg += cur_lane.extruder_obj.prep_on_shuttle_check(cur_lane)
-
                     if self.afc.current == cur_lane.name:
                         self.afc.spool.set_active_spool(cur_lane.spool_id)
                         self.lane_tool_loaded(cur_lane)
@@ -1032,7 +1327,12 @@ class afcAMS(afcUnit):
         return succeeded
 
     def calibrate_lane(self, cur_lane, tol):
-        """Run HUB HES calibration for an OpenAMS lane."""
+        """Run HUB HES calibration for an OpenAMS lane.
+
+        :param cur_lane: the lane to calibrate (must be loaded).
+        :param tol: calibration tolerance (unused by OpenAMS).
+        :return tuple: (success bool, message str, distance int).
+        """
         if self.oams is None:
             return False, "OpenAMS hardware not available", 0
 
@@ -1047,10 +1347,20 @@ class afcAMS(afcUnit):
         return False, f"HUB HES calibration failed for {cur_lane.name}", 0
 
     def calibration_lane_message(self) -> str:
+        """Return the summary message template for completed lane calibration.
+
+        :return str: format string with a ``{lanes}`` placeholder.
+        """
         return "\nHUB HES calibration complete for lanes: {lanes}\n"
 
     def calibrate_bowden(self, cur_lane, dis, tol):
-        """Run PTFE length calibration for an OpenAMS lane."""
+        """Run PTFE length calibration for an OpenAMS lane.
+
+        :param cur_lane: the lane to calibrate (must be loaded).
+        :param dis: requested distance (unused; firmware drives calibration).
+        :param tol: calibration tolerance (unused by OpenAMS).
+        :return tuple: (success bool, message str, distance int).
+        """
         if self.oams is None:
             return False, "OpenAMS hardware not available", 0
 
@@ -1070,7 +1380,11 @@ class afcAMS(afcUnit):
     def _toolhead_sensor_triggered(self, cur_lane):
         """Check if the toolhead sensor is triggered, using the raw hardware
         button state for U1 motion sensors (which need encoder rotation for
-        filament_present but have a physical switch for static detection)."""
+        filament_present but have a physical switch for static detection).
+
+        :param cur_lane: the lane whose extruder sensor is checked.
+        :return bool: True if the toolhead sensor sees filament.
+        """
         sensor_obj = getattr(cur_lane.extruder_obj, 'filament_sensor_obj', None)
         if sensor_obj is not None and hasattr(sensor_obj, 'runout_buttun_state'):
             return bool(sensor_obj.runout_buttun_state)
@@ -1079,7 +1393,10 @@ class afcAMS(afcUnit):
     # ── Custom load/unload gcode handlers ───────────────────────────
 
     def _cmd_oams_custom_load(self, gcmd):
-        """Handle _OAMS_CUSTOM_LOAD — filament transport to toolhead area."""
+        """Handle _OAMS_CUSTOM_LOAD — filament transport to toolhead area.
+
+        :param gcmd: gcode command; reads ``LANE``.
+        """
         lane_name = gcmd.get('LANE')
         cur_lane = self.afc.lanes.get(lane_name)
         if cur_lane is None:
@@ -1090,7 +1407,10 @@ class afcAMS(afcUnit):
             raise gcmd.error(f"OAMS load failed for {lane_name}")
 
     def _cmd_oams_custom_unload(self, gcmd):
-        """Handle _OAMS_CUSTOM_UNLOAD — filament transport from toolhead."""
+        """Handle _OAMS_CUSTOM_UNLOAD — filament transport from toolhead.
+
+        :param gcmd: gcode command; reads ``LANE``.
+        """
         lane_name = gcmd.get('LANE')
         cur_lane = self.afc.lanes.get(lane_name)
         if cur_lane is None:
@@ -1101,7 +1421,14 @@ class afcAMS(afcUnit):
             raise gcmd.error(f"OAMS unload failed for {lane_name}")
 
     def _oams_load_sequence(self, cur_lane, cur_extruder) -> bool:
-        """OAMS load transport: push filament to toolhead area."""
+        """OAMS load transport: push filament to toolhead area.
+
+        Guards polling against state corruption for the duration of the load.
+
+        :param cur_lane: the lane being loaded.
+        :param cur_extruder: the lane's extruder object.
+        :return bool: True on successful transport.
+        """
         self._operation_active = True
         try:
             return self._oams_load_inner(cur_lane, cur_extruder)
@@ -1115,6 +1442,10 @@ class afcAMS(afcUnit):
         AFC's load_sequence handles the shared toolhead engagement
         (sync_to_extruder, tool_end, tool_stn, sensor verification,
         buffer ram) after this returns via custom_load_cmd.
+
+        :param cur_lane: the lane being loaded.
+        :param cur_extruder: the lane's extruder object.
+        :return bool: True on successful transport.
         """
         # Clear suppression — this lane is being intentionally loaded
         self._hub_load_suppressed.discard(cur_lane.name)
@@ -1123,15 +1454,21 @@ class afcAMS(afcUnit):
         if not self._oams_load(cur_lane):
             return False
 
+        # Latch loaded_to_hub True; raw_load_state (live hub HES) is updated by
+        # the sensor poll as filament passes/clears the hub junction.
         cur_lane.loaded_to_hub = True
-        hub_obj = getattr(cur_lane, "hub_obj", None)
-        if hub_obj is not None and hasattr(hub_obj, "switch_pin_callback"):
-            hub_obj.switch_pin_callback(self.afc.reactor.monotonic(), True)
 
         return True
 
     def _oams_unload_sequence(self, cur_lane, cur_extruder) -> bool:
-        """OAMS unload transport — OAMS hardware unload back to spool bay."""
+        """OAMS unload transport — OAMS hardware unload back to spool bay.
+
+        Guards polling against state corruption for the duration of the unload.
+
+        :param cur_lane: the lane being unloaded.
+        :param cur_extruder: the lane's extruder object.
+        :return bool: True on successful unload transport.
+        """
         self._operation_active = True
         try:
             return self._oams_unload_inner(cur_lane, cur_extruder)
@@ -1146,6 +1483,8 @@ class afcAMS(afcUnit):
         ``prepare_unload``, so stop the OAMS follower here too — otherwise it
         keeps feeding forward against the cut/park/tip before the hardware
         unload reverses it.
+
+        :param lane: the lane beginning to unload.
         """
         super().lane_unloading(lane)
         try:
@@ -1163,6 +1502,10 @@ class afcAMS(afcUnit):
         (unload_spool) drives the follower in reverse itself during the rewind.
         Reversing it this early would pull filament back during the toolhead
         cut/park/tip operations, before the tip is even formed.
+
+        :param cur_lane: the lane being unloaded.
+        :param cur_hub: the lane's hub object.
+        :param cur_extruder: the lane's extruder object.
         """
         if self._follower:
             self._follower.set_follower_state(
@@ -1175,6 +1518,10 @@ class afcAMS(afcUnit):
         AFC's unload_sequence handles the shared toolhead operations
         (LED, heat, quick pull, buffer disable, sync, cut/park/tip)
         and unsync_to_extruder before calling this via custom_unload_cmd.
+
+        :param cur_lane: the lane being unloaded.
+        :param cur_extruder: the lane's extruder object.
+        :return bool: True on successful hardware unload.
         """
         afc = self.afc
 
@@ -1184,8 +1531,9 @@ class afcAMS(afcUnit):
                 cur_lane, f"OAMS unload failed for {cur_lane.name}")
             return False
 
-        # Finalize state
-        cur_lane.loaded_to_hub = True
+        # Finalize state. _oams_unload() already latched loaded_to_hub from the
+        # live F1S (spool present in bay = still staged; spool yanked = not
+        # staged) and settled the hub HES, so do NOT force it True here.
         self.lane_tool_unloaded(cur_lane)
         self._hub_load_suppressed.add(cur_lane.name)
 
@@ -1193,7 +1541,16 @@ class afcAMS(afcUnit):
         return True
 
     def _oams_load(self, cur_lane, max_retries: int = 3) -> bool:
-        """Load filament via OpenAMS hardware with engagement verification."""
+        """Load filament via OpenAMS hardware with engagement verification.
+
+        Short-circuits if the firmware already has the spool loaded to the
+        toolhead; otherwise drives the follower, sends the hardware load,
+        verifies engagement, and retries with cleanup on failure.
+
+        :param cur_lane: the lane to load.
+        :param max_retries: number of load attempts before giving up.
+        :return bool: True if the spool loaded and engaged.
+        """
         if self.oams is None:
             self.logger.error("OAMS hardware not available")
             return False
@@ -1379,7 +1736,15 @@ class afcAMS(afcUnit):
         return False
 
     def _oams_unload(self, cur_lane) -> bool:
-        """Unload filament via OpenAMS hardware."""
+        """Unload filament via OpenAMS hardware.
+
+        Reverses the follower, retracts the extruder, runs the hardware unload
+        (skipped for runout-empty spools), then waits for the hub HES to settle
+        clear and latches the post-unload lane state.
+
+        :param cur_lane: the lane to unload.
+        :return bool: True if the unload succeeded.
+        """
         if self.oams is None:
             self.logger.error("OAMS hardware not available")
             return False
@@ -1487,22 +1852,25 @@ class afcAMS(afcUnit):
             if self._monitor:
                 self._monitor.notify_unload_complete()
 
-            # Update hub state from hardware sensor
-            if hasattr(self.oams, 'hub_hes_value'):
-                hub_values = self.oams.hub_hes_value
-                if hub_values and spool_index < len(hub_values):
-                    cur_lane.loaded_to_hub = bool(hub_values[spool_index])
+            # After unload the spool stays staged in the bay: latch loaded_to_hub
+            # to whether the spool is still present (F1S). raw_load_state (live
+            # hub HES) is refreshed by the sensor poll.
+            if hasattr(self.oams, 'f1s_hes_value'):
+                f1s_values = self.oams.f1s_hes_value
+                if f1s_values and spool_index < len(f1s_values):
+                    f1s_present = bool(f1s_values[spool_index])
+                    cur_lane.prep_state = f1s_present
+                    cur_lane.loaded_to_hub = f1s_present
 
-                    # Update virtual hub sensor
-                    hub = cur_lane.hub_obj
-                    if hub and hasattr(hub, 'switch_pin_callback'):
-                        try:
-                            eventtime = self.afc.reactor.monotonic()
-                            hub.switch_pin_callback(
-                                eventtime,
-                                bool(hub_values[spool_index]))
-                        except Exception:
-                            pass
+            # The OAMS retract-past/push-back/back-off settle makes the hub HES
+            # bounce; wait for it to settle clear so the shared virtual hub reads
+            # clear before AFC's next-lane "hub clear?" load check — otherwise the
+            # swap errors "Hub not clear" on a transient reading. Reflect the
+            # settled value immediately instead of waiting for the 2s sensor poll.
+            if self._wait_for_hub_settle(spool_index):
+                cur_lane._load_state = False
+                if spool_index < len(self._last_hub):
+                    self._last_hub[spool_index] = False
 
             return success
 
@@ -1513,7 +1881,10 @@ class afcAMS(afcUnit):
     # ── Calibration commands ────────────────────────────────────────
 
     def cmd_AFC_OAMS_CALIBRATE_PTFE(self, gcmd):
-        """Calibrate PTFE length for OpenAMS unit."""
+        """Calibrate PTFE length for OpenAMS unit.
+
+        :param gcmd: gcode command; reads optional ``SPOOL`` (default 0).
+        """
         if self.oams is None:
             gcmd.respond_info("OAMS hardware not available")
             return
@@ -1527,7 +1898,10 @@ class afcAMS(afcUnit):
             gcmd.respond_info(f"PTFE calibration failed: {e}")
 
     def cmd_AFC_OAMS_CALIBRATE_HUB_HES(self, gcmd):
-        """Calibrate hub HES sensor for a specific spool bay."""
+        """Calibrate hub HES sensor for a specific spool bay.
+
+        :param gcmd: gcode command; requires ``SPOOL=<index>``.
+        """
         if self.oams is None:
             gcmd.respond_info("OAMS hardware not available")
             return
@@ -1540,7 +1914,10 @@ class afcAMS(afcUnit):
             f"Hub HES calibration {'successful' if success else 'failed'} for spool {spool}")
 
     def cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL(self, gcmd):
-        """Calibrate hub HES for all loaded spool bays."""
+        """Calibrate hub HES for all loaded spool bays.
+
+        :param gcmd: gcode command (no parameters used).
+        """
         if self.oams is None:
             gcmd.respond_info("OAMS hardware not available")
             return
@@ -1553,7 +1930,13 @@ class afcAMS(afcUnit):
         gcmd.respond_info(f"Calibrated {count} hub HES sensor(s)")
 
     def cmd_AFC_OAMS_CLEAR_ERRORS(self, gcmd):
-        """Clear OpenAMS errors and resync state with hardware."""
+        """Clear OpenAMS errors and resync state with hardware.
+
+        Aborts any in-flight action, clears firmware errors, resets this unit's
+        lane tool-loaded state and LEDs, and restarts the monitor.
+
+        :param gcmd: gcode command (no parameters used).
+        """
         if self.oams is None:
             gcmd.respond_info("OAMS hardware not available")
             return
@@ -1607,6 +1990,12 @@ class afcAMS(afcUnit):
 
         Scopes lookups to the event lane's own extruder to avoid
         cross-extruder interference in multi-extruder setups.
+
+        :param lane_name: name of the lane the event concerns.
+        :param loaded: True when the spool became tool-loaded, False when unloaded.
+        :param spool_index: optional spool index reported with the event.
+        :param eventtime: optional reactor time; defaults to now.
+        :return bool: True if the event was applied (lane resolved).
         """
         lane = self._resolve_lane_reference(lane_name)
         if lane is None:
@@ -1678,6 +2067,10 @@ class afcAMS(afcUnit):
 
         Returns True if the update should be suppressed. Automatically
         clears the flag once the runout handling window has passed.
+
+        :param lane: the lane whose sensor update is being evaluated.
+        :param new_val: the new sensor value about to be applied.
+        :return bool: True if the update should be suppressed.
         """
         if not getattr(lane, '_oams_runout_detected', False):
             return False
@@ -1705,7 +2098,12 @@ class afcAMS(afcUnit):
         return False
 
     def _is_same_extruder(self, source_lane, target_lane):
-        """Check if two lanes share the same physical extruder."""
+        """Check if two lanes share the same physical extruder.
+
+        :param source_lane: the first lane.
+        :param target_lane: the second lane.
+        :return bool: True if both resolve to the same extruder name.
+        """
         src_ext = getattr(source_lane, 'extruder_obj', None)
         tgt_ext = getattr(target_lane, 'extruder_obj', None)
         if src_ext is None or tgt_ext is None:
@@ -1722,6 +2120,10 @@ class afcAMS(afcUnit):
         The old filament coasts through the shared PTFE. OAMS pushes
         the new spool's filament forward to meet it at the extruder
         gears seamlessly.
+
+        :param source_lane: the runout (source) lane.
+        :param target_lane: the runout_lane to reload from.
+        :return bool: True if the reload completed, False on failure (print paused).
         """
         afc = self.afc
         source_name = source_lane.name
@@ -1767,6 +2169,10 @@ class afcAMS(afcUnit):
 
         Classifies the runout as same-extruder (seamless reload) or
         other (defers to AFC's normal infinite spool / pause logic).
+
+        :param spool_index: spool index reported by the hardware.
+        :param monitor: optional originating monitor (unused).
+        :param lane_name: optional lane name fallback when the index doesn't resolve.
         """
         lane = self._lane_for_spool_index(spool_index)
         if lane is None and lane_name:
@@ -1805,7 +2211,11 @@ class afcAMS(afcUnit):
                 "deferring to AFC infinite spool handling")
 
     def check_runout(self, lane=None):
-        """OAMS runout: only trigger when printing AND this lane is loaded to its extruder."""
+        """OAMS runout: only trigger when printing AND this lane is loaded to its extruder.
+
+        :param lane: the lane to test for an actionable runout.
+        :return bool: True if a runout should be acted on for this lane.
+        """
         if lane is None:
             return False
         try:
@@ -1826,6 +2236,9 @@ class afcAMS(afcUnit):
 
         Called by handle_load_runout before the generic _perform_infinite_runout.
         Returns True if handled, False to fall through to generic behavior.
+
+        :param lane: the lane that ran out.
+        :return bool: True if fully handled here, False to defer to generic logic.
         """
         runout_lane_name = getattr(lane, 'runout_lane', None)
 
@@ -1868,7 +2281,10 @@ class afcAMS(afcUnit):
         return False
 
     def on_filament_insert(self, lane):
-        """OAMS insert: update lane state and publish event."""
+        """OAMS insert: update lane state and publish event.
+
+        :param lane: the lane a spool was inserted into.
+        """
         lane.loaded_to_hub = True
         self.lane_loaded(lane)
         self.lane_illuminate_spool(lane)
@@ -1881,7 +2297,10 @@ class afcAMS(afcUnit):
         super().on_filament_insert(lane)
 
     def on_filament_remove(self, lane):
-        """OAMS removal: update lane state, cancel pending TD-1 timers, publish event."""
+        """OAMS removal: update lane state, cancel pending TD-1 timers, publish event.
+
+        :param lane: the lane a spool was removed from.
+        """
         if lane.name in self._pending_spool_loaded_timers:
             try:
                 timer = self._pending_spool_loaded_timers[lane.name]
@@ -1914,6 +2333,9 @@ class afcAMS(afcUnit):
         an empty lane. NOTE: determine_current_spool() re-queries the firmware
         (authoritative), so the _oams_load "already loaded" guard relies on the
         toolhead sensor, not this value — this is hygiene, not the load guard.
+
+        :param spool_index: bay index that went empty (None is a no-op).
+        :param lane: the lane associated with the bay.
         """
         if spool_index is None or self.oams is None:
             return
@@ -1941,7 +2363,10 @@ class afcAMS(afcUnit):
 
     def _clear_lane_info(self, lane):
         """Clear a lane's spool/filament data so a new insert starts fresh
-        (mirrors the U1 RFID _clear_lane)."""
+        (mirrors the U1 RFID _clear_lane).
+
+        :param lane: the lane whose spool/filament info is cleared.
+        """
         lane.material = ""
         lane.color = ""
         if getattr(lane, 'spool_id', None) not in (None, "", 0):
@@ -1962,6 +2387,9 @@ class afcAMS(afcUnit):
 
         The firmware cancel command stops the follower motor and considers the
         spool loaded at its current position.
+
+        :param spool_index: bay index to record as the current spool.
+        :param lane_name: optional lane name for context (unused).
         """
         self.oams.load_spool_cancel()
         deadline = self.afc.reactor.monotonic() + 5.0
@@ -1981,7 +2409,10 @@ class afcAMS(afcUnit):
 
     def _clear_lane_state_after_td1(self, cur_lane):
         """Clear AFC-level lane loaded state that background detection may have set
-        during a temporary TD-1 load."""
+        during a temporary TD-1 load.
+
+        :param cur_lane: the lane whose transient TD-1 loaded state is cleared.
+        """
         try:
             if getattr(cur_lane, "tool_loaded", False):
                 cur_lane.set_tool_unloaded()
@@ -1993,7 +2424,13 @@ class afcAMS(afcUnit):
         self.afc.save_vars()
 
     def _unload_after_td1(self, cur_lane, spool_index):
-        """Unload filament after TD-1 operation using firmware unload_spool()."""
+        """Unload filament after TD-1 operation using firmware unload_spool().
+
+        Retries up to three times, clears firmware errors, and resets lane state.
+
+        :param cur_lane: the lane being unloaded.
+        :param spool_index: bay index being unloaded.
+        """
         success = False
         for attempt in range(3):
             try:
@@ -2012,7 +2449,11 @@ class afcAMS(afcUnit):
         self._clear_lane_state_after_td1(cur_lane)
 
     def _cancel_and_cleanup_td1(self, cur_lane, spool_index):
-        """Cancel load and clean up after a failed TD-1 calibration."""
+        """Cancel load and clean up after a failed TD-1 calibration.
+
+        :param cur_lane: the lane involved in the failed calibration.
+        :param spool_index: bay index to cancel/unload.
+        """
         try:
             self._cancel_and_mark_loaded(spool_index, cur_lane.name)
         except Exception:
@@ -2033,7 +2474,11 @@ class afcAMS(afcUnit):
         self._clear_lane_state_after_td1(cur_lane)
 
     def _get_td1_snapshot(self, cur_lane):
-        """Get a hashable snapshot of TD-1 data for change detection."""
+        """Get a hashable snapshot of TD-1 data for change detection.
+
+        :param cur_lane: the lane whose TD-1 device data is read.
+        :return tuple: (scan_time, td, color), or None if unavailable.
+        """
         try:
             td1_data = self.afc.moonraker.get_td1_data()
         except Exception:
@@ -2049,7 +2494,16 @@ class afcAMS(afcUnit):
         return (scan_time, td, color)
 
     def _interpolate_encoder_at_scan(self, scan_time_str, encoder_history, fallback):
-        """Find encoder position at the TD-1 scan_time by interpolating history."""
+        """Find encoder position at the TD-1 scan_time by interpolating history.
+
+        Picks the recorded encoder value whose wall-clock time is closest to the
+        scan timestamp.
+
+        :param scan_time_str: TD-1 scan timestamp string (ISO-ish).
+        :param encoder_history: list of (wall_time, encoder) samples.
+        :param fallback: value returned when the time can't be parsed/matched.
+        :return: the best-matching encoder value, or ``fallback``.
+        """
         try:
             st = scan_time_str
             if st.endswith("+00:00Z"):
@@ -2080,6 +2534,11 @@ class afcAMS(afcUnit):
         Loads spool, waits for hub trigger, captures encoder reference,
         then lets the load continue while polling TD-1 every 2 seconds.
         When TD-1 reads data, captures encoder delta from hub = bowden length.
+
+        :param cur_lane: the lane to calibrate (needs a td1_device_id).
+        :param dis: requested distance (unused; load is continuous).
+        :param tol: calibration tolerance (unused).
+        :return tuple: (success bool, message str, encoder_delta int).
         """
         if cur_lane.td1_device_id is None:
             msg = (f"Cannot calibrate TD-1 for {cur_lane.name}, td1_device_id "
@@ -2194,7 +2653,16 @@ class afcAMS(afcUnit):
         return True, "td1_bowden_length calibration successful", encoder_delta
 
     def _capture_td1_with_oams(self, cur_lane, *, require_loaded, require_enabled) -> Tuple[bool, str]:
-        """Capture TD-1 data using OAMS hardware load/unload cycle."""
+        """Capture TD-1 data using OAMS hardware load/unload cycle.
+
+        Validates preconditions, loads the spool to the hub, advances by the
+        configured bowden length, reads TD-1, then unloads.
+
+        :param cur_lane: the lane to capture from.
+        :param require_loaded: require the lane to be loaded/prepped first.
+        :param require_enabled: require ``td1_when_loaded`` to be enabled.
+        :return tuple: (success bool, status message str).
+        """
         last_capture_time = self._td1_last_capture_time
         if last_capture_time is not None:
             settle_delay = 4.2 - (self.afc.reactor.monotonic() - last_capture_time)
@@ -2347,7 +2815,11 @@ class afcAMS(afcUnit):
         return True, "TD-1 data captured"
 
     def prep_capture_td1(self, cur_lane):
-        """OpenAMS prep TD-1 capture — only when capture_td1_when_loaded is True."""
+        """OpenAMS prep TD-1 capture — only when capture_td1_when_loaded is True.
+
+        :param cur_lane: the lane to capture during prep.
+        :return: (success, message) tuple, or None if capture is skipped.
+        """
         if not cur_lane.td1_when_loaded:
             return None
         if self.afc.function.get_current_lane_obj() is not None:
@@ -2356,23 +2828,40 @@ class afcAMS(afcUnit):
             cur_lane, require_loaded=True, require_enabled=False)
 
     def capture_td1_data(self, cur_lane):
+        """Capture TD-1 data for a lane via the OAMS load/unload cycle.
+
+        :param cur_lane: the lane to capture from.
+        :return tuple: (success bool, status message str).
+        """
         return self._capture_td1_with_oams(
             cur_lane, require_loaded=True, require_enabled=False)
 
     # ── Internal helpers ────────────────────────────────────────────
 
     def _get_oams_index(self) -> int:
-        """Return numeric OAMS index for gcode commands."""
+        """Return numeric OAMS index for gcode commands.
+
+        :return int: the numeric suffix of ``oams_name`` (1 on parse failure).
+        """
         try:
             return int(self.oams_name.replace("oams", ""))
         except (ValueError, AttributeError):
             return 1
 
     def _get_openams_spool_index(self, lane) -> int:
+        """Return the spool/bay index mapped to a lane.
+
+        :param lane: the lane to look up.
+        :return int: the spool index, or 0 if unmapped.
+        """
         return self._spool_map.get(getattr(lane, 'name', ''), 0)
 
     def _resolve_lane_reference(self, lane_name: Optional[str]):
-        """Resolve lane name to lane object, with case-insensitive fallback."""
+        """Resolve lane name to lane object, with case-insensitive fallback.
+
+        :param lane_name: lane name to resolve.
+        :return: the matching AFCLane object, or None.
+        """
         if not lane_name:
             return None
         if lane_name in self.afc.lanes:
@@ -2384,7 +2873,11 @@ class afcAMS(afcUnit):
         return None
 
     def _lane_for_spool_index(self, spool_index: Optional[int]):
-        """Find lane by spool index."""
+        """Find lane by spool index.
+
+        :param spool_index: the spool/bay index to look up.
+        :return: the matching AFCLane object, or None.
+        """
         if spool_index is None:
             return None
         for name, idx in self._spool_map.items():
@@ -2393,7 +2886,11 @@ class afcAMS(afcUnit):
         return None
 
     def _wait_for_idle(self, timeout: float = 30.0) -> bool:
-        """Wait for OAMS hardware to become idle."""
+        """Wait for OAMS hardware to become idle.
+
+        :param timeout: maximum seconds to wait.
+        :return bool: True if idle, False on timeout or no hardware.
+        """
         if self.oams is None:
             return False
         deadline = self.afc.reactor.monotonic() + timeout
@@ -2405,14 +2902,64 @@ class afcAMS(afcUnit):
         self.logger.error("OAMS idle timeout")
         return False
 
+    def _wait_for_hub_settle(self, spool_index: int, timeout: float = 4.0,
+                             stable_time: float = 0.3) -> bool:
+        """Wait for a spool's hub HES to settle CLEAR after an unload.
+
+        The OAMS unload retracts filament past the hub HES, pushes it back to
+        the sensor, then backs off to idle — so the hub HES bounces before it
+        settles clear. Because the shared virtual hub reports
+        any(lane.raw_load_state), if AFC's next-lane "hub clear?" check runs
+        mid-bounce it falsely sees "Hub not clear". Poll the LIVE hub HES until
+        it has read clear continuously for ``stable_time`` (up to ``timeout``).
+
+        :param spool_index: the spool/bay whose hub HES is watched.
+        :param timeout: maximum seconds to wait for a stable-clear reading.
+        :param stable_time: seconds the HES must read clear continuously.
+        :return: True if it settled clear, False on timeout (a real obstruction).
+        """
+        if self.oams is None:
+            return True
+        reactor = self.afc.reactor
+        deadline = reactor.monotonic() + timeout
+        clear_since = None
+        while True:
+            now = reactor.monotonic()
+            try:
+                hub_values = getattr(self.oams, 'hub_hes_value', None) or []
+                hub_present = (bool(hub_values[spool_index])
+                               if spool_index < len(hub_values) else False)
+            except Exception:
+                hub_present = False
+            if not hub_present:
+                if clear_since is None:
+                    clear_since = now
+                elif now - clear_since >= stable_time:
+                    return True
+            else:
+                clear_since = None
+            if now >= deadline:
+                self.logger.warning(
+                    f"OAMS hub HES did not settle clear within {timeout}s "
+                    f"(spool {spool_index}); proceeding")
+                return False
+            reactor.pause(now + 0.05)
+
     def _get_monitor_state(self):
-        """Get FPS state for follower/monitor interactions."""
+        """Get FPS state for follower/monitor interactions.
+
+        :return: the monitor's ``FPSState``, or None if no monitor exists.
+        """
         if self._monitor:
             return self._monitor.state
         return None
 
     def _calibrate_hub_hes_spool(self, spool_index: int) -> bool:
-        """Run hub HES calibration for a single spool bay."""
+        """Run hub HES calibration for a single spool bay.
+
+        :param spool_index: the spool/bay index to calibrate.
+        :return bool: True if the calibration command was dispatched without error.
+        """
         try:
             oams_idx = self._get_oams_index()
             self.afc.gcode.run_script_from_command(
@@ -2438,6 +2985,7 @@ class afcAMS(afcUnit):
 class FollowerState:
     """Track follower motor state for a single OAMS unit."""
     def __init__(self):
+        """Initialize follower tracking with no last-sent command."""
         self.coasting   = False
         self.last_state = None  # (enable, direction) to avoid redundant MCU commands
 
@@ -2465,17 +3013,29 @@ class FollowerController:
         self._led_error_state: Dict[str, int] = {}
 
     def get_follower_state(self, oams_name):
-        """Get or create follower state tracking for an OAMS unit."""
+        """Get or create follower state tracking for an OAMS unit.
+
+        :param oams_name: OAMS hardware name.
+        :return FollowerState: the (possibly newly created) state record.
+        """
         if oams_name not in self.follower_state:
             self.follower_state[oams_name] = FollowerState()
         return self.follower_state[oams_name]
 
     def get_oams(self, oams_name):
-        """Look up OAMS hardware object by name."""
+        """Look up OAMS hardware object by name.
+
+        :param oams_name: OAMS hardware name.
+        :return: the OAMS hardware object, or None.
+        """
         return self.oams.get(oams_name)
 
     def is_mcu_ready(self, oams):
-        """Check if OAMS MCU is ready for commands."""
+        """Check if OAMS MCU is ready for commands.
+
+        :param oams: OAMS hardware object.
+        :return bool: True if its MCU is connected and not shut down.
+        """
         if oams is None:
             return False
         try:
@@ -2495,7 +3055,14 @@ class FollowerController:
     # ---- Follower motor control ----
 
     def enable_follower(self, fps_state, oams, direction, context, force=False):
-        """Enable follower motor in the given direction."""
+        """Enable follower motor in the given direction.
+
+        :param fps_state: FPS state (unused; kept for interface symmetry).
+        :param oams: OAMS hardware object to drive.
+        :param direction: 0 or 1 (defaults to 1 if out of range).
+        :param context: short description logged with the command.
+        :param force: send even if the state appears unchanged.
+        """
         if oams is None:
             return
         direction = direction if direction in (0, 1) else 1
@@ -2504,7 +3071,15 @@ class FollowerController:
             self._set_follower_if_changed(oams_name, oams, 1, direction, context, force=force)
 
     def set_follower_state(self, fps_state, oams, enable, direction, context, force=False):
-        """Set follower state directly."""
+        """Set follower state directly.
+
+        :param fps_state: FPS state (unused; kept for interface symmetry).
+        :param oams: OAMS hardware object to drive.
+        :param enable: enable flag for the follower motor.
+        :param direction: 0 or 1 (defaults to 1 if out of range).
+        :param context: short description logged with the command.
+        :param force: send even if the state appears unchanged.
+        """
         if oams is None:
             return
         oams_name = getattr(oams, 'name', None)
@@ -2514,7 +3089,15 @@ class FollowerController:
         self._set_follower_if_changed(oams_name, oams, enable, direction, context, force=force)
 
     def _set_follower_if_changed(self, oams_name, oams, enable, direction, context, force=False):
-        """Send follower MCU command only if state changed (or force=True)."""
+        """Send follower MCU command only if state changed (or force=True).
+
+        :param oams_name: OAMS hardware name (state key).
+        :param oams: OAMS hardware object to drive.
+        :param enable: enable flag for the follower motor.
+        :param direction: follower direction.
+        :param context: short description logged with the command.
+        :param force: send even if the (enable, direction) state is unchanged.
+        """
         state = self.get_follower_state(oams_name)
         new_state = (enable, direction)
 
@@ -2535,7 +3118,14 @@ class FollowerController:
     # ---- LED error control ----
 
     def set_led_error_if_changed(self, oams, oams_name, spool_idx, error_state, context=""):
-        """Set LED error state on hardware, deduplicating repeated calls."""
+        """Set LED error state on hardware, deduplicating repeated calls.
+
+        :param oams: OAMS hardware object.
+        :param oams_name: OAMS hardware name (dedup key prefix).
+        :param spool_idx: spool/bay index whose LED is affected.
+        :param error_state: target error state to set.
+        :param context: short description logged with the command.
+        """
         key = f"{oams_name}_{spool_idx}"
         current = self._led_error_state.get(key)
         if current == error_state:
@@ -2550,13 +3140,25 @@ class FollowerController:
             self.logger.error(f"Failed to set LED error on {oams_name}: {e}")
 
     def clear_error_led(self, oams, oams_name, spool_idx, context=""):
-        """Clear LED error state."""
+        """Clear LED error state.
+
+        :param oams: OAMS hardware object.
+        :param oams_name: OAMS hardware name.
+        :param spool_idx: spool/bay index whose LED is cleared.
+        :param context: short description logged with the command.
+        """
         self.set_led_error_if_changed(oams, oams_name, spool_idx, 0, context)
 
     # ---- Rate-limited MCU command queue ----
 
     def rate_limited_mcu_command(self, oams_name, command_fn, *args, **kwargs):
-        """Queue an MCU command with completion-aware rate limiting."""
+        """Queue an MCU command with completion-aware rate limiting.
+
+        :param oams_name: OAMS hardware name (queue key).
+        :param command_fn: callable to invoke on the MCU.
+        :param args: positional arguments forwarded to ``command_fn``.
+        :param kwargs: keyword arguments forwarded to ``command_fn``.
+        """
         oams = self.oams.get(oams_name)
         if oams is None or not self.is_mcu_ready(oams):
             return
@@ -2569,7 +3171,13 @@ class FollowerController:
         self._process_mcu_command_queue(oams_name)
 
     def _process_mcu_command_queue(self, oams_name):
-        """Process queued MCU commands, one at a time."""
+        """Process queued MCU commands, one at a time.
+
+        Defers while a command is in flight or the OAMS reports a busy
+        ``action_status``, retrying via a short reactor timer.
+
+        :param oams_name: OAMS hardware name whose queue is processed.
+        """
         oams = self.oams.get(oams_name)
         if oams is None:
             return
@@ -2582,6 +3190,11 @@ class FollowerController:
 
         if getattr(oams, "action_status", None) is not None:
             def _retry(eventtime):
+                """Timer callback: re-attempt the queue once the OAMS is no longer busy.
+
+                :param eventtime: reactor time the timer fired.
+                :return: ``reactor.NEVER`` (one-shot timer).
+                """
                 self._mcu_command_in_flight[oams_name] = False
                 self._process_mcu_command_queue(oams_name)
                 return self.reactor.NEVER
@@ -2603,6 +3216,11 @@ class FollowerController:
             self.logger.error(f"MCU command failed for {oams_name}: {e}")
 
         def _done(eventtime):
+            """Timer callback: mark the command complete and process the next one.
+
+            :param eventtime: reactor time the timer fired.
+            :return: ``reactor.NEVER`` (one-shot timer).
+            """
             self._mcu_command_in_flight[oams_name] = False
             self._process_mcu_command_queue(oams_name)
             return self.reactor.NEVER
@@ -2662,6 +3280,7 @@ class FPSLoadState:
 class FPSState:
     """Tracking state for one FPS buffer channel."""
     def __init__(self):
+        """Initialize all FPS tracking fields to the unloaded/idle baseline."""
         # Core state
         self.state = FPSLoadState.UNLOADED
         self.current_lane = None
@@ -2711,6 +3330,7 @@ class FPSState:
         self.engagement_in_progress = False
 
     def clear_encoder_samples(self):
+        """Forget the last encoder reading so the next delta starts fresh."""
         self.last_encoder = None
 
 
@@ -2772,7 +3392,10 @@ class OAMSMonitor:
     # ---- Lifecycle ----
 
     def start(self, oams_obj):
-        """Start monitoring for the given OAMS hardware object."""
+        """Start monitoring for the given OAMS hardware object.
+
+        :param oams_obj: the OAMS hardware object to monitor.
+        """
         self._oams = oams_obj
         self._running = True
         # Reset detection state to prevent stale triggers
@@ -2795,7 +3418,15 @@ class OAMSMonitor:
         self.logger.debug(f"Monitor stopped for {self.fps_name}")
 
     def notify_load_complete(self, lane_name, oams_name, spool_idx):
-        """Called by AFC_OpenAMS after successful load."""
+        """Called by AFC_OpenAMS after successful load.
+
+        Marks the channel LOADED (toolhead not yet confirmed) and resets the
+        detection state.
+
+        :param lane_name: lane now loaded.
+        :param oams_name: OAMS hardware name.
+        :param spool_idx: spool/bay index loaded.
+        """
         self.state.state = FPSLoadState.LOADED
         self.state.current_lane = lane_name
         self.state.current_oams = oams_name
@@ -2828,7 +3459,14 @@ class OAMSMonitor:
     # ---- Main monitoring loop ----
 
     def _monitor_tick(self, eventtime):
-        """Reactor timer callback — runs every MONITOR_INTERVAL."""
+        """Reactor timer callback — runs every MONITOR_INTERVAL.
+
+        Skips while not loaded/printing or during engagement/grace, then runs
+        the stuck-spool and (optionally) clog checks.
+
+        :param eventtime: reactor time the timer fired.
+        :return float: next scheduled reactor time, or ``NEVER`` to stop.
+        """
         if not self._running or self._oams is None:
             return self.reactor.NEVER
 
@@ -2902,6 +3540,10 @@ class OAMSMonitor:
 
         When the spool is jammed, the follower can't push filament so
         encoder stops and FPS pressure drops (no tension in buffer).
+
+        :param eventtime: current reactor time.
+        :param encoder_delta: encoder clicks moved since the last check.
+        :param pressure: current FPS pressure reading.
         """
         st = self.state
 
@@ -2946,6 +3588,10 @@ class OAMSMonitor:
         When filament is clogged between the extruder and spool, the
         extruder keeps pushing (pressure stays at target) but the encoder
         doesn't move (filament isn't flowing through the buffer).
+
+        :param eventtime: current reactor time.
+        :param encoder_delta: encoder clicks moved since the last check.
+        :param pressure: current FPS pressure reading.
         """
         st = self.state
 
@@ -3013,4 +3659,9 @@ class OAMSMonitor:
 
 
 def load_config_prefix(config):
+    """Klipper entry point: construct an OpenAMS unit for an ``[AFC_OpenAMS ...]`` section.
+
+    :param config: ConfigWrapper for the unit's config section.
+    :return afcAMS: the constructed OpenAMS unit object.
+    """
     return afcAMS(config)

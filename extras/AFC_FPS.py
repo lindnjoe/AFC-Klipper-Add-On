@@ -14,7 +14,7 @@
 # rotation-distance adjustment to keep the buffer at its set_point.
 #
 # Compatible with any ADC-based filament position sensor including:
-#   - TurtleNeck FPS boards
+#   - OpenAMS FPS boards
 #   - Proportional Sync Feedback (PSF) sensors (DRV5055A2 / MT9105ET Hall)
 #   - Any Hall-effect + spring slider producing a 0.0-1.0 analog signal
 #
@@ -67,6 +67,13 @@ class FPSEndstopWrapper:
     """
 
     def __init__(self, fps_buffer, trigger_func):
+        """
+        Initialize the software endstop wrapper.
+
+        :param fps_buffer: Owning :class:`AFCFPSBuffer` providing the ADC/reactor.
+        :param trigger_func: Callable returning True when the FPS threshold for
+                             this endstop is reached.
+        """
         self._fps_buffer = fps_buffer
         self._reactor = fps_buffer.reactor
         self._trigger_func = trigger_func
@@ -76,16 +83,44 @@ class FPSEndstopWrapper:
         self._poll_timer = None
 
     def get_mcu(self):
+        """
+        Return the MCU that owns the FPS ADC pin.
+
+        :return: The MCU object backing the FPS ADC.
+        """
         return self._fps_buffer.adc.get_mcu()
 
     def add_stepper(self, stepper):
+        """
+        Register a stepper as homed by this endstop.
+
+        :param stepper: Stepper object to associate with the endstop.
+        """
         self._steppers.append(stepper)
 
     def get_steppers(self):
+        """
+        Return the steppers registered on this endstop.
+
+        :return: A new list of the associated stepper objects.
+        """
         return list(self._steppers)
 
     def home_start(self, print_time, sample_time, sample_count, rest_time,
                    triggered=True):
+        """
+        Begin a homing move, polling the FPS reading for the trigger condition.
+
+        If the trigger condition is already met, completes immediately;
+        otherwise starts a reactor timer that polls until it is.
+
+        :param print_time: Print time at which homing starts (unused).
+        :param sample_time: Endstop sample time (unused).
+        :param sample_count: Endstop sample count (unused).
+        :param rest_time: Endstop rest time (unused).
+        :param triggered: Trigger state to home toward; defaults to True.
+        :return: A reactor completion that resolves when triggered.
+        """
         self._trigger_time = 0.
         self._completion = self._reactor.completion()
         # Check if already triggered before starting poll timer
@@ -100,6 +135,12 @@ class FPSEndstopWrapper:
         return self._completion
 
     def _poll_fps(self, eventtime):
+        """
+        Reactor timer callback that checks the FPS trigger condition.
+
+        :param eventtime: Reactor event time of the poll.
+        :return: ``reactor.NEVER`` once triggered, otherwise the next poll time.
+        """
         if self._trigger_func():
             mcu = self.get_mcu()
             self._trigger_time = mcu.estimated_print_time(eventtime)
@@ -108,12 +149,24 @@ class FPSEndstopWrapper:
         return eventtime + FPS_ENDSTOP_POLL_TIME
 
     def home_wait(self, home_end_time):
+        """
+        Finish a homing move, stopping the poll timer.
+
+        :param home_end_time: Latest print time the move may run to (unused).
+        :return: The print time at which the endstop triggered, or 0 if not.
+        """
         if self._poll_timer is not None:
             self._reactor.unregister_timer(self._poll_timer)
             self._poll_timer = None
         return self._trigger_time
 
     def query_endstop(self, print_time):
+        """
+        Report the instantaneous triggered state of the endstop.
+
+        :param print_time: Print time of the query (unused).
+        :return: 1 when the FPS trigger condition is met, otherwise 0.
+        """
         return 1 if self._trigger_func() else 0
 
 
@@ -127,6 +180,17 @@ class AFCFPSBuffer:
     """
 
     def __init__(self, config):
+        """
+        Initialize the FPS buffer from its config section.
+
+        Sets up the ADC sensor and sampling/callbacks, validates the tuning
+        points (``low_point`` < ``set_point`` < ``high_point`` and deadband),
+        creates the virtual filament sensors, registers G-code commands and the
+        software endstops, and registers the buffer with AFC.
+
+        :param config: ConfigWrapper providing the ADC pin, buffer tuning
+                       parameters, fault/LED options and GUI settings.
+        """
         self.printer = config.get_printer()
         self.afc = self.printer.load_object(config, 'AFC')
         self.reactor = self.afc.reactor
@@ -323,12 +387,18 @@ class AFCFPSBuffer:
         self.printer.add_object('AFC_buffer {}'.format(self.name), self)
 
     def __str__(self):
+        """
+        Return the buffer's short name.
+
+        :return: The buffer name string.
+        """
         return self.name
 
     # ------------------------------------------------------------------
     # Klipper ready
     # ------------------------------------------------------------------
     def _handle_ready(self):
+        """Cache the toolhead, arm fault detection, and validate the LED object on klippy:ready."""
         self.min_event_systime = self.reactor.monotonic() + 2.
         self.toolhead = self.printer.lookup_object('toolhead')
 
@@ -613,7 +683,8 @@ class AFCFPSBuffer:
             # Restore the last multiplier for this extruder if the same lane
             # is coming back (tool change with no spool swap). If a different
             # lane is on this extruder, it's a new spool — start fresh at 1.0.
-            extruder_name = getattr(lane, 'afc_extruder_name', None)
+            extruder_name = getattr(getattr(lane, 'extruder_obj', None),
+                                    'th_extruder_name', None)
             saved = self._saved_multipliers.get(extruder_name) if extruder_name else None
             if saved is not None and saved[0] == lane.name and saved[1] != 1.0:
                 self.set_multiplier(saved[1])
@@ -656,7 +727,8 @@ class AFCFPSBuffer:
         # Save the last multiplier for this extruder/lane so it can be
         # restored on the next tool change back to this same lane.
         if self._lane_has_rotation_control(self.current_lane):
-            extruder_name = getattr(self.current_lane, 'afc_extruder_name', None)
+            extruder_name = getattr(getattr(self.current_lane, 'extruder_obj', None),
+                                    'th_extruder_name', None)
             if extruder_name:
                 self._saved_multipliers[extruder_name] = (
                     self.current_lane.name, self._last_multiplier
@@ -719,38 +791,73 @@ class AFCFPSBuffer:
     # Fault detection  (same interface as AFCTrigger)
     # ------------------------------------------------------------------
     def get_fault_sensitivity(self, sensitivity):
+        """
+        Convert a user error-sensitivity into a fault distance in millimeters.
+
+        :param sensitivity: User sensitivity in the range 0-10 (0 disables).
+        :return: Fault distance ``(11 - sensitivity) * 10`` mm, or 0 when disabled.
+        """
         if sensitivity > 0:
             return (11 - sensitivity) * 10
         return 0
 
     def disable_fault_sensitivity(self):
+        """Temporarily disable fault detection by zeroing the fault sensitivity."""
         self.fault_sensitivity = 0
 
     def restore_fault_sensitivity(self):
+        """Restore the fault sensitivity derived from the configured error sensitivity."""
         self.fault_sensitivity = self.get_fault_sensitivity(self.error_sensitivity)
 
     def setup_fault_timer(self):
+        """Seed the error position and register the extruder-position fault timer if needed."""
         self.update_filament_error_pos()
         if self.extruder_pos_timer is None:
             self.extruder_pos_timer = self.reactor.register_timer(self.extruder_pos_update_event)
 
     def start_fault_timer(self, print_time):
+        """
+        Start the fault-detection timer.
+
+        :param print_time: Current print time (unused).
+        """
         self.fault_timer = "Running"
         self.reactor.update_timer(self.extruder_pos_timer, self.reactor.NOW)
 
     def stop_fault_timer(self, print_time):
+        """
+        Stop the fault-detection timer.
+
+        :param print_time: Current print time (unused).
+        """
         self.fault_timer = "Stopped"
         self.reactor.update_timer(self.extruder_pos_timer, self.reactor.NEVER)
 
     def fault_detection_enabled(self):
+        """
+        Report whether fault detection is currently active.
+
+        :return: True when the fault sensitivity is greater than zero.
+        """
         return self.fault_sensitivity > 0
 
     def start_fault_detection(self, eventtime, multiplier):
+        """
+        Apply a multiplier, reset the error position, and start fault detection.
+
+        :param eventtime: Reactor event time used to start the fault timer.
+        :param multiplier: Rotation-distance multiplier to apply on start.
+        """
         self.set_multiplier(multiplier)
         self.update_filament_error_pos()
         self.start_fault_timer(eventtime)
 
     def get_extruder_pos(self):
+        """
+        Return the current extruder position, tracking the previous value.
+
+        :return: The current extruder position, or None if unavailable.
+        """
         current_pos = self.afc.function.get_extruder_pos(
             past_extruder_position=self.past_extruder_position
         )
@@ -759,11 +866,23 @@ class AFCFPSBuffer:
         return current_pos
 
     def update_filament_error_pos(self):
+        """Advance the fault trip position to the current extruder position plus the fault distance."""
         current_pos = self.get_extruder_pos()
         if current_pos is not None:
             self.filament_error_pos = current_pos + self.fault_sensitivity
 
     def extruder_pos_update_event(self, eventtime):
+        """
+        Reactor timer callback that watches for filament feed faults.
+
+        Skips non-stepper lanes and lanes on a different active extruder. While
+        printing, keeps advancing the trip position when the FPS reading is in
+        the correctable range, and raises an error if the extruder advances past
+        the trip position while the reading is stuck at an extreme.
+
+        :param eventtime: Reactor event time of the check.
+        :return: The reactor time at which the timer should next fire.
+        """
         cur_lane = self.current_lane
         # Skip fault detection for non-stepper lanes — without the correction
         # timer adjusting rotation distance, extruder pos grows unbounded.
@@ -772,7 +891,8 @@ class AFCFPSBuffer:
 
         if cur_lane is not None:
             active_extruder = self.afc.toolhead.get_extruder()
-            lane_extruder_name = getattr(cur_lane, 'afc_extruder_name', None)
+            lane_extruder_name = getattr(getattr(cur_lane, 'extruder_obj', None),
+                                         'th_extruder_name', None)
             if (lane_extruder_name
                     and hasattr(active_extruder, 'name')
                     and active_extruder.name != lane_extruder_name):
@@ -796,6 +916,16 @@ class AFCFPSBuffer:
         return eventtime + CHECK_RUNOUT_TIMEOUT
 
     def pause_on_error(self, msg, pause=False):
+        """
+        Raise an AFC error (optionally pausing) when a fault is detected.
+
+        No-op during the startup grace period, when the buffer is disabled, or
+        when the printer is already paused. Appends a clog/feed hint based on the
+        last buffer state.
+
+        :param msg: Base error message to report.
+        :param pause: When True, raise the AFC error and pause the print.
+        """
         eventtime = self.reactor.monotonic()
         if eventtime < self.min_event_systime or not self.enable or self.afc.function.is_paused():
             return
@@ -810,9 +940,22 @@ class AFCFPSBuffer:
     # Status
     # ------------------------------------------------------------------
     def buffer_status(self):
+        """
+        Return the last computed buffer state name.
+
+        :return: One of the Advancing/Trailing/Neutral state name strings.
+        """
         return self.last_state
 
     def get_status(self, eventtime=None):
+        """
+        Return a status dict describing the buffer for the GUI/API.
+
+        :param eventtime: Reactor event time (unused).
+        :return: Dict with state, lanes, enabled flag, raw/smoothed FPS values,
+                 set point, active lane, rotation distance, and fault-detection
+                 details.
+        """
         response = {}
         response['state'] = self.last_state
         response['lanes'] = [lane.name for lane in self.lanes.values()]
@@ -1025,6 +1168,14 @@ class VirtualRunoutHelper:
     """Minimal runout helper used by FPS virtual sensors."""
 
     def __init__(self, printer, name, runout_cb=None, enable_runout=False):
+        """
+        Initialize the minimal runout helper.
+
+        :param printer: Klipper printer object.
+        :param name: Sensor name.
+        :param runout_cb: Optional callable invoked on a runout transition.
+        :param enable_runout: Whether runout callbacks are enabled.
+        """
         self.printer = printer
         self._reactor = printer.get_reactor()
         self.name = name
@@ -1037,6 +1188,16 @@ class VirtualRunoutHelper:
         self.min_event_systime = self._reactor.NEVER
 
     def note_filament_present(self, eventtime=None, is_filament_present=False, **_kwargs):
+        """
+        Update the tracked filament-present state and fire runout if needed.
+
+        Only acts on a state change; invokes the runout callback when filament
+        transitions to absent and runout is enabled.
+
+        :param eventtime: Reactor event time; defaults to now when None.
+        :param is_filament_present: New filament-present state.
+        :param _kwargs: Ignored extra keyword arguments for API compatibility.
+        """
         if eventtime is None:
             eventtime = self._reactor.monotonic()
 
@@ -1053,6 +1214,12 @@ class VirtualRunoutHelper:
                 self.runout_callback(eventtime=eventtime)
 
     def get_status(self, _eventtime=None):
+        """
+        Return the sensor status.
+
+        :param _eventtime: Reactor event time (unused).
+        :return: Dict with ``filament_detected`` and ``enabled`` booleans.
+        """
         return {
             "filament_detected": bool(self.filament_present),
             "enabled": bool(self.sensor_enabled),
@@ -1066,6 +1233,19 @@ class VirtualFilamentSensor:
     SET_HELP = "Sets the filament sensor on/off"
 
     def __init__(self, printer, name, show_in_gui=True, runout_cb=None, enable_runout=False):
+        """
+        Register a lightweight virtual filament sensor.
+
+        Adds the object under the ``filament_switch_sensor`` namespace (hiding it
+        from the GUI by underscore-prefixing when requested) and registers the
+        QUERY/SET filament-sensor G-code commands.
+
+        :param printer: Klipper printer object.
+        :param name: Sensor name.
+        :param show_in_gui: When False, hide the sensor from the GUI.
+        :param runout_cb: Optional runout callback passed to the runout helper.
+        :param enable_runout: Whether runout callbacks are enabled.
+        """
         self.printer = printer
         self.name = name
         self._object_name = f"filament_switch_sensor {name}"
@@ -1097,9 +1277,22 @@ class VirtualFilamentSensor:
             pass
 
     def get_status(self, eventtime):
+        """
+        Return the sensor status from the runout helper.
+
+        :param eventtime: Reactor event time passed through to the helper.
+        :return: Dict with ``filament_detected`` and ``enabled`` booleans.
+        """
         return self.runout_helper.get_status(eventtime)
 
     def cmd_QUERY_FILAMENT_SENSOR(self, gcmd):
+        """
+        G-code handler that reports whether filament is detected.
+
+        Usage: ``QUERY_FILAMENT_SENSOR SENSOR=<name>``
+
+        :param gcmd: The parsed G-code command.
+        """
         status = self.runout_helper.get_status(None)
         if status["filament_detected"]:
             msg = f"Filament Sensor {self.name}: filament detected"
@@ -1108,8 +1301,21 @@ class VirtualFilamentSensor:
         self.logger.info(msg)
 
     def cmd_SET_FILAMENT_SENSOR(self, gcmd):
+        """
+        G-code handler that enables or disables the virtual sensor.
+
+        Usage: ``SET_FILAMENT_SENSOR SENSOR=<name> ENABLE=<0|1>``
+
+        :param gcmd: The parsed G-code command.
+        """
         self.runout_helper.sensor_enabled = bool(gcmd.get_int("ENABLE", 1))
 
 
 def load_config_prefix(config):
+    """
+    Klipper entry point that instantiates the FPS buffer.
+
+    :param config: ConfigWrapper for the buffer section.
+    :return: A new :class:`AFCFPSBuffer` instance.
+    """
     return AFCFPSBuffer(config)

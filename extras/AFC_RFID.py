@@ -29,6 +29,11 @@ class SpoolmanClient:
     """
 
     def __init__(self, moonraker):
+        """Wrap a live moonraker object to add the Spoolman write API.
+
+        :param moonraker: AFC moonraker object whose host and GET plumbing
+            (``_get_results``, ``get_spool``) are reused.
+        """
         self._mr = moonraker
         self.host = moonraker.host
         self.logger = moonraker.logger
@@ -36,10 +41,24 @@ class SpoolmanClient:
         self._filament_fields_ensured = False
 
     def _get_results(self, url_string, print_error=True):
+        """Delegate a GET/request to the wrapped moonraker's HTTP plumbing.
+
+        :param url_string: URL string or ``urllib`` Request to fetch.
+        :param print_error: Whether moonraker should log on failure.
+        :return: Parsed result, or None on failure.
+        """
         return self._mr._get_results(url_string, print_error)
 
     def _spoolman_proxy(self, method, path, body=None, print_error=True):
-        """Spoolman API call via moonraker's proxy endpoint."""
+        """Spoolman API call via moonraker's proxy endpoint.
+
+        :param method: HTTP method (e.g. 'GET', 'POST', 'PATCH').
+        :param path: Spoolman API path (e.g. '/v1/filament').
+        :param body: Optional request body; a JSON string is decoded to an
+            object so moonraker's proxy sets the JSON Content-Type.
+        :param print_error: Whether to log on a failed request.
+        :return: Parsed JSON result, or None on failure.
+        """
         payload = {"request_method": method, "path": path}
         if body is not None:
             # Moonraker's proxy needs body as a JSON object so it sets
@@ -62,6 +81,13 @@ class SpoolmanClient:
         return result
 
     def search_filaments(self, article_number=None, vendor_name=None, material=None):
+        """Search Spoolman filaments by optional criteria.
+
+        :param article_number: Filament article number / SKU to match.
+        :param vendor_name: Vendor name to match.
+        :param material: Material string to match.
+        :return list: Matching filament dicts (empty list if none/error).
+        """
         parts = []
         if article_number:
             parts.append(f"article_number={quote(str(article_number))}")
@@ -75,6 +101,11 @@ class SpoolmanClient:
         return resp if isinstance(resp, list) else []
 
     def search_spools(self, filament_id=None):
+        """Search Spoolman spools, optionally filtered by filament id.
+
+        :param filament_id: Filament id to filter spools by; all spools if None.
+        :return list: Matching spool dicts (empty list if none/error).
+        """
         parts = []
         if filament_id is not None:
             parts.append(f"filament.id={filament_id}")
@@ -84,6 +115,14 @@ class SpoolmanClient:
         return resp if isinstance(resp, list) else []
 
     def get_or_create_vendor(self, name):
+        """Return an existing Spoolman vendor by name, creating it if absent.
+
+        Prefers a case-insensitive exact name match, else the first result;
+        creates a new vendor when none exist.
+
+        :param name: Vendor name to look up or create.
+        :return dict: The matched or newly created vendor dict.
+        """
         resp = self._spoolman_proxy(
             "GET", f"/v1/vendor?name={quote(str(name))}", print_error=False)
         if isinstance(resp, list) and resp:
@@ -99,6 +138,28 @@ class SpoolmanClient:
                         settings_bed_temp=None, weight=None, spool_weight=None,
                         article_number=None, multi_color_hexes=None,
                         multi_color_direction=None):
+        """Create a Spoolman filament from the given fields.
+
+        Only non-None fields are sent. A multi-colour spool uses
+        ``multi_color_hexes`` (and direction); since Spoolman accepts only one
+        of ``color_hex`` / ``multi_color_hexes``, ``color_hex`` is dropped then.
+
+        :param name: Filament name.
+        :param vendor_id: Spoolman vendor id.
+        :param material: Material string.
+        :param density: Material density (g/cm^3).
+        :param diameter: Filament diameter (mm).
+        :param color_hex: Single colour hex (leading '#' stripped).
+        :param settings_extruder_temp: Recommended extruder temperature.
+        :param settings_bed_temp: Recommended bed temperature.
+        :param weight: Net filament weight (g).
+        :param spool_weight: Empty spool tare weight (g).
+        :param article_number: Filament article number / SKU.
+        :param multi_color_hexes: List/tuple or comma string of colour hexes
+            for a multi-colour spool.
+        :param multi_color_direction: Multi-colour direction (default 'coaxial').
+        :return dict: The created filament dict, or None on failure.
+        """
         data = {"name": name}
         if vendor_id is not None: data["vendor_id"] = vendor_id
         if material is not None: data["material"] = material
@@ -123,7 +184,12 @@ class SpoolmanClient:
 
     def update_filament(self, filament_id, fields):
         """PATCH a filament with the given fields (used to backfill empties on a
-        matched filament). No-op on an empty dict."""
+        matched filament). No-op on an empty dict.
+
+        :param filament_id: Spoolman filament id to update.
+        :param fields: Dict of {field: value} to PATCH.
+        :return: PATCH result dict, or None when there's nothing to do.
+        """
         if not fields:
             return None
         return self._spoolman_proxy("PATCH", f"/v1/filament/{filament_id}",
@@ -131,6 +197,14 @@ class SpoolmanClient:
 
     def create_spool(self, filament_id, initial_weight=None, remaining_weight=None,
                      spool_weight=None):
+        """Create a Spoolman spool for a filament.
+
+        :param filament_id: Spoolman filament id this spool is made of.
+        :param initial_weight: Initial net filament weight (g).
+        :param remaining_weight: Remaining net filament weight (g).
+        :param spool_weight: Empty spool tare weight (g).
+        :return dict: The created spool dict, or None on failure.
+        """
         data = {"filament_id": filament_id}
         if initial_weight is not None: data["initial_weight"] = initial_weight
         if remaining_weight is not None: data["remaining_weight"] = remaining_weight
@@ -156,7 +230,10 @@ class SpoolmanClient:
 
         Idempotent and cached: one GET /v1/field/spool per client; POSTs only
         the fields that are missing. POST is create-or-update, so a re-create is
-        harmless if a race adds it first."""
+        harmless if a race adds it first.
+
+        :return: None
+        """
         if self._fields_ensured:
             return
         existing = self._spoolman_proxy("GET", "/v1/field/spool",
@@ -176,7 +253,10 @@ class SpoolmanClient:
 
     def _ensure_filament_fields(self):
         """Create the AFC filament extra fields if they don't exist yet.
-        Idempotent and cached (one GET /v1/field/filament per client)."""
+        Idempotent and cached (one GET /v1/field/filament per client).
+
+        :return: None
+        """
         if self._filament_fields_ensured:
             return
         existing = self._spoolman_proxy("GET", "/v1/field/filament",
@@ -193,7 +273,13 @@ class SpoolmanClient:
     def write_filament_variant(self, filament_id, variant, current_extra=None):
         """Store the filament sub-type/variant (e.g. 'Matte', 'Silk') in the
         'variant' filament extra field. Merges with any existing extra; a no-op
-        when the value is empty or already current."""
+        when the value is empty or already current.
+
+        :param filament_id: Spoolman filament id to update.
+        :param variant: Sub-type/variant string to store.
+        :param current_extra: The filament's existing extra dict, to merge into.
+        :return: PATCH result dict, or None when there's nothing to write.
+        """
         if not variant:
             return None
         self._ensure_filament_fields()
@@ -207,7 +293,13 @@ class SpoolmanClient:
 
     def _patch_spool(self, spool_id, lot_nr=None, extra_updates=None):
         """PATCH a spool's lot_nr and/or extra fields. Reads the current extra
-        and merges, so other extra fields (e.g. slicer presets) are preserved."""
+        and merges, so other extra fields (e.g. slicer presets) are preserved.
+
+        :param spool_id: Spoolman spool id to update.
+        :param lot_nr: Lot number (manufacturing date) to set.
+        :param extra_updates: Dict of extra-field updates to merge in.
+        :return: PATCH result dict, or None when there's nothing to write.
+        """
         body = {}
         if lot_nr is not None:
             body["lot_nr"] = lot_nr
@@ -223,7 +315,13 @@ class SpoolmanClient:
     def write_spool_metadata(self, spool_id, lot_nr=None, uid=None):
         """Write the tag's manufacturing date (-> lot_nr) and NFC UID (-> the
         'card_uids' extra field, merged into the spool's existing UID list as
-        comma-separated uppercase hex)."""
+        comma-separated uppercase hex).
+
+        :param spool_id: Spoolman spool id to update.
+        :param lot_nr: Manufacturing date string to store as lot_nr.
+        :param uid: NFC tag UID to add to the spool's 'card_uids' list.
+        :return: PATCH result dict, or None when there's nothing to write.
+        """
         extra = None
         norm = _norm_uid(uid)
         if norm:
@@ -238,11 +336,19 @@ class SpoolmanClient:
 
     def get_spool(self, spool_id):
         """Read a spool dict from Spoolman (delegated to the live moonraker,
-        which already has get_spool)."""
+        which already has get_spool).
+
+        :param spool_id: Spoolman spool id to fetch.
+        :return dict: The spool dict, or None if not found.
+        """
         return self._mr.get_spool(spool_id)
 
     def read_flow_k(self, spool_id):
-        """Read flow K from the 'flow_k' extra field."""
+        """Read flow K from the 'flow_k' extra field.
+
+        :param spool_id: Spoolman spool id to read.
+        :return float: The stored flow K, or None if unset/unavailable.
+        """
         spool = self.get_spool(spool_id)
         if not spool:
             return None
@@ -255,7 +361,12 @@ class SpoolmanClient:
         return None
 
     def write_flow_k(self, spool_id, k):
-        """Persist a calibrated flow K to the 'flow_k' extra field."""
+        """Persist a calibrated flow K to the 'flow_k' extra field.
+
+        :param spool_id: Spoolman spool id to update.
+        :param k: Flow K value to store (rounded to 6 decimals).
+        :return: PATCH result dict, or None when the spool can't be read.
+        """
         self._ensure_spool_fields()
         spool = self.get_spool(spool_id)
         if not spool:
@@ -511,7 +622,11 @@ MATERIAL_DENSITY = {
 
 
 def color_name(hex_str: str) -> str:
-    """Return nearest human-readable color name for a hex color string."""
+    """Return nearest human-readable color name for a hex color string.
+
+    :param hex_str: Hex colour string (with or without leading '#').
+    :return str: Nearest colour name, or '' if the input can't be parsed.
+    """
     if not hex_str or len(hex_str) < 6:
         return ""
     h = hex_str.strip().lstrip("#").lower()[:6]
@@ -536,6 +651,9 @@ def color_label(colors) -> str:
     Single colour -> 'Pale Muted Rose #e7c1d5'.
     Dual/multi    -> 'Pale Muted Rose #e7c1d5 + Bisque #ffe9c9' (dual-colour).
     Accepts a single hex string or a list of hex strings.
+
+    :param colors: A single hex string or a list of hex strings.
+    :return str: Formatted colour label (with a dual/multi-colour suffix).
     """
     if isinstance(colors, str):
         colors = [colors] if colors else []
@@ -553,7 +671,12 @@ def color_label(colors) -> str:
 
 
 def color_distance(hex1: str, hex2: str) -> float:
-    """Euclidean RGB distance between two hex color strings."""
+    """Euclidean RGB distance between two hex color strings.
+
+    :param hex1: First colour as a 6-char hex string (no '#').
+    :param hex2: Second colour as a 6-char hex string (no '#').
+    :return float: Euclidean distance between the two RGB colours.
+    """
     r1, g1, b1 = int(hex1[0:2], 16), int(hex1[2:4], 16), int(hex1[4:6], 16)
     r2, g2, b2 = int(hex2[0:2], 16), int(hex2[2:4], 16), int(hex2[4:6], 16)
     return ((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2) ** 0.5
@@ -564,6 +687,11 @@ def colors_match(scanned, candidate, tol=0.0) -> bool:
 
     Used for exact spool identity: a single-colour [a] only matches [a], a
     dual-colour [a,b] only matches another [a,b] (either order). tol=0 = exact.
+
+    :param scanned: List of scanned colour hex strings.
+    :param candidate: List of candidate colour hex strings to compare against.
+    :param tol: Max per-colour RGB distance to still count as a match.
+    :return bool: True if the two colour lists are the same set within tol.
     """
     if len(scanned) != len(candidate):
         return False
@@ -585,7 +713,11 @@ def colors_match(scanned, candidate, tol=0.0) -> bool:
 
 def _norm_uid(uid) -> str:
     """Normalize an RFID UID for comparison: drop separators, upper-case.
-    So 'E5:CA:F0:A1', 'e5caf0a1' and 'E5CAF0A1' all compare equal."""
+    So 'E5:CA:F0:A1', 'e5caf0a1' and 'E5CAF0A1' all compare equal.
+
+    :param uid: Raw UID (any separators / casing).
+    :return str: Separator-free uppercase UID ('' if uid is empty).
+    """
     return re.sub(r'[\s:_\-]', '', str(uid or '')).strip().upper()
 
 
@@ -595,7 +727,12 @@ _CARD_UIDS_FIELD = SpoolmanClient.SPOOL_EXTRA_CARD_UIDS
 
 
 def _decode_extra(extra, key):
-    """JSON-decode a Spoolman extra-field value; return None when absent."""
+    """JSON-decode a Spoolman extra-field value; return None when absent.
+
+    :param extra: A spool/filament 'extra' dict (or None).
+    :param key: Extra-field key to read.
+    :return: Decoded value, the raw string if not JSON, or None when absent.
+    """
     raw = (extra or {}).get(key)
     if raw in (None, ""):
         return None
@@ -607,7 +744,11 @@ def _decode_extra(extra, key):
 
 def _spool_uids(spool: dict) -> set:
     """Set of normalized NFC UIDs stored on a spool: the 'card_uids'
-    comma-separated list (Snapmaker-Extended convention)."""
+    comma-separated list (Snapmaker-Extended convention).
+
+    :param spool: Spoolman spool dict.
+    :return set: Normalized UID strings carried by the spool.
+    """
     extra = spool.get("extra") or {}
     uids = set()
     val = _decode_extra(extra, _CARD_UIDS_FIELD)
@@ -624,6 +765,10 @@ def find_spool_by_uid(client, uid):
     list). The UID is the primary identity of a physical spool: if it matches, it
     IS that spool. Spoolman can't query extra fields, so we scan all spools once.
     Returns the spool dict or None.
+
+    :param client: SpoolmanClient used to list spools.
+    :param uid: NFC tag UID to look for.
+    :return dict: The matching spool dict, or None.
     """
     target = _norm_uid(uid)
     if not target:
@@ -643,7 +788,12 @@ def find_spool_by_sku(client, sku):
     article_number). For readers that DON'T expose a per-tag UID (e.g. the ACE
     Pro, which reports SKU/material but no unique tag id) the spool can't be
     uniquely identified, so bind to the fullest non-archived spool of that exact
-    product. Returns the spool dict or None."""
+    product. Returns the spool dict or None.
+
+    :param client: SpoolmanClient used to search filaments/spools.
+    :param sku: Product SKU (filament article_number) to match.
+    :return dict: The fullest non-archived matching spool, or None.
+    """
     if not sku:
         return None
     try:
@@ -671,7 +821,11 @@ def find_spool_by_sku(client, sku):
 def density_for_material(material: str) -> float:
     """Return Spoolman density (g/cm^3) for a material string.
     Strips spaces, dashes, underscores so 'PLA-CF', 'pla cf', 'pla_cf'
-    all match 'placf'. Falls back to PLA (1.24) for unknown materials."""
+    all match 'placf'. Falls back to PLA (1.24) for unknown materials.
+
+    :param material: Material string (any casing/separators).
+    :return float: Density in g/cm^3 (1.24 fallback for unknown materials).
+    """
     if not material:
         return 1.24
     key = material.strip().lower()
@@ -686,7 +840,11 @@ def density_for_material(material: str) -> float:
 
 
 def rgb_array_to_hex(color_array) -> str:
-    """Convert an [r, g, b] array to '#rrggbb' hex string."""
+    """Convert an [r, g, b] array to '#rrggbb' hex string.
+
+    :param color_array: An [r, g, b] list/tuple of ints.
+    :return str: '#rrggbb' hex string ('#000000' for invalid input).
+    """
     if isinstance(color_array, (list, tuple)) and len(color_array) >= 3:
         r, g, b = int(color_array[0]), int(color_array[1]), int(color_array[2])
         return f"#{r:02x}{g:02x}{b:02x}"
@@ -695,7 +853,20 @@ def rgb_array_to_hex(color_array) -> str:
 
 def log_new_filament(logger, prefix, filament, brand, material, color_hex,
                      diameter, ext_temp, bed_temp, sku=""):
-    """Log a detailed breakdown when a new filament is created in Spoolman."""
+    """Log a detailed breakdown when a new filament is created in Spoolman.
+
+    :param logger: Logger for the info message.
+    :param prefix: Log prefix (e.g. 'U1 RFID').
+    :param filament: The created Spoolman filament dict.
+    :param brand: Vendor/brand name.
+    :param material: Material string.
+    :param color_hex: Single colour hex (no '#').
+    :param diameter: Filament diameter (mm).
+    :param ext_temp: Nozzle temperature.
+    :param bed_temp: Bed temperature.
+    :param sku: Product SKU / article number.
+    :return: None
+    """
     fid = filament.get("id", "?")
     parts = [f"{prefix}: created filament #{fid} in Spoolman:"]
     if brand:
@@ -717,7 +888,15 @@ def log_new_filament(logger, prefix, filament, brand, material, color_hex,
 
 
 def log_new_spool(logger, prefix, spool, weight, spool_weight=None):
-    """Log a detailed breakdown when a new spool is created in Spoolman."""
+    """Log a detailed breakdown when a new spool is created in Spoolman.
+
+    :param logger: Logger for the info message.
+    :param prefix: Log prefix (e.g. 'U1 RFID').
+    :param spool: The created Spoolman spool dict.
+    :param weight: Net filament weight (g).
+    :param spool_weight: Empty spool tare weight (g), if known.
+    :return: None
+    """
     sid = spool.get("id", "?")
     parts = [f"{prefix}: created spool #{sid} in Spoolman:"]
     parts.append(f"  filament weight: {weight}g")
@@ -728,7 +907,12 @@ def log_new_spool(logger, prefix, spool, weight, spool_weight=None):
 
 
 def get_auto_spoolman_create(lane, unit_default=False):
-    """Check if auto Spoolman creation is enabled — unit then extruder fallback."""
+    """Check if auto Spoolman creation is enabled — unit then extruder fallback.
+
+    :param lane: AFC lane whose unit/extruder are consulted.
+    :param unit_default: Value returned when neither unit nor extruder opts in.
+    :return bool: True if auto Spoolman create is enabled for the lane.
+    """
     unit = getattr(lane, 'unit_obj', None)
     if unit is not None and getattr(unit, 'auto_spoolman_create', False):
         return True
@@ -923,8 +1107,18 @@ def sync_rfid_to_spoolman(afc, lane, slot_info: dict, logger, prefix: str,
             # readers like the ACE Pro) by its product SKU. Otherwise leave the
             # lane on the values apply_filament_defaults already set.
             if not (allow_create and (scanned_uid or sku)):
+                ident = f"SKU {sku}" if sku else (
+                    f"UID {scanned_uid}" if scanned_uid else "this tag")
+                logger.info(
+                    f"{prefix}: no Spoolman spool matches {ident} and "
+                    f"auto-create is {'ON' if allow_create else 'OFF'}"
+                    + ("" if allow_create else
+                       " (set 'auto_spoolman_create: True' to create one)"))
                 return
             if not sku and not material:
+                logger.info(
+                    f"{prefix}: tag has no SKU or material — can't create a "
+                    f"Spoolman filament")
                 return
 
             # Resolve the FILAMENT (product): exact SKU match, else create one.
@@ -965,6 +1159,9 @@ def sync_rfid_to_spoolman(afc, lane, slot_info: dict, logger, prefix: str,
                     article_number=sku or None,
                 )
                 if filament is None:
+                    logger.warning(
+                        f"{prefix}: Spoolman create_filament FAILED for "
+                        f"'{filament_name}' (SKU {sku}) — check Spoolman/moonraker")
                     return
                 log_new_filament(logger, prefix, filament,
                                  brand, material, color_hex, diameter,
@@ -972,6 +1169,8 @@ def sync_rfid_to_spoolman(afc, lane, slot_info: dict, logger, prefix: str,
 
             filament_id = (filament or {}).get("id")
             if filament_id is None:
+                logger.warning(
+                    f"{prefix}: resolved filament for SKU {sku} has no id — aborting")
                 return
 
             # Backfill any fields the tag has but the filament is missing.
@@ -1003,6 +1202,9 @@ def sync_rfid_to_spoolman(afc, lane, slot_info: dict, logger, prefix: str,
                 spool_weight=spool_weight if spool_weight and spool_weight > 0 else None,
             )
             if spool is None:
+                logger.warning(
+                    f"{prefix}: Spoolman create_spool FAILED for filament "
+                    f"#{filament_id} (SKU {sku}) — check Spoolman/moonraker")
                 return
             log_new_spool(logger, prefix, spool,
                           default_filament_weight,

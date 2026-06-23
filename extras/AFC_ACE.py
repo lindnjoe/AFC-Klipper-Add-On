@@ -6,6 +6,11 @@
 
 """AFC unit driver for Anycubic ACE PRO filament changers."""
 
+# Stuck spool detection (see _check_stuck) is our own implementation of an idea
+# from the Kobra-S1/ACEPRO project: watch the ACE firmware's continuous
+# feed-assist run time instead of an encoder to spot a jam.
+#   https://github.com/Kobra-S1/ACEPRO
+
 from __future__ import annotations
 
 import collections
@@ -50,6 +55,11 @@ except Exception:
     log_new_spool = None
 
     def color_name(hex_str):
+        """No-op color-name lookup used when AFC_RFID is absent.
+
+        :param hex_str: A '#rrggbb' color string (ignored).
+        :return str: Always an empty string.
+        """
         return ""
 
     def rgb_array_to_hex(color_array):
@@ -127,7 +137,13 @@ apply_compat_patches()
 
 def _ams_box_logo(title, n_slots, name):
     """AMS-style unit logo: a titled box with one spool bay per slot, fronted by
-    the R/E/A/D/Y banner (prep console output). ASCII borders for portability."""
+    the R/E/A/D/Y banner (prep console output). ASCII borders for portability.
+
+    :param title: Box title (e.g. the unit model name).
+    :param n_slots: Number of slot bays to draw.
+    :param name: Unit name shown under the box.
+    :return str: HTML-tagged multi-line logo string.
+    """
     n = max(1, int(n_slots) if n_slots else 1)
     bay_w = 3
     while n * bay_w + (n - 1) < len(title):
@@ -147,7 +163,13 @@ def _ams_box_logo(title, n_slots, name):
 
 
 def _ams_box_logo_error(title, n_slots, name):
-    """Error variant of the AMS-style logo (red box, ERROR banner)."""
+    """Error variant of the AMS-style logo (red box, ERROR banner).
+
+    :param title: Box title (e.g. the unit model name).
+    :param n_slots: Number of slot bays sizing the box width.
+    :param name: Unit name shown under the box.
+    :return str: HTML-tagged multi-line error logo string.
+    """
     n = max(1, int(n_slots) if n_slots else 1)
     bay_w = 3
     while n * bay_w + (n - 1) < len(title):
@@ -165,9 +187,29 @@ def _ams_box_logo_error(title, n_slots, name):
 
 
 class afcACE(afcUnit):
+    """AFC unit driver for Anycubic ACE PRO filament changers.
+
+    Drives a 4-slot ACE PRO over a USB serial connection (see ACEConnection
+    and the module docstring) rather than physical AFC steppers/sensors. All
+    filament transport (feed, unwind, feed assist) is issued as serial commands
+    to the ACE firmware; lane prep/load state, the virtual hub, RFID inventory
+    and Spoolman sync are derived from the ACE's reported slot status. Supports
+    'combined' and 'direct' toolhead modes, dryer control, stuck-spool
+    detection, feed/hub/TD-1 calibration, and a feed-assist watchdog that keeps
+    assist reconciled to the active lane.
+    """
     SLOTS_PER_UNIT = 4
+    _LOGO_TITLE = "ACE PRO"   # AFC_ACE2 overrides this for the Pro 2 prep logo
 
     def __init__(self, config):
+        """Configure the ACE unit and register its gcode commands.
+
+        :param config: Klipper ConfigWrapper for this unit section. Reads the
+            serial port, mode, feed/retract speeds, dryer and stuck-detection
+            limits, feed-assist options, calibration step sizes and FPS
+            thresholds, then registers the per-unit and base ACE_* gcode
+            commands and the temperature_ace sensor factory.
+        """
         super().__init__(config)
         self.type = config.get('type', 'ACE')
 
@@ -179,8 +221,15 @@ class afcACE(afcUnit):
                 f"Use '{MODE_COMBINED}' or '{MODE_DIRECT}'.")
         self.mode = mode
 
-        self.feed_speed = config.getfloat("feed_speed", 60.0)
-        self.retract_speed = config.getfloat("retract_speed", 50.0)
+        # The ACE firmware honors the feed/unwind speed up to ~90 mm/s and
+        # clamps anything above that (verified via ACE_FEED_TEST) — values over
+        # ~90 just run at the ceiling, while values below scale the rate.
+        self.feed_speed = config.getfloat("feed_speed", 80.0)
+        self.retract_speed = config.getfloat("retract_speed", 80.0)
+        # Safety cap on the dryer set-point — ACE_DRY clamps the commanded temp
+        # to this to avoid cooking filament / over-driving the heater.
+        self.max_dryer_temperature = config.getfloat(
+            "max_dryer_temperature", 55.0, minval=0.0)
         self.unload_preretract = config.getfloat("unload_preretract", 50.0)
         self._unit_load_to_hub = config.getboolean("load_to_hub", None)
         self._default_feed_assist = config.getboolean("use_feed_assist", True)
@@ -188,6 +237,15 @@ class afcACE(afcUnit):
         # active tool actually has its feed assist running, in case a pickup /
         # tool-change event didn't enable it.
         self._assist_watchdog = config.getboolean("assist_watchdog", True)
+        # Stuck-spool detection. A normal buffer refill makes the ACE feed-assist
+        # feed for a fraction of a second; a jammed or tangled spool makes it
+        # run continuously. The firmware reports that continuous run time as
+        # cont_assist_time, so if it climbs past stuck_time while we're printing
+        # we treat the spool as stuck and pause. Encoder-independent and
+        # material-agnostic. Off by default (opt-in).
+        self._stuck_detection = config.getboolean("stuck_spool_detection", False)
+        self._stuck_time = config.getfloat(
+            "stuck_time", 4.0, minval=2.0)
         self.extruder_assist_length = config.getfloat("extruder_assist_length", 50.0)
         self.extruder_assist_speed = config.getfloat("extruder_assist_speed", 300.0)
         self.sensor_approach_margin = config.getfloat("sensor_approach_margin", 30.0)
@@ -205,6 +263,8 @@ class afcACE(afcUnit):
         self._ace: Optional[ACEConnection] = None
         self._slot_map: dict[str, int] = {}
         self._feed_assist_active: set[int] = set()
+        # One-shot latch so a sustained jam pauses once, not every heartbeat.
+        self._stuck_tripped = False
         self._slot_inventory: list[dict] = [{} for _ in range(self.SLOTS_PER_UNIT)]
         self._operation_active = False
         self._cached_hw_status = {}
@@ -240,6 +300,15 @@ class afcACE(afcUnit):
         self.gcode.register_command(
             f'ACE_LANE_RESET_{unit_suffix}', self.cmd_ACE_LANE_RESET,
             desc=f"Retract ACE lane filament back into unit ({self.name})")
+        self.gcode.register_command(
+            f'ACE_CMD_{unit_suffix}', self.cmd_ACE_CMD,
+            desc=f"Send a raw ACE protocol command and print the reply ({self.name})")
+        self.gcode.register_command(
+            f'ACE_FEED_TEST_{unit_suffix}', self.cmd_ACE_FEED_TEST,
+            desc=f"Sweep feed speed to test whether it changes feed rate ({self.name})")
+        self.gcode.register_command(
+            f'ACE_STUCK_SPOOL_DETECTION_{unit_suffix}', self.cmd_ACE_STUCK_SPOOL_DETECTION,
+            desc=f"Enable/disable ACE stuck spool detection ({self.name})")
         # Register base commands (first unit wins for single-unit setups)
         for cmd, handler, desc in [
             ('ACE_CALIBRATE', self.cmd_ACE_CALIBRATE, "Calibrate ACE feed distance to toolhead"),
@@ -248,6 +317,9 @@ class afcACE(afcUnit):
             ('ACE_DRY', self.cmd_ACE_DRY, "Start ACE filament dryer"),
             ('ACE_DRY_STOP', self.cmd_ACE_DRY_STOP, "Stop ACE filament dryer"),
             ('ACE_LANE_RESET', self.cmd_ACE_LANE_RESET, "Retract ACE lane filament back into unit"),
+            ('ACE_CMD', self.cmd_ACE_CMD, "Send a raw ACE protocol command and print the reply"),
+            ('ACE_FEED_TEST', self.cmd_ACE_FEED_TEST, "Sweep feed speed to test whether it changes feed rate"),
+            ('ACE_STUCK_SPOOL_DETECTION', self.cmd_ACE_STUCK_SPOOL_DETECTION, "Enable/disable ACE stuck spool detection"),
         ]:
             try:
                 self.gcode.register_command(cmd, handler, desc=desc)
@@ -268,10 +340,17 @@ class afcACE(afcUnit):
                 "use [temperature_ace <name>] config sections instead", e)
 
     def handle_connect(self):
+        """Build the prep logos, map lanes to ACE slots, and register the
+        deferred serial connect and feed-assist reconciliation event handlers.
+
+        Sets each lane's custom load/unload commands and seeds its loadless
+        ``_load_state`` to False so the native virtual hub reads clear until a
+        sync or load drives the loaded-to-hub state.
+        """
         super().handle_connect()
 
-        self.logo = _ams_box_logo("ACE PRO", len(self.lanes), self.name)
-        self.logo_error = _ams_box_logo_error("ACE PRO", len(self.lanes), self.name)
+        self.logo = _ams_box_logo(self._LOGO_TITLE, len(self.lanes), self.name)
+        self.logo_error = _ams_box_logo_error(self._LOGO_TITLE, len(self.lanes), self.name)
 
         # Build slot map (1-based config index → 0-based ACE slot)
         # and set custom load/unload commands
@@ -281,6 +360,12 @@ class afcACE(afcUnit):
             self._slot_map[lane_name] = slot
             lane.custom_load_cmd = f"{self._custom_load_cmd_name} UNIT={self.name} LANE={lane_name}"
             lane.custom_unload_cmd = f"{self._custom_unload_cmd_name} UNIT={self.name} LANE={lane_name}"
+            # ACE lanes have no physical load pin, so raw_load_state (_load_state)
+            # would default True (loadless default). Start it False so the native
+            # virtual hub (any(lane.raw_load_state)) reads clear until a sync or
+            # load drives the loaded-to-hub state. _handle_ready seeds it from the
+            # restored loaded_to_hub.
+            lane._load_state = False
 
         # Defer serial connection until reactor is running (klippy:ready)
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
@@ -293,6 +378,14 @@ class afcACE(afcUnit):
             "extruder:activate_extruder", self._handle_extruder_activated)
 
     def _handle_tool_loaded(self, lane):
+        """Event handler for ``afc:tool_loaded`` — reconcile feed assist to the
+        newly loaded lane.
+
+        :param lane: Event payload, usually the loaded lane but sometimes the
+            extruder object; the active lane name is resolved from it (with
+            mode-specific fallbacks) and feed assist is reconciled on a
+            background reactor callback.
+        """
         # Resolve the active lane name. The payload is usually the loaded
         # lane, but at print start / with a tool already on the shuttle the
         # toolchanger fires this with the extruder object (name "extruder"):
@@ -325,6 +418,10 @@ class afcACE(afcUnit):
         ack, THEN start assist on the new slot. Both run in this background
         reactor callback — off the toolhead's gcode greenlet — so the acks
         never hold the toolhead over the wipe tower.
+
+        :param name: Name of the lane that should now have feed assist, or a
+            lane on another unit (ours is then stopped), or None to leave
+            assist untouched.
         """
         active_slot = self._slot_map.get(name)
         if active_slot is not None:
@@ -395,6 +492,9 @@ class afcACE(afcUnit):
         return None
 
     def _handle_ready(self):
+        """``klippy:ready`` handler: seed each lane's virtual hub from its
+        restored loaded_to_hub state, then defer the ACE serial connect onto a
+        reactor callback so it runs once the reactor is fully up."""
         # Seed each lane's virtual hub with its real loaded state up front.
         # Loadless serial lanes default _load_state=True upstream, so a virtual
         # hub (state = any(raw_load_state)) reads "loaded" until something drives
@@ -406,18 +506,21 @@ class afcACE(afcUnit):
             self._set_hub_state(lane, lane.loaded_to_hub)
         self.afc.reactor.register_callback(self._deferred_ace_connect)
 
+    def _make_connection(self, reactor, serial_port, logger, baud_rate):
+        """Create the ACE serial transport. AFC_ACE2 (Pro 2) overrides this to
+        return a V2 (binary protobuf) connection instead of the V1 JSON one."""
+        return ACEConnection(reactor=reactor, serial_port=serial_port,
+                             logger=logger, baud_rate=baud_rate)
+
     def _deferred_ace_connect(self, eventtime):
         """Connect to ACE hardware after reactor is fully running."""
         serial_logger = self._create_serial_logger() or self.logger
         last_err = None
         for attempt in range(self._CONNECT_MAX_RETRIES):
             try:
-                self._ace = ACEConnection(
-                    reactor=self.afc.reactor,
-                    serial_port=self.serial_port,
-                    logger=serial_logger,
-                    baud_rate=self.baud_rate,
-                )
+                self._ace = self._make_connection(
+                    self.afc.reactor, self.serial_port, serial_logger,
+                    self.baud_rate)
                 self._ace.connect()
                 if attempt > 0:
                     self.logger.info(
@@ -476,6 +579,9 @@ class afcACE(afcUnit):
         self._ace.reconnect_callback = self._on_ace_reconnect
 
     def _on_ace_reconnect(self):
+        """Reconnect callback: the ACE reset and forgot its feed-assist state,
+        so drop our stale tracking and defer a resync of assist for the lane
+        currently loaded on the active toolhead."""
         # The ACE forgot its feed-assist state across the reset. Drop our
         # stale tracking (otherwise the watchdog's "already active" guard would
         # never re-issue it) and immediately re-send assist for whatever lane
@@ -490,6 +596,12 @@ class afcACE(afcUnit):
         self.afc.reactor.register_callback(self._resync_assist_after_reconnect)
 
     def _resync_assist_after_reconnect(self, eventtime):
+        """Reactor callback that re-issues feed assist for the active lane after
+        a reconnect, unless a load/unload is in progress (which sets assist
+        itself on completion).
+
+        :param eventtime: Reactor event time (unused).
+        """
         # Don't fight an in-flight load/unload — it sets assist itself when it
         # finishes. Otherwise let the watchdog re-issue assist for the active
         # lane right now (its target is empty again, so it will reconcile).
@@ -497,7 +609,13 @@ class afcACE(afcUnit):
             self._maybe_assist_watchdog()
 
     def _on_hw_status_callback(self, response):
-        """Process heartbeat status from ACE — keep lane states in sync."""
+        """Process heartbeat status from ACE — keep lane states in sync.
+
+        :param response: Raw status dict from the ACE heartbeat. Its ``result``
+            payload (or the dict itself) is cached, and while no operation is
+            active it drives slot-state sync, the assist watchdog, and stuck
+            spool detection.
+        """
         if not isinstance(response, dict):
             return
         result = response.get("result", response)
@@ -508,28 +626,41 @@ class afcACE(afcUnit):
             return
         self._sync_slot_states(result)
         self._maybe_assist_watchdog()
+        self._check_stuck(result)
 
     def _is_virtual_hub(self, lane) -> bool:
+        """Return whether the lane's hub is a virtual (pinless) hub.
+
+        :param lane: Lane whose hub to inspect.
+        :return bool: True when the lane has a hub that reports is_virtual_pin().
+        """
         hub = lane.hub_obj
         return (hub is not None
                 and hasattr(hub, 'is_virtual_pin')
                 and hub.is_virtual_pin())
 
     def _set_hub_state(self, lane, state: bool):
-        """Set the virtual hub sensor state for an ACE lane."""
-        hub = lane.hub_obj
-        if hub and hasattr(hub, 'is_virtual_pin') and hub.is_virtual_pin():
-            try:
-                eventtime = self.afc.reactor.monotonic()
-                hub.switch_pin_callback(eventtime, state)
-            except Exception:
-                pass
+        """Drive the lane's hub presence (loaded-to-hub) signal.
+
+        Vivid-style: ACE has no physical hub sensor, so the lane's
+        raw_load_state carries the loaded-to-hub state and the native AFC_hub
+        reports any(lane.raw_load_state). prep_state (filament inserted in slot)
+        is tracked separately. No switch_pin_callback / set_state_driven needed.
+
+        :param lane: Lane whose hub-presence signal to drive.
+        :param state: True if filament is staged at/past the hub.
+        """
+        lane._load_state = bool(state)
 
     def _sync_slot_states(self, hw_status):
         """Sync lane prep/load state from ACE hardware slot status.
 
         Uses _prev_slot_states (per-lane dict) and _prev_states_stale to
         avoid false insert/remove detection after load/unload operations.
+
+        :param hw_status: ACE hardware status dict containing the per-slot
+            ``slots`` list whose ``status`` field drives each lane's prep/load
+            state, insert/remove runout handling, and tooled-state restore.
         """
         slots = hw_status.get("slots", [])
 
@@ -551,8 +682,14 @@ class afcACE(afcUnit):
             slot_transient = slot_status in ("shifting", "feeding", "unwinding")
 
             if not slot_transient:
-                lane._load_state = slot_ready
+                # Vivid-style: slot "ready" means filament inserted -> prep_state.
+                # raw_load_state (loaded-to-hub) is driven separately via
+                # _set_hub_state by the load/unload paths. When the slot empties,
+                # nothing is inserted so nothing can be at the hub either.
                 lane.prep_state = slot_ready
+                if not slot_ready:
+                    lane.loaded_to_hub = False
+                    self._set_hub_state(lane, False)
 
             prep_done = getattr(lane, '_afc_prep_done', False)
 
@@ -600,7 +737,11 @@ class afcACE(afcUnit):
     # ── Lane parameter helpers ──────────────────────────────────────
 
     def _get_bowden_length(self, cur_lane) -> float:
-        """Total feed distance: dist_hub (lane→hub) + afc_bowden_length (hub→toolhead)."""
+        """Total feed distance: dist_hub (lane→hub) + afc_bowden_length (hub→toolhead).
+
+        :param cur_lane: Lane to compute the feed distance for.
+        :return float: dist_hub plus the hub's afc_bowden_length.
+        """
         dist = cur_lane.dist_hub
         hub = cur_lane.hub_obj
         if hub is not None:
@@ -608,36 +749,80 @@ class afcACE(afcUnit):
         return dist
 
     def _get_unload_length(self, cur_lane) -> float:
-        """Total retract distance: dist_hub + afc_unload_bowden_length."""
+        """Total retract distance: dist_hub + afc_unload_bowden_length.
+
+        :param cur_lane: Lane to compute the retract distance for.
+        :return float: dist_hub plus the hub's afc_unload_bowden_length
+            (falling back to afc_bowden_length).
+        """
         dist = cur_lane.dist_hub
         hub = cur_lane.hub_obj
         if hub is not None:
             dist += getattr(hub, 'afc_unload_bowden_length', getattr(hub, 'afc_bowden_length', 0))
         return dist
 
+    def _get_eject_length(self, cur_lane) -> float:
+        """Retract distance for an eject/unload. When the lane is loaded to the
+        toolhead, retract the full path (dist_hub + bowden). When it's only
+        staged at the hub, the filament just spans the lane->hub gap, so retract
+        dist_hub + a 200mm buffer to clear the hub and pull it into the unit.
+
+        :param cur_lane: Lane to compute the eject distance for.
+        :return float: Full unload length when tool-loaded, else dist_hub + 200.
+        """
+        if getattr(cur_lane, 'tool_loaded', False):
+            return self._get_unload_length(cur_lane)
+        return cur_lane.dist_hub + 200
+
     def _use_feed_assist(self, cur_lane) -> bool:
+        """Resolve whether feed assist should run for a lane.
+
+        :param cur_lane: Lane to check.
+        :return bool: The lane's per-lane use_feed_assist when set, else the
+            unit default.
+        """
         fa = getattr(cur_lane, 'use_feed_assist', None)
         if fa is not None:
             return fa
         return self._default_feed_assist
 
     def _get_slot(self, lane_name: str) -> int:
+        """Map a lane name to its 0-based ACE slot index.
+
+        :param lane_name: Name of the lane.
+        :return int: The mapped slot, or 0 if the lane is unknown.
+        """
         return self._slot_map.get(lane_name, 0)
 
     # ── Unit interface overrides ────────────────────────────────────
 
     def prep_load(self, lane: AFCLane):
+        """No-op for ACE: filament transport to the hub is handled in
+        prep_post_load via serial feed, not during prep_load.
+
+        :param lane: Lane being prepped (unused).
+        """
         pass
 
     def check_runout(self, cur_lane):
-        """ACE supports runout detection during printing."""
+        """ACE supports runout detection during printing.
+
+        :param cur_lane: Lane to check (unused beyond context).
+        :return bool: True when AFC reports a print in progress, else False.
+        """
         try:
             return self.afc.function.is_printing()
         except Exception:
             return False
 
     def on_filament_insert(self, lane):
-        """ACE-specific insertion: refresh RFID inventory, apply spool defaults, sync to spoolman."""
+        """ACE-specific insertion: refresh RFID inventory, apply spool defaults, sync to spoolman.
+
+        :param lane: Lane whose slot had filament inserted; its RFID inventory
+            is refreshed, filament defaults/Spoolman are applied, a freshly
+            staged or remembered spool id is restored, and the base
+            on_filament_insert is then called.
+        """
         slot = self._get_slot(lane.name)
         if slot >= self.SLOTS_PER_UNIT:
             return
@@ -677,7 +862,11 @@ class afcACE(afcUnit):
         super().on_filament_insert(lane)
 
     def on_filament_remove(self, lane):
-        """ACE-specific removal: clear slot inventory and hub state."""
+        """ACE-specific removal: clear slot inventory and hub state.
+
+        :param lane: Lane whose slot was emptied; its cached RFID inventory and
+            loaded-to-hub state are cleared.
+        """
         slot = self._get_slot(lane.name)
         if slot < self.SLOTS_PER_UNIT:
             self._clear_slot_inventory(slot)
@@ -688,7 +877,15 @@ class afcACE(afcUnit):
     # ── TD-1 support ────────────────────────────────────────────────
 
     def calibrate_td1(self, cur_lane, dis, tol):
-        """Calibrate TD-1 bowden length by feeding until TD-1 device detects filament."""
+        """Calibrate TD-1 bowden length by feeding until TD-1 device detects filament.
+
+        Wraps _calibrate_td1_inner with the _operation_active guard.
+
+        :param cur_lane: Lane to calibrate.
+        :param dis: Step size in mm for incremental feeding.
+        :param tol: Tolerance (unused for ACE).
+        :return tuple: (success, message, distance) from _calibrate_td1_inner.
+        """
         self._operation_active = True
         try:
             return self._calibrate_td1_inner(cur_lane, dis, tol)
@@ -701,13 +898,25 @@ class afcACE(afcUnit):
 
         Return non-None to prevent the base _prep_capture_td1 from running
         the stepper-based path.
+
+        :param cur_lane: Lane being prepped.
+        :return: (True, message) when TD-1 capture is handled elsewhere, else
+            None to fall through to the base stepper path.
         """
         if cur_lane.td1_when_loaded and cur_lane.loaded_to_hub:
             return True, "TD-1 capture handled by prep_post_load"
         return None
 
     def capture_td1_data(self, cur_lane):
-        """ACE TD-1 data capture using feed_filament instead of stepper moves."""
+        """ACE TD-1 data capture using feed_filament instead of stepper moves.
+
+        Wraps _capture_td1_data_inner with the _operation_active guard after
+        validating the connection and TD-1 device id.
+
+        :param cur_lane: Lane to capture TD-1 data for.
+        :return: None when prerequisites are unmet, else the
+            (success, message) tuple from _capture_td1_data_inner.
+        """
         if self._ace is None or not self._ace.connected:
             return None
         if cur_lane.td1_device_id is None:
@@ -727,6 +936,14 @@ class afcACE(afcUnit):
             self._operation_active = False
 
     def _capture_td1_data_inner(self, cur_lane, slot):
+        """Feed to the hub (if needed) and on to the TD-1 device, read the TD-1
+        data, then retract back. Implementation of capture_td1_data.
+
+        :param cur_lane: Lane to capture TD-1 data for.
+        :param slot: 0-based ACE slot index for the lane.
+        :return tuple: (True, message) if TD-1 data was captured, else
+            (False, message).
+        """
         dist_hub = cur_lane.dist_hub
 
         if not cur_lane.loaded_to_hub:
@@ -765,6 +982,15 @@ class afcACE(afcUnit):
         return False, "TD-1 data not captured (unload completed)"
 
     def _calibrate_td1_inner(self, cur_lane, dis, tol):
+        """Measure td1_bowden_length by feeding to the hub then incrementally on
+        from the hub until the TD-1 device detects filament, then save the
+        result to config. Implementation of calibrate_td1.
+
+        :param cur_lane: Lane to calibrate.
+        :param dis: Step size in mm (defaults to 50 when not positive).
+        :param tol: Tolerance (unused).
+        :return tuple: (success, message, measured_distance).
+        """
         if self._ace is None or not self._ace.connected:
             return False, "ACE not connected", 0
 
@@ -859,7 +1085,14 @@ class afcACE(afcUnit):
     # ── Prep and post-load ─────────────────────────────────────────
 
     def prep_post_load(self, lane: AFCLane):
-        """Stage filament to hub via ACE serial feed."""
+        """Stage filament to hub via ACE serial feed.
+
+        Feeds dist_hub from the slot when load_to_hub is enabled and the slot
+        is prepped but not yet staged, marking the lane loaded_to_hub and
+        optionally capturing TD-1 data. Retries the feed up to three times.
+
+        :param lane: Lane to stage to the hub.
+        """
         if self._unit_load_to_hub is not None:
             load_to_hub = self._unit_load_to_hub
         else:
@@ -893,6 +1126,7 @@ class afcACE(afcUnit):
                 self._ace.feed_filament(slot, dist_hub, self.feed_speed)
                 self._wait_for_feed_complete(slot, dist_hub, self.feed_speed)
                 lane.loaded_to_hub = True
+                self._set_hub_state(lane, True)
                 self.afc.save_vars()
                 self.logger.info(
                     f"ACE prep_post_load: {lane.name} staged at hub "
@@ -918,20 +1152,37 @@ class afcACE(afcUnit):
                     f"{max_attempts} attempts: {e}")
 
     def eject_lane(self, lane: AFCLane):
-        """Retract filament back into ACE unit."""
+        """Retract filament back into the ACE unit.
+
+        From the hub-staged state the filament only spans the lane->hub gap, so
+        unwind dist_hub + a 200mm buffer to clear the hub sensor and fully pull
+        the filament back into the unit. If it's loaded past the hub (to the
+        toolhead) fall back to the full unload length (dist_hub + bowden).
+
+        :param lane: Lane to eject/retract back into the unit.
+        """
         slot = self._get_slot(lane.name)
         if self._ace and self._ace.connected:
             try:
                 self._stop_feed_assist(slot)
                 self._wait_for_ace_ready()
-                dist = self._get_unload_length(lane)
+                dist = self._get_eject_length(lane)
+                self.logger.info(
+                    f"ACE eject {lane.name}: unwinding {dist:.0f}mm "
+                    f"(dist_hub={lane.dist_hub:.0f}mm)")
                 self._ace.unwind_filament(slot, dist, self.retract_speed)
                 self._wait_for_feed_complete(slot, dist, self.retract_speed)
             except Exception as e:
                 self.logger.error(f"ACE eject failed for {lane.name}: {e}")
 
     def lane_move(self, cur_lane, distance, speed_mode):
-        """Move filament via ACE serial instead of stepper."""
+        """Move filament via ACE serial instead of stepper.
+
+        :param cur_lane: Lane to move.
+        :param distance: Signed distance in mm; positive feeds, negative unwinds.
+        :param speed_mode: AFC speed mode (unused; ACE uses its own feed/retract
+            speeds).
+        """
         slot = self._get_slot(cur_lane.name)
         if not self._ace or not self._ace.connected:
             self.logger.error("ACE not connected for lane_move")
@@ -948,13 +1199,21 @@ class afcACE(afcUnit):
             self.logger.error(f"ACE lane_move failed: {e}")
 
     def lane_unload(self, cur_lane):
-        """Custom lane unload — retract via ACE serial."""
+        """Custom lane unload — retract via ACE serial.
+
+        :param cur_lane: Lane to unload.
+        :return bool: Always True.
+        """
         slot = self._get_slot(cur_lane.name)
         if self._ace and self._ace.connected:
             try:
                 self._stop_feed_assist(slot)
                 self._wait_for_ace_ready()
-                dist = self._get_unload_length(cur_lane)
+                dist = self._get_eject_length(cur_lane)
+                self.logger.info(
+                    f"ACE unload {cur_lane.name}: unwinding {dist:.0f}mm "
+                    f"(dist_hub={cur_lane.dist_hub:.0f}mm, "
+                    f"tool_loaded={getattr(cur_lane, 'tool_loaded', False)})")
                 self._ace.unwind_filament(slot, dist, self.retract_speed)
                 self._wait_for_feed_complete(slot, dist, self.retract_speed)
             except Exception as e:
@@ -962,7 +1221,11 @@ class afcACE(afcUnit):
         return True
 
     def abort_load(self, cur_lane):
-        """Cancel in-progress ACE feed."""
+        """Cancel in-progress ACE feed.
+
+        :param cur_lane: Lane whose feed is being aborted (unused; aborts the
+            ACE's current action).
+        """
         if self._ace and self._ace.connected:
             try:
                 self._ace.abort_current_action()
@@ -970,10 +1233,28 @@ class afcACE(afcUnit):
                 pass
 
     def get_lane_reset_command(self, lane, dis):
+        """Return the gcode command used to reset/retract a lane.
+
+        :param lane: Lane to reset.
+        :param dis: Reset distance (unused; the ACE_LANE_RESET handler computes
+            the retract distance itself).
+        :return str: The ACE_LANE_RESET command for this unit and lane.
+        """
         return f"ACE_LANE_RESET UNIT={self.name} LANE={lane.name}"
 
     def system_Test(self, cur_lane, delay, assignTcmd, enable_movement):
-        """ACE system test — query hardware slot status instead of physical switches."""
+        """ACE system test — query hardware slot status instead of physical switches.
+
+        Drives a lane's prep step: reads the ACE slot status, sets prep/load
+        and tooled state accordingly, applies RFID defaults, optionally starts
+        feed assist, and reports a status message.
+
+        :param cur_lane: Lane being prep-tested.
+        :param delay: Unused (kept for interface compatibility).
+        :param assignTcmd: When True, assign the lane's tool (Tn) command.
+        :param enable_movement: Unused (kept for interface compatibility).
+        :return bool: True if the lane passed the prep checks, else False.
+        """
         msg = ''
         succeeded = True
 
@@ -989,7 +1270,6 @@ class afcACE(afcUnit):
                     slots = hw_status.get("slots", [])
                     if slot < len(slots) and isinstance(slots[slot], dict):
                         slot_ready = slots[slot].get("status", "") == "ready"
-                        cur_lane._load_state = slot_ready
                         cur_lane.prep_state = slot_ready
                         if not slot_ready:
                             cur_lane.loaded_to_hub = False
@@ -1038,6 +1318,7 @@ class afcACE(afcUnit):
                                               getattr(self.afc, 'load_to_hub', False))
                         if load_to_hub:
                             cur_lane.loaded_to_hub = True
+                            self._set_hub_state(cur_lane, True)
 
                     if (cur_lane.tool_loaded
                         and cur_lane.extruder_obj.lane_loaded == cur_lane.name):
@@ -1072,7 +1353,10 @@ class afcACE(afcUnit):
 
     def _clear_stale_sensor_state(self, cur_lane):
         """Clear stale tool_start_state / filament_present / FPS latch so
-        calibration reads real-time sensor values."""
+        calibration reads real-time sensor values.
+
+        :param cur_lane: Lane whose toolhead sensor/buffer latch state to clear.
+        """
         sensor_obj = getattr(cur_lane.extruder_obj, 'filament_sensor_obj', None)
         if sensor_obj is not None:
             sensor_obj.runout_helper.filament_present = False
@@ -1086,7 +1370,11 @@ class afcACE(afcUnit):
     def _toolhead_sensor_triggered(self, cur_lane):
         """Check if the toolhead sensor is triggered, using the raw hardware
         button state for U1 motion sensors (which need encoder rotation for
-        filament_present but have a physical switch for static detection)."""
+        filament_present but have a physical switch for static detection).
+
+        :param cur_lane: Lane whose toolhead sensor to check.
+        :return bool: True when the toolhead pre-sensor reports filament.
+        """
         sensor_obj = getattr(cur_lane.extruder_obj, 'filament_sensor_obj', None)
         if sensor_obj is not None and hasattr(sensor_obj, 'runout_buttun_state'):
             return bool(sensor_obj.runout_buttun_state)
@@ -1096,6 +1384,13 @@ class afcACE(afcUnit):
         """Feed filament in steps until toolhead sensor triggers.
 
         Returns (distance_fed, sensor_triggered).
+
+        :param slot: 0-based ACE slot index to feed.
+        :param cur_lane: Lane whose toolhead sensor is polled after each step.
+        :param max_distance: Maximum total distance in mm to feed.
+        :param step_size: Per-step feed distance in mm (defaults to
+            calibration_step).
+        :return tuple: (total_fed, sensor_triggered).
         """
         if step_size is None:
             step_size = self.calibration_step
@@ -1123,7 +1418,16 @@ class afcACE(afcUnit):
 
     def calibrate_bowden(self, cur_lane, dis, tol):
         """Calibrate afc_bowden_length (hub→toolhead) by feeding until
-        the toolhead sensor triggers."""
+        the toolhead sensor triggers.
+
+        Wraps _calibrate_bowden_inner with the _operation_active guard.
+
+        :param cur_lane: Lane to calibrate.
+        :param dis: Step size in mm (passed by the caller; the inner method uses
+            calibration_step).
+        :param tol: Tolerance (unused).
+        :return tuple: (success, message, measured_distance).
+        """
         slot = self._get_slot(cur_lane.name)
         if not self._ace or not self._ace.connected:
             return False, "ACE not connected", 0
@@ -1140,6 +1444,16 @@ class afcACE(afcUnit):
             self._prev_states_stale = True
 
     def _calibrate_bowden_inner(self, cur_lane, cur_hub, slot):
+        """Feed in calibration_step increments until the toolhead sensor trips,
+        record that distance as afc_bowden_length (and afc_unload_bowden_length),
+        retract, and rewrite the values to config. Implementation of
+        calibrate_bowden.
+
+        :param cur_lane: Lane to calibrate.
+        :param cur_hub: Hub object the measured bowden length is saved to.
+        :param slot: 0-based ACE slot index for the lane.
+        :return tuple: (success, message, measured_distance).
+        """
         self._clear_stale_sensor_state(cur_lane)
 
         if self._toolhead_sensor_triggered(cur_lane):
@@ -1215,7 +1529,14 @@ class afcACE(afcUnit):
         return True, f"afc_bowden_length calibration: {bowden_dist}mm (was {old_bowden}mm)", bowden_dist
 
     def calibrate_lane(self, cur_lane, tol):
-        """Calibrate dist_hub from ACE slot to hub sensor."""
+        """Calibrate dist_hub from ACE slot to hub sensor.
+
+        Wraps _calibrate_hub_inner with the _operation_active guard.
+
+        :param cur_lane: Lane to calibrate.
+        :param tol: Tolerance (unused).
+        :return tuple: (success, message, measured_distance).
+        """
         self._operation_active = True
         try:
             return self._calibrate_hub_inner(cur_lane)
@@ -1226,7 +1547,11 @@ class afcACE(afcUnit):
     # ── Custom load/unload gcode handlers ───────────────────────────
 
     def _cmd_ace_custom_load(self, gcmd):
-        """Handle _ACE_CUSTOM_LOAD — filament transport to toolhead area."""
+        """Handle _ACE_CUSTOM_LOAD — filament transport to toolhead area.
+
+        :param gcmd: Gcode command; LANE selects the lane to load. Raises a
+            gcode error on an unknown lane or a failed load.
+        """
         lane_name = gcmd.get('LANE')
         cur_lane = self.afc.lanes.get(lane_name)
         if cur_lane is None:
@@ -1237,7 +1562,11 @@ class afcACE(afcUnit):
             raise gcmd.error(f"ACE load failed for {lane_name}")
 
     def _cmd_ace_custom_unload(self, gcmd):
-        """Handle _ACE_CUSTOM_UNLOAD — filament transport from toolhead."""
+        """Handle _ACE_CUSTOM_UNLOAD — filament transport from toolhead.
+
+        :param gcmd: Gcode command; LANE selects the lane to unload. Raises a
+            gcode error on an unknown lane or a failed unload.
+        """
         lane_name = gcmd.get('LANE')
         cur_lane = self.afc.lanes.get(lane_name)
         if cur_lane is None:
@@ -1248,7 +1577,14 @@ class afcACE(afcUnit):
             raise gcmd.error(f"ACE unload failed for {lane_name}")
 
     def _ace_load_sequence(self, cur_lane, cur_extruder) -> bool:
-        """ACE load transport: serial feed to toolhead area + feed assist."""
+        """ACE load transport: serial feed to toolhead area + feed assist.
+
+        Wraps _ace_load_inner with the _operation_active guard.
+
+        :param cur_lane: Lane to load.
+        :param cur_extruder: Extruder the lane loads into.
+        :return bool: True on a successful load transport.
+        """
         self._operation_active = True
         try:
             return self._ace_load_inner(cur_lane, cur_extruder)
@@ -1262,6 +1598,11 @@ class afcACE(afcUnit):
         AFC's load_sequence handles the shared toolhead engagement
         (sync_to_extruder, tool_end, tool_stn, sensor verification,
         buffer ram) after this returns via custom_load_cmd.
+
+        :param cur_lane: Lane to load.
+        :param cur_extruder: Extruder the lane loads into.
+        :return bool: True once filament reaches the toolhead sensor; False on
+            any failure (handled via handle_lane_failure).
         """
         afc = self.afc
         slot = self._get_slot(cur_lane.name)
@@ -1365,6 +1706,7 @@ class afcACE(afcUnit):
 
         # Set loaded_to_hub AFTER successful feed
         cur_lane.loaded_to_hub = True
+        self._set_hub_state(cur_lane, True)
 
         # Enable feed assist
         if self._use_feed_assist(cur_lane):
@@ -1379,6 +1721,8 @@ class afcACE(afcUnit):
         Upstream's unload sequence invokes ``lane_unloading`` (for LEDs) but
         never ``prepare_unload``, so we trigger the ACE feed-assist stop here as
         well. Keeps the watchdog from fighting the retract on the upstream core.
+
+        :param lane: Lane that is starting to unload.
         """
         super().lane_unloading(lane)
         try:
@@ -1395,6 +1739,10 @@ class afcACE(afcUnit):
         Assist should stop before cut/park/tip since it only conflicts with
         the serial unwind. This prevents inadvertent assist state on resume
         if an error during tip-forming pauses the print.
+
+        :param cur_lane: Lane being unloaded; its slot's feed assist is stopped.
+        :param cur_hub: Hub object (unused here).
+        :param cur_extruder: Extruder object (unused here).
         """
         # Suppress the assist watchdog for the whole unload. AFC's quick-pull /
         # cut / tip-forming runs between here and the custom unload sequence
@@ -1408,7 +1756,14 @@ class afcACE(afcUnit):
         self._stop_feed_assist(slot)
 
     def _ace_unload_sequence(self, cur_lane, cur_extruder) -> bool:
-        """ACE unload transport — ACE serial unwind back to hub."""
+        """ACE unload transport — ACE serial unwind back to hub.
+
+        Wraps _ace_unload_inner with the _operation_active guard.
+
+        :param cur_lane: Lane to unload.
+        :param cur_extruder: Extruder the lane is synced to.
+        :return bool: True on a successful unload transport.
+        """
         self._operation_active = True
         try:
             return self._ace_unload_inner(cur_lane, cur_extruder)
@@ -1423,6 +1778,12 @@ class afcACE(afcUnit):
         (LED, heat, quick pull, buffer disable, sync, cut/park/tip)
         then calls this via custom_unload_cmd.  The lane is still
         synced to the extruder on entry so we can do extruder moves.
+
+        :param cur_lane: Lane to unload.
+        :param cur_extruder: Extruder the lane is synced to; used for the
+            tool_stn_unload retract before the serial unwind.
+        :return bool: True once filament is staged near the hub; False on
+            failure (handled via handle_lane_failure).
         """
         afc = self.afc
         slot = self._get_slot(cur_lane.name)
@@ -1476,7 +1837,10 @@ class afcACE(afcUnit):
     }
 
     def cmd_ACE_CALIBRATE(self, gcmd):
-        """Calibrate ACE feed distance to toolhead for a lane."""
+        """Calibrate ACE feed distance to toolhead for a lane.
+
+        :param gcmd: Gcode command; LANE selects the lane to calibrate.
+        """
         lane_name = gcmd.get('LANE', '')
         if not lane_name or lane_name not in self.afc.lanes:
             gcmd.respond_info("Usage: ACE_CALIBRATE LANE=<lane_name>")
@@ -1491,7 +1855,11 @@ class afcACE(afcUnit):
     }
 
     def cmd_ACE_CALIBRATE_HUB(self, gcmd):
-        """Calibrate ACE feed distance to hub sensor."""
+        """Calibrate ACE feed distance to hub sensor.
+
+        :param gcmd: Gcode command; LANE selects the lane to calibrate. Requires
+            a physical (non-virtual) hub sensor.
+        """
         lane_name = gcmd.get('LANE', '')
         if not lane_name or lane_name not in self.afc.lanes:
             gcmd.respond_info("Usage: ACE_CALIBRATE_HUB LANE=<lane_name>")
@@ -1504,7 +1872,10 @@ class afcACE(afcUnit):
         gcmd.respond_info(msg)
 
     def cmd_ACE_STATUS(self, gcmd):
-        """Query and display ACE hardware status."""
+        """Query and display ACE hardware status.
+
+        :param gcmd: Gcode command; responds with the raw ACE status dict.
+        """
         if not self._ace or not self._ace.connected:
             gcmd.respond_info("ACE not connected")
             return
@@ -1514,18 +1885,236 @@ class afcACE(afcUnit):
         except Exception as e:
             gcmd.respond_info(f"Error querying ACE: {e}")
 
+    @staticmethod
+    def _parse_ace_params(raw):
+        """Parse the PARAMS argument into a dict. Accepts real JSON, but the
+        gcode/console parser strips JSON double-quotes, so also accept the
+        quote-less form {key:val,key:val} with bare keys, [a,b] lists, and
+        int/float/bool/string value inference.
+
+        :param raw: The PARAMS argument string.
+        :return: A params dict, or None when empty/unparseable.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+
+        def conv(v):
+            """Coerce a token to a list, int, float, bool, or string.
+
+            :param v: Raw token (possibly quoted or a [a,b] list).
+            :return: The inferred Python value.
+            """
+            v = v.strip().strip('"').strip("'")
+            if v.startswith('[') and v.endswith(']'):
+                return [conv(x) for x in v[1:-1].split(',') if x.strip()]
+            for cast in (int, float):
+                try:
+                    return cast(v)
+                except ValueError:
+                    pass
+            if v.lower() in ('true', 'false'):
+                return v.lower() == 'true'
+            return v
+
+        s = raw.lstrip('{').rstrip('}')
+        pairs, cur, depth = [], '', 0
+        for ch in s:
+            if ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+            if ch == ',' and depth == 0:
+                pairs.append(cur)
+                cur = ''
+            else:
+                cur += ch
+        if cur.strip():
+            pairs.append(cur)
+        out = {}
+        for p in pairs:
+            sep = ':' if ':' in p else ('=' if '=' in p else None)
+            if sep is None:
+                continue
+            k, _, val = p.partition(sep)
+            out[k.strip().strip('"').strip("'")] = conv(val)
+        return out or None
+
+    def cmd_ACE_CMD(self, gcmd):
+        """Send a raw ACE protocol command and print the reply — for probing
+        which protocol methods this firmware actually supports.
+
+        Usage: ACE_CMD METHOD=<method> [PARAMS=<json-ish>]
+        PARAMS has NO spaces (gcode splits on whitespace); quotes are optional
+        (the console strips them), e.g.
+          ACE_CMD METHOD=get_status
+          ACE_CMD METHOD=set_fan_speed PARAMS={fan_speed:7000}
+          ACE_CMD METHOD=set_filament_info PARAMS={index:0,type:PLA,color:[255,0,0]}
+        A supported method replies code=0; an unsupported one replies
+        code=400 InvalidCommand (shown as an error here) and is harmless.
+
+        :param gcmd: Gcode command; METHOD is the protocol method and optional
+            PARAMS is the json-ish argument string. Responds with the reply.
+        """
+        if not self._ace or not self._ace.connected:
+            gcmd.respond_info("ACE not connected")
+            return
+        method = gcmd.get('METHOD', '')
+        if not method:
+            gcmd.respond_info("ACE_CMD: METHOD=<method> required")
+            return
+        try:
+            params = self._parse_ace_params(gcmd.get('PARAMS', ''))
+        except Exception as e:
+            gcmd.respond_info(f"ACE_CMD: bad PARAMS ({e}) — e.g. "
+                              f"PARAMS={{index:0,type:PLA}}")
+            return
+        try:
+            resp = self._ace.send_command(method, params=params)
+            gcmd.respond_info(f"ACE_CMD {method}: OK -> {resp}")
+        except Exception as e:
+            gcmd.respond_info(f"ACE_CMD {method}: {e}")
+
+    def _pick_test_slot(self):
+        """First slot that reports a recognized tag / SKU (a loaded spool).
+
+        :return: The slot index of the first loaded spool, or None if none.
+        """
+        for slot in range(self.SLOTS_PER_UNIT):
+            inv = self._slot_inventory[slot]
+            if inv.get("rfid") in (2, 3) or inv.get("sku"):
+                return slot
+        return None
+
+    def _poll_until_status(self, want_ready, timeout):
+        """Poll get_status until status is (want_ready=True) / isn't ('ready').
+        Returns True if the wanted condition was seen before timeout.
+
+        :param want_ready: Target condition — True waits for 'ready', False
+            waits for a non-'ready' (busy) status.
+        :param timeout: Maximum time in seconds to poll.
+        :return bool: True if the wanted condition was seen before timeout.
+        """
+        ace = self._ace
+        reactor = self.afc.reactor
+        elapsed = 0.0
+        while elapsed < timeout:
+            try:
+                hw = ace.get_status(timeout=2.0)
+                if isinstance(hw, dict):
+                    is_ready = hw.get("status", "") == "ready"
+                    if is_ready == want_ready:
+                        return True
+            except Exception:
+                pass
+            reactor.pause(reactor.monotonic() + 0.2)
+            elapsed += 0.2
+        return False
+
+    cmd_ACE_FEED_TEST_options = {
+        "SLOT":   {"type": "int",   "default": -1},
+        "LENGTH": {"type": "float", "default": 100.0},
+        "START":  {"type": "int",   "default": 10},
+        "END":    {"type": "int",   "default": 250},
+        "STEP":   {"type": "int",   "default": 20},
+    }
+
+    def cmd_ACE_FEED_TEST(self, gcmd):
+        """Sweep the ACE feed/unwind speed to see whether the speed param
+        actually changes the feed rate. For each speed it feeds LENGTH mm, times
+        it (waiting for the ACE to finish), then unwinds LENGTH mm so the net
+        travel is zero. Waits for 'ready' between every move so nothing returns
+        FORBIDDEN. Prints speed -> elapsed and derived mm/s.
+
+        Usage: ACE_FEED_TEST [SLOT=<n>] [LENGTH=100] [START=10] [END=250] [STEP=20]
+        Run with the test slot NOT loaded to the toolhead — the spool feeds toward
+        the hub and returns each pass. Keep LENGTH below your dist_hub.
+        This ties up the console for the duration of the sweep.
+
+        :param gcmd: Gcode command supplying SLOT, LENGTH, START, END and STEP;
+            responds with per-speed timings and a clamped/works verdict.
+        """
+        if not self._ace or not self._ace.connected:
+            gcmd.respond_info("ACE not connected")
+            return
+        length = gcmd.get_float('LENGTH', 100.0, minval=1.0)
+        start = gcmd.get_int('START', 10, minval=1)
+        end = gcmd.get_int('END', 250, minval=start)
+        step = gcmd.get_int('STEP', 20, minval=1)
+        slot = gcmd.get_int('SLOT', -1)
+        if slot < 0:
+            slot = self._pick_test_slot()
+        if slot is None or slot < 0 or slot >= self.SLOTS_PER_UNIT:
+            gcmd.respond_info(
+                "ACE_FEED_TEST: no loaded slot detected — pass SLOT=<n>")
+            return
+        reactor = self.afc.reactor
+        gcmd.respond_info(
+            f"ACE_FEED_TEST: slot {slot}, {length:.0f}mm, speeds "
+            f"{start}..{end} step {step} (feed + net-zero unwind each pass)")
+        results = []
+        speed = start
+        try:
+            while speed <= end:
+                self._wait_for_ace_ready()
+                # feed and time to completion
+                t0 = reactor.monotonic()
+                self._ace.feed_filament(slot, length, speed)
+                self._poll_until_status(False, timeout=5.0)   # wait until busy
+                self._poll_until_status(True, timeout=max(30.0, length / 2))
+                elapsed = reactor.monotonic() - t0
+                rate = length / elapsed if elapsed > 0 else 0
+                results.append((speed, elapsed))
+                gcmd.respond_info(
+                    f"  speed={speed:>3}: {elapsed:5.2f}s  (~{rate:4.0f} mm/s)")
+                # net-zero return at the same speed
+                self._wait_for_ace_ready()
+                self._ace.unwind_filament(slot, length, speed, "normal")
+                self._poll_until_status(False, timeout=5.0)
+                self._poll_until_status(True, timeout=max(30.0, length / 2))
+                speed += step
+        except Exception as e:
+            gcmd.respond_info(f"ACE_FEED_TEST aborted at speed {speed}: {e}")
+            self._wait_for_ace_ready()
+            return
+        if len(results) >= 2:
+            t_slow, t_fast = results[0][1], results[-1][1]
+            if t_slow > 0 and abs(t_slow - t_fast) / t_slow < 0.15:
+                verdict = ("times ~constant -> speed param appears "
+                           "CLAMPED/IGNORED (like the fan)")
+            else:
+                verdict = "times scale with speed -> speed param WORKS"
+            gcmd.respond_info(f"ACE_FEED_TEST done. {verdict}")
+        else:
+            gcmd.respond_info("ACE_FEED_TEST done.")
+
     cmd_ACE_DRY_options = {
         "UNIT": {"type": "string", "default": ""},
         "TEMP": {"type": "float", "default": 50.0},
         "DURATION": {"type": "float", "default": 90.0},
-        "FAN": {"type": "int", "default": 800},
+        "FAN": {"type": "int", "default": 7000},
     }
 
     def cmd_ACE_DRY(self, gcmd):
-        """Start ACE filament dryer."""
+        """Start ACE filament dryer. NOTE: the ACE Pro firmware ignores the fan
+        speed and always runs its fan at 7000 — FAN is kept for compatibility
+        but has no effect.
+
+        :param gcmd: Gcode command supplying TEMP, DURATION and FAN. TEMP is
+            capped to max_dryer_temperature before the dryer is started.
+        """
         temp = gcmd.get_float('TEMP', 50.0)
         duration = gcmd.get_float('DURATION', 90.0)
-        fan = gcmd.get_int('FAN', 800)
+        fan = gcmd.get_int('FAN', 7000)
+        if temp > self.max_dryer_temperature:
+            gcmd.respond_info(
+                f"ACE dryer: TEMP {temp:.0f}°C capped to "
+                f"max_dryer_temperature {self.max_dryer_temperature:.0f}°C")
+            temp = self.max_dryer_temperature
         if not self._ace or not self._ace.connected:
             gcmd.respond_info("ACE not connected")
             return
@@ -1536,7 +2125,10 @@ class afcACE(afcUnit):
             gcmd.respond_info(f"Error starting dryer: {e}")
 
     def cmd_ACE_DRY_STOP(self, gcmd):
-        """Stop ACE filament dryer."""
+        """Stop ACE filament dryer.
+
+        :param gcmd: Gcode command (no arguments used).
+        """
         if not self._ace or not self._ace.connected:
             gcmd.respond_info("ACE not connected")
             return
@@ -1547,7 +2139,10 @@ class afcACE(afcUnit):
             gcmd.respond_info(f"Error stopping dryer: {e}")
 
     def cmd_ACE_LANE_RESET(self, gcmd):
-        """Retract lane filament back into ACE unit."""
+        """Retract lane filament back into ACE unit.
+
+        :param gcmd: Gcode command; LANE selects the lane to reset/eject.
+        """
         lane_name = gcmd.get('LANE', '')
         if not lane_name or lane_name not in self.afc.lanes:
             gcmd.respond_info("Usage: ACE_LANE_RESET LANE=<lane_name>")
@@ -1559,6 +2154,14 @@ class afcACE(afcUnit):
     # ── Hardware interaction helpers ────────────────────────────────
 
     def _start_feed_assist(self, slot: int):
+        """Enable ACE feed assist on a slot, tracking it as active.
+
+        Idempotent and retried on timeout; FORBIDDEN replies are left for the
+        watchdog to retry. No-op when the slot is already active or the ACE is
+        disconnected.
+
+        :param slot: 0-based ACE slot index.
+        """
         if slot in self._feed_assist_active:
             return
         if not (self._ace and self._ace.connected):
@@ -1598,6 +2201,13 @@ class afcACE(afcUnit):
                 return
 
     def _stop_feed_assist(self, slot: int):
+        """Disable ACE feed assist on a slot, clearing it from active tracking.
+
+        Idempotent and retried on timeout. No-op when the slot is not tracked
+        active or the ACE is disconnected.
+
+        :param slot: 0-based ACE slot index.
+        """
         if slot not in self._feed_assist_active:
             return
         if not (self._ace and self._ace.connected):
@@ -1626,6 +2236,11 @@ class afcACE(afcUnit):
                 return
 
     def _active_assist_lane(self):
+        """Name of the lane that should currently have feed assist.
+
+        :return: The name of this unit's lane that is tool_loaded on the
+            extruder currently on the shuttle, or None if there isn't one.
+        """
         # Name of the lane that SHOULD have feed assist: the one loaded on the
         # toolhead extruder currently on the shuttle. None if there isn't one.
         try:
@@ -1655,6 +2270,12 @@ class afcACE(afcUnit):
         return candidate
 
     def _maybe_assist_watchdog(self):
+        """Heartbeat watchdog: reconcile feed assist to the active lane.
+
+        If the active tool's lane should be assisted but isn't (or the wrong
+        slot is), schedule a reconcile. Idempotent — a no-op once assist is
+        correct. Disabled when assist_watchdog is off.
+        """
         # Heartbeat watchdog: if the active tool's lane should be assisted but
         # isn't (or the wrong slot is), reconcile. Idempotent — a no-op once
         # assist is correct, so it only acts on a genuine discrepancy.
@@ -1674,7 +2295,104 @@ class afcACE(afcUnit):
             self.afc.reactor.register_callback(
                 lambda et, n=name: self._reconcile_feed_assist(n))
 
+    def _check_stuck(self, result):
+        """Spot a stuck/tangled spool from the ACE's continuous assist time.
+
+        The firmware reports cont_assist_time — how long the feed-assist has
+        been running without stopping. A healthy buffer refill is a brief
+        blip; a jam keeps the feed running. If that time climbs past stuck_time
+        while we're printing with assist on, the spool is stuck: stop driving
+        the jam and pause. Runs only on idle heartbeats (the caller skips it
+        during load/unload, where long feeds are normal).
+
+        :param result: ACE status dict; its ``cont_assist_time`` is compared
+            against stuck_time to decide whether to trip a one-shot pause.
+        """
+        if not self._stuck_detection:
+            return
+        # Only meaningful during a real print with assist actually running.
+        # Outside those conditions, clear the latch so it re-arms cleanly.
+        if (not self.afc.function.in_print()
+                or self.afc.function.is_paused()
+                or not self._feed_assist_active):
+            self._stuck_tripped = False
+            return
+        cont = result.get("cont_assist_time")
+        if cont is None:
+            return
+        try:
+            cont = float(cont)
+        except (TypeError, ValueError):
+            return
+        if cont < self._stuck_time:
+            # Pump cycled normally — the previous jam (if any) cleared.
+            self._stuck_tripped = False
+            return
+        if self._stuck_tripped:
+            return  # already handled this jam; don't re-pause every heartbeat
+        self._stuck_tripped = True
+        # Defer the pause off the serial/heartbeat path onto the reactor.
+        self.afc.reactor.register_callback(
+            lambda et, c=cont: self._handle_stuck(c))
+
+    def _handle_stuck(self, cont_time):
+        """Stop feed assist on the active lane and pause the print for a stuck
+        spool (deferred onto the reactor from _check_stuck).
+
+        :param cont_time: Continuous feed-assist run time in seconds reported
+            by the ACE, included in the pause message.
+        """
+        name = self._active_assist_lane()
+        slot = self._slot_map.get(name) if name else None
+        # Stop driving the feed into the blockage before we pause.
+        if slot is not None:
+            try:
+                self._stop_feed_assist(slot)
+            except Exception:
+                pass
+        msg = (
+            "ACE stuck spool detected on {unit}{lane}: feed assist ran "
+            "continuously for {t:.1f}s (>= {thr:.1f}s threshold). The spool is "
+            "likely tangled or jammed at the unit. Clear the snag, then resume. "
+            "Run ACE_STUCK_SPOOL_DETECTION ENABLE=0 to disable this check.".format(
+                unit=self.name,
+                lane=" lane {}".format(name) if name else "",
+                t=cont_time, thr=self._stuck_time))
+        try:
+            # Route through AFC so it snapshots position and uses the AFC
+            # pause/resume path (z-hop, restore on AFC_RESUME).
+            self.afc.error.AFC_error(msg, pause=True)
+        except Exception:
+            self.logger.error(msg)
+            self.gcode.run_script_from_command("PAUSE")
+
+    cmd_ACE_STUCK_SPOOL_DETECTION_help = "Enable/disable ACE stuck spool detection"
+    def cmd_ACE_STUCK_SPOOL_DETECTION(self, gcmd):
+        """Toggle stuck spool detection or adjust its threshold at runtime.
+
+        Usage
+        -----
+        `ACE_STUCK_SPOOL_DETECTION [ENABLE=0|1] [STUCK_TIME=<seconds>]`
+
+        :param gcmd: Gcode command supplying optional ENABLE and STUCK_TIME.
+        """
+        enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
+        if enable is not None:
+            self._stuck_detection = bool(enable)
+            if not self._stuck_detection:
+                self._stuck_tripped = False
+        stuck_time = gcmd.get_float('STUCK_TIME', None, minval=2.0)
+        if stuck_time is not None:
+            self._stuck_time = stuck_time
+        self.logger.info(
+            "ACE stuck spool detection {state}: stuck_time={t:.1f}s".format(
+                state="ON" if self._stuck_detection else "OFF",
+                t=self._stuck_time))
+
     def _handle_extruder_activated(self):
+        """``extruder:activate_extruder`` handler: when one of our lanes is
+        loaded on the now-active extruder, schedule a feed-assist reconcile to
+        switch assist to it. Mode-agnostic."""
         # A tool pickup (e.g. grabbing the probe tool during print start)
         # activates that tool's extruder. If one of our lanes is loaded on the
         # now-active extruder, switch feed assist to it. Mode-agnostic.
@@ -1692,6 +2410,9 @@ class afcACE(afcUnit):
         After a retract/feed completes, the slot may report 'ready'/'empty'
         before the ACE controller finishes internal housekeeping. Sending
         a new feed_filament while the ACE is still busy returns FORBIDDEN.
+
+        :param timeout: Maximum time in seconds to wait for 'ready' before
+            logging a warning and proceeding anyway.
         """
         ace = self._ace
         if ace is None or not ace.connected:
@@ -1718,7 +2439,17 @@ class afcACE(afcUnit):
 
     def _wait_for_feed_complete(self, slot_index, length_mm, speed_mm_s,
                                  lane=None, poll_interval=0.5) -> bool:
-        """Wait for ACE feed/unwind movement to complete by polling slot status."""
+        """Wait for ACE feed/unwind movement to complete by polling slot status.
+
+        :param slot_index: 0-based ACE slot index being moved.
+        :param length_mm: Move length in mm, used to bound the wait.
+        :param speed_mm_s: Move speed in mm/s, used to bound the wait.
+        :param lane: Optional lane; if its toolhead sensor triggers the wait
+            returns early as successful.
+        :param poll_interval: Status poll interval in seconds.
+        :return bool: True if the slot started then returned to ready/empty (or
+            the lane sensor triggered); False on no-start or timeout.
+        """
         ace = self._ace
         if ace is None or not ace.connected:
             return False
@@ -1779,7 +2510,14 @@ class afcACE(afcUnit):
         return False
 
     def _smart_load_retry(self, cur_lane, slot, feed_dist, max_retries: int = 3) -> bool:
-        """Resend the full feed command when the initial feed stalls or times out."""
+        """Resend the full feed command when the initial feed stalls or times out.
+
+        :param cur_lane: Lane being loaded.
+        :param slot: 0-based ACE slot index.
+        :param feed_dist: Feed distance in mm to resend each attempt.
+        :param max_retries: Maximum number of feed retries.
+        :return bool: True once the toolhead sensor triggers, else False.
+        """
         for attempt in range(max_retries):
             self.logger.info(
                 f"Feed retry {attempt + 1}/{max_retries} for {cur_lane.name} "
@@ -1797,7 +2535,13 @@ class afcACE(afcUnit):
 
     def _calibrate_hub_inner(self, cur_lane) -> tuple:
         """Calibrate dist_hub by incrementally feeding until the hub sensor
-        triggers; the first-detection distance is the measurement."""
+        triggers; the first-detection distance is the measurement.
+
+        Requires a physical hub sensor; rewrites dist_hub to config on success.
+
+        :param cur_lane: Lane to calibrate.
+        :return tuple: (success, message, measured_distance).
+        """
         slot = self._get_slot(cur_lane.name)
         if not self._ace or not self._ace.connected:
             return False, "ACE not connected", 0
@@ -1890,8 +2634,26 @@ class afcACE(afcUnit):
                     f"ACE {self.name}: slot {slot} inventory query failed: {e}")
 
     def _store_slot_rfid(self, slot, info):
-        """Store RFID fields from a get_filament_info response into slot cache."""
+        """Store RFID fields from a get_filament_info response into slot cache.
+
+        Per Anycubic's own ACE protocol (klipper-go ace_proto.go, FilamentInfo)
+        the richest per-slot tag payload is: index, sku, brand, type, color[],
+        extruder_temp{min,max}, hotbed_temp{min,max}, diameter, rfid (recognition
+        status), source. The real firmware additionally returns weight
+        (total/current). There is NO per-tag UID/serial in the payload, so an ACE
+        spool's identity has to come from its SKU. The full raw dict is kept (and
+        debug-logged) so any extra fields a firmware build sends are visible.
+
+        :param slot: 0-based ACE slot index to store data for.
+        :param info: get_filament_info response dict for the slot.
+        """
         inv = self._slot_inventory[slot]
+        prev_raw = inv.get("raw")
+        inv["raw"] = info
+        changed = info != prev_raw
+        if changed:
+            self.logger.debug(
+                f"ACE {self.name}: slot {slot} get_filament_info -> {info}")
         inv["material"] = info.get("material", info.get("type", ""))
         inv["color"] = info.get("color", [0, 0, 0])
         inv["sku"] = info.get("sku", "")
@@ -1899,18 +2661,53 @@ class afcACE(afcUnit):
         inv["diameter"] = info.get("diameter", 1.75)
         inv["total_weight"] = info.get("total", 0)
         inv["current_weight"] = info.get("current", 0)
+        # RFID recognition state (ace_proto.go RfidStatus):
+        #   rfid:   0 not-found, 1 unrecognized, 2 recognized, 3 recognizing
+        # 'source' is in the documented protocol but absent on tested firmware.
+        inv["rfid"] = info.get("rfid")
+        inv["source"] = info.get("source")
+        # Keep the full min/max temperature ranges AND a derived single value.
         ext_temp = info.get("extruder_temp", {})
         bed_temp = info.get("hotbed_temp", {})
-        if isinstance(ext_temp, dict) and ext_temp.get("min") and ext_temp.get("max"):
-            inv["extruder_temp"] = (ext_temp["min"] + ext_temp["max"]) // 2
-        elif isinstance(ext_temp, dict) and ext_temp.get("max"):
-            inv["extruder_temp"] = ext_temp["max"]
+        if isinstance(ext_temp, dict):
+            inv["extruder_temp_min"] = ext_temp.get("min")
+            inv["extruder_temp_max"] = ext_temp.get("max")
+            if ext_temp.get("min") and ext_temp.get("max"):
+                inv["extruder_temp"] = (ext_temp["min"] + ext_temp["max"]) // 2
+            elif ext_temp.get("max"):
+                inv["extruder_temp"] = ext_temp["max"]
+            else:
+                inv["extruder_temp"] = None
         else:
             inv["extruder_temp"] = None
-        inv["bed_temp"] = bed_temp.get("max") if isinstance(bed_temp, dict) else None
+            inv["extruder_temp_min"] = inv["extruder_temp_max"] = None
+        if isinstance(bed_temp, dict):
+            inv["bed_temp_min"] = bed_temp.get("min")
+            inv["bed_temp_max"] = bed_temp.get("max")
+            if bed_temp.get("min") and bed_temp.get("max"):
+                inv["bed_temp"] = (bed_temp["min"] + bed_temp["max"]) // 2
+            elif bed_temp.get("max"):
+                inv["bed_temp"] = bed_temp["max"]
+            else:
+                inv["bed_temp"] = None
+        else:
+            inv["bed_temp"] = inv["bed_temp_min"] = inv["bed_temp_max"] = None
+        # Surface a real tag read once per change (not every poll). Live capture
+        # confirms the ACE payload has no id/serial/UID field — identity is the
+        # SKU only (the envelope 'id' is just the request id, not the spool).
+        if changed and (inv.get("rfid") in (2, 3) or inv.get("sku")):
+            self.logger.info(
+                f"ACE {self.name}: slot {slot} RFID read — "
+                f"sku={inv.get('sku')!r} brand={inv.get('brand')!r} "
+                f"type={inv.get('material')!r} rfid={inv.get('rfid')} "
+                f"nozzle={inv.get('extruder_temp_min')}-{inv.get('extruder_temp_max')}C")
 
     def _refresh_slot_inventory(self, slot):
-        """Fetch fresh RFID data for a single slot from ACE hardware."""
+        """Fetch fresh RFID data for a single slot from ACE hardware.
+        (get_filament_info already returns current tag data on this firmware.)
+
+        :param slot: 0-based ACE slot index to refresh.
+        """
         if self._ace is None or not self._ace.connected:
             return
         if slot < 0 or slot >= self.SLOTS_PER_UNIT:
@@ -1924,7 +2721,10 @@ class afcACE(afcUnit):
                 f"ACE {self.name}: slot {slot} RFID refresh failed: {e}")
 
     def _clear_slot_inventory(self, slot):
-        """Clear cached RFID data for a slot."""
+        """Clear cached RFID data for a slot.
+
+        :param slot: 0-based ACE slot index to clear.
+        """
         if 0 <= slot < self.SLOTS_PER_UNIT:
             self._slot_inventory[slot]["material"] = ""
             self._slot_inventory[slot]["color"] = [0, 0, 0]
@@ -1939,8 +2739,10 @@ class afcACE(afcUnit):
                 slot_info = self._slot_inventory[slot]
                 slot_loaded = bool(
                     slot_info and slot_info.get("status", "") == "ready")
-                lane._load_state = slot_loaded
                 lane.prep_state = slot_loaded
+                if not slot_loaded:
+                    lane.loaded_to_hub = False
+                    self._set_hub_state(lane, False)
 
                 if apply_filament_defaults is not None:
                     apply_filament_defaults(
@@ -1955,16 +2757,36 @@ class afcACE(afcUnit):
                     self._sync_rfid_to_spoolman(lane, slot_info)
 
     def _sync_rfid_to_spoolman(self, lane, slot_info):
-        """Sync ACE RFID tag data to Spoolman."""
+        """Sync ACE RFID tag data to Spoolman.
+
+        :param lane: Lane to associate with a Spoolman spool.
+        :param slot_info: Cached slot inventory dict (SKU, color, weight, etc.)
+            matched/created against Spoolman when configured.
+        """
         if sync_rfid_to_spoolman is None:
             return
         if self.afc.spoolman is None or self.afc.moonraker is None:
+            # Spoolman not in use (a valid setup — tag-only, no Spoolman) or
+            # moonraker not connected yet at startup. Either way the tag was
+            # already applied to the lane by apply_filament_defaults, so the
+            # Spoolman sync is just a no-op here. Debug only — not a warning.
+            self.logger.debug(
+                f"ACE {self.name}: RFID->Spoolman skipped for {lane.name} — "
+                f"Spoolman not configured/connected")
             return
         if getattr(lane, "spool_id", None) not in (None, "", 0):
+            self.logger.debug(
+                f"ACE {self.name}: RFID->Spoolman skipped — {lane.name} already "
+                f"has spool_id {lane.spool_id}")
             return
         sku = slot_info.get("sku", "")
         if not sku:
+            self.logger.debug(
+                f"ACE {self.name}: RFID->Spoolman skipped — no SKU on slot")
             return
+        self.logger.debug(
+            f"ACE {self.name}: RFID->Spoolman for {lane.name}, SKU {sku}, "
+            f"auto_create={self._get_auto_spoolman_create(lane)}")
 
         color_rgb = slot_info.get("color", [0, 0, 0])
         color_hex = ""
@@ -1982,7 +2804,12 @@ class afcACE(afcUnit):
             spool_weight=spool_wt if spool_wt > 0 else None)
 
     def _get_auto_spoolman_create(self, lane):
-        """Check if auto Spoolman spool creation is enabled for a lane."""
+        """Check if auto Spoolman spool creation is enabled for a lane.
+
+        :param lane: Lane to check.
+        :return bool: True if auto-creation is enabled (per-lane, else the unit
+            default).
+        """
         if get_auto_spoolman_create is not None:
             return get_auto_spoolman_create(lane, self.auto_spoolman_create)
         return self.auto_spoolman_create
@@ -2025,6 +2852,9 @@ def crc16_ccitt_reflected(data: bytes) -> int:
 
     Compatible with ACEPRO's _calc_crc implementation.
     Uses polynomial 0x8408 (bit-reflected 0x1021).
+
+    :param data: Bytes to checksum.
+    :return int: 16-bit CRC value.
     """
     crc = 0xFFFF
     for byte in data:
@@ -2061,6 +2891,14 @@ class ACEConnection:
     """
 
     def __init__(self, reactor, serial_port, logger=None, baud_rate=DEFAULT_BAUD):
+        """Initialize the serial connection state (no port is opened yet).
+
+        :param reactor: Klipper reactor used for fd registration, timers and
+            command completions.
+        :param serial_port: Path to the ACE serial device.
+        :param logger: Optional logger; defaults to the module serial logger.
+        :param baud_rate: Serial baud rate.
+        """
         self._reactor = reactor
         self._serial_port = serial_port
         self._baud_rate = baud_rate
@@ -2108,6 +2946,7 @@ class ACEConnection:
 
     @property
     def connected(self):
+        """:return bool: True while the serial port is open and registered."""
         return self._connected
 
     def connect(self):
@@ -2212,6 +3051,12 @@ class ACEConnection:
         )
 
         def _reconnect_callback(eventtime):
+            """Reactor timer: attempt reconnect, firing reconnect_callback on
+            success or rescheduling with backoff on failure.
+
+            :param eventtime: Reactor event time.
+            :return: reactor.NEVER when done/disabled, else the next retry time.
+            """
             if not self._reconnect_enabled:
                 return self._reactor.NEVER
             try:
@@ -2253,6 +3098,12 @@ class ACEConnection:
         self.disconnect()
 
         def _quick_reconnect_cb(eventtime):
+            """Reactor timer: fast reconnect after USB autosuspend, falling back
+            to the backoff reconnect on failure.
+
+            :param eventtime: Reactor event time.
+            :return: Always reactor.NEVER.
+            """
             if not self._reconnect_enabled:
                 return self._reactor.NEVER
             try:
@@ -2289,6 +3140,13 @@ class ACEConnection:
 
         Uses Klipper's reactor completion mechanism to block the calling
         greenlet while still allowing other reactor events to be processed.
+
+        :param method: ACE protocol method name.
+        :param params: Optional params dict for the request.
+        :param timeout: Seconds to wait for the matching response.
+        :return: The response's ``result`` payload (or the full dict).
+        :raises ACESerialError: On write failure or an error-code reply.
+        :raises ACETimeoutError: When no response arrives before timeout.
         """
         if not self._connected or self._serial is None:
             raise ACESerialError("ACE not connected")
@@ -2346,7 +3204,11 @@ class ACEConnection:
         return result
 
     def send_command_async(self, method, params=None):
-        """Send a JSON-RPC command without waiting for a response."""
+        """Send a JSON-RPC command without waiting for a response.
+
+        :param method: ACE protocol method name.
+        :param params: Optional params dict for the request.
+        """
         if not self._connected or self._serial is None:
             return
 
@@ -2390,7 +3252,12 @@ class ACEConnection:
             self._heartbeat_timer = None
 
     def _heartbeat_tick(self, eventtime):
-        """Send periodic get_status to verify connection is alive."""
+        """Send periodic get_status to verify connection is alive.
+
+        :param eventtime: Reactor event time.
+        :return: reactor.NEVER if disconnected/reconnecting, else the next tick
+            time.
+        """
         if not self._connected:
             return self._reactor.NEVER
 
@@ -2469,7 +3336,11 @@ class ACEConnection:
     # ---- Frame Protocol ----
 
     def _build_frame(self, payload: bytes) -> bytes:
-        """Build a binary frame wrapping the JSON payload."""
+        """Build a binary frame wrapping the JSON payload.
+
+        :param payload: JSON-encoded request bytes.
+        :return bytes: Header + length + payload + CRC + footer frame.
+        """
         length = len(payload)
         crc = crc16_ccitt_reflected(payload)
         return (
@@ -2481,7 +3352,13 @@ class ACEConnection:
         )
 
     def _handle_read(self, eventtime):
-        """Reactor callback invoked when data is available on the serial fd."""
+        """Reactor callback invoked when data is available on the serial fd.
+
+        Reads available bytes, appends them to the reassembly buffer and parses
+        complete frames; handles USB autosuspend/disconnect by reconnecting.
+
+        :param eventtime: Reactor event time (records last receive time).
+        """
         try:
             data = self._serial.read(4096)
         except Exception as e:
@@ -2576,7 +3453,13 @@ class ACEConnection:
             self._handle_response(response)
 
     def _handle_response(self, response: dict):
-        """Route a parsed response to its pending request completion."""
+        """Route a parsed response to its pending request completion.
+
+        Unsolicited notifications and async/heartbeat replies are forwarded to
+        status_callback; id-matched replies complete their pending request.
+
+        :param response: Parsed JSON response dict from the ACE.
+        """
         response_id = response.get("id")
 
         if response_id is None:
@@ -2622,11 +3505,20 @@ class ACEConnection:
     # ---- High-Level Hardware Commands ----
 
     def get_status(self, timeout=3.0):
-        """Query current device status (temperatures, sensors, slots)."""
+        """Query current device status (temperatures, sensors, slots).
+
+        :param timeout: Seconds to wait for the response.
+        :return: The status result payload.
+        """
         return self.send_command("get_status", timeout=timeout)
 
     def get_filament_info(self, slot_index, timeout=3.0):
-        """Get RFID/NFC filament data for a specific slot (0-based)."""
+        """Get RFID/NFC filament data for a specific slot (0-based).
+
+        :param slot_index: 0-based slot index.
+        :param timeout: Seconds to wait for the response.
+        :return: The filament-info result payload.
+        """
         return self.send_command(
             "get_filament_info",
             params={"index": slot_index},
@@ -2651,7 +3543,10 @@ class ACEConnection:
         )
 
     def stop_feed_filament(self, slot_index):
-        """Stop an active feed operation on the specified slot."""
+        """Stop an active feed operation on the specified slot.
+
+        :param slot_index: 0-based slot index.
+        """
         self.send_command_async(
             "stop_feed_filament", params={"index": slot_index}
         )
@@ -2676,45 +3571,76 @@ class ACEConnection:
         )
 
     def stop_unwind_filament(self, slot_index):
-        """Stop an active unwind/retract operation."""
+        """Stop an active unwind/retract operation.
+
+        :param slot_index: 0-based slot index.
+        """
         self.send_command_async(
             "stop_unwind_filament", params={"index": slot_index}
         )
 
     def start_feed_assist(self, slot_index, timeout=2.0):
-        """Enable continuous motorized feed assist for a slot and wait for ACK."""
+        """Enable continuous motorized feed assist for a slot and wait for ACK.
+
+        :param slot_index: 0-based slot index.
+        :param timeout: Seconds to wait for the ACK.
+        :return: The response result payload.
+        """
         return self.send_command(
             "start_feed_assist", params={"index": slot_index}, timeout=timeout
         )
 
     def stop_feed_assist(self, slot_index):
-        """Disable feed assist for a slot."""
+        """Disable feed assist for a slot.
+
+        :param slot_index: 0-based slot index.
+        """
         self.send_command_async(
             "stop_feed_assist", params={"index": slot_index}
         )
 
     def stop_feed_assist_sync(self, slot_index, timeout=2.0):
-        """Disable feed assist for a slot and wait for ACK."""
+        """Disable feed assist for a slot and wait for ACK.
+
+        :param slot_index: 0-based slot index.
+        :param timeout: Seconds to wait for the ACK.
+        :return: The response result payload.
+        """
         return self.send_command(
             "stop_feed_assist", params={"index": slot_index}, timeout=timeout
         )
 
     def update_feeding_speed(self, slot_index, speed_mm_min):
-        """Update the speed of an active feed operation."""
+        """Update the speed of an active feed operation.
+
+        :param slot_index: 0-based slot index.
+        :param speed_mm_min: New feed speed (firmware unit).
+        """
         self.send_command_async(
             "update_feeding_speed",
             params={"index": slot_index, "speed": speed_mm_min},
         )
 
     def update_unwinding_speed(self, slot_index, speed_mm_min):
-        """Update the speed of an active unwind operation."""
+        """Update the speed of an active unwind operation.
+
+        :param slot_index: 0-based slot index.
+        :param speed_mm_min: New unwind speed (firmware unit).
+        """
         self.send_command_async(
             "update_unwinding_speed",
             params={"index": slot_index, "speed": speed_mm_min},
         )
 
     def start_drying(self, temp_c, fan_speed_rpm, duration_min):
-        """Start a filament drying cycle."""
+        """Start a filament drying cycle (verified on the ACE Pro firmware).
+        NOTE: the firmware ignores fan_speed and runs the fan fixed at 7000.
+
+        :param temp_c: Target dryer temperature in degrees Celsius.
+        :param fan_speed_rpm: Requested fan speed (ignored by firmware).
+        :param duration_min: Drying duration in minutes.
+        :return: The response result payload.
+        """
         return self.send_command(
             "drying",
             params={
@@ -2736,6 +3662,33 @@ class ACEConnection:
         """Disable RFID/NFC tag detection."""
         return self.send_command("disable_rfid")
 
+    # ---- Commands from Anycubic's ACE protocol (ace_proto.go) ----
+    # Verified on the ACE Pro firmware via ACE_CMD: set_filament_info works
+    # (code 0). set_fan_speed / continue_filament / switch_filament /
+    # refresh_filament_info all return 400 InvalidCommand on this firmware and
+    # were removed; probe new methods with ACE_CMD before adding wrappers.
+
+    def set_filament_info(self, slot_index, filament_type, color_rgb):
+        """Write filament type + colour to a slot (SetFilamentInfo). Accepted by
+        the ACE Pro firmware (code 0) but had no observable effect on an EMPTY
+        slot in testing (get_filament_info still read blank) — likely only takes
+        on a slot that has filament present. Not wired into any flow.
+
+        :param slot_index: 0-based slot index.
+        :param filament_type: Material type string to write.
+        :param color_rgb: [r, g, b] (0-255).
+        :return: The response result payload.
+        """
+        return self.send_command(
+            "set_filament_info",
+            params={"index": slot_index, "type": filament_type,
+                    "color": list(color_rgb)})
+
 
 def load_config_prefix(config):
+    """Klipper entry point: construct the ACE unit from a config section.
+
+    :param config: ConfigWrapper for the ``[AFC_ACE ...]`` section.
+    :return afcACE: The configured ACE unit instance.
+    """
     return afcACE(config)

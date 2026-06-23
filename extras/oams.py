@@ -16,6 +16,11 @@ _FLOAT_STRUCT = struct.Struct("f")
 _U32_STRUCT = struct.Struct("I")
 
 class OAMSStatus:
+    """Enumeration of firmware action/status codes reported by the OAMS MCU.
+
+    These values mirror the ``action`` field of ``oams_action_status`` MCU
+    messages and the local ``action_status`` used to track in-flight operations.
+    """
     LOADING = 0
     UNLOADING = 1
     FORWARD_FOLLOWING = 2
@@ -26,6 +31,12 @@ class OAMSStatus:
     ERROR = 7
 
 class OAMSOpCode:
+    """Enumeration of result/operation codes returned by OAMS firmware actions.
+
+    These values appear in the ``code`` field of ``oams_action_status`` messages
+    and are returned from load/unload helpers to describe success or the kind of
+    failure encountered.
+    """
     SUCCESS = 0
     ERROR_UNSPECIFIED = 1
     ERROR_BUSY = 2
@@ -36,19 +47,44 @@ class OAMSOpCode:
 
 
 class RetryState:
+    """Per-spool bookkeeping for load-retry attempts.
+
+    Tracks how many attempts have been made, when the last attempt occurred,
+    and whether the most recent successful load required a retry.
+    """
     def __init__(self):
+        """Initialize the retry counters to their unused/zero state."""
         self.count        = 0
         self.last_attempt = None
         self.was_retry    = False
 
     def reset(self):
+        """Reset all retry bookkeeping back to the initial state."""
         self.count        = 0
         self.last_attempt = None
         self.was_retry    = False
 
 
 class OAMS:
+    """Klipper hardware controller for a single OpenAMS ([oams ...]) unit.
+
+    Wraps the OAMS MCU: it configures the pressure (FPS) buffer, the first-stage
+    (f1s) and hub Hall-effect sensors, and the pressure/current PID loops; sends
+    load/unload/follower/calibration commands; receives sensor and status
+    updates from firmware; and provides retry wrappers and the ``OAMS_*`` G-code
+    commands. One instance is created per ``[oams ...]`` config section.
+    """
     def __init__(self, config):
+        """Construct the controller from its Klipper config section.
+
+        Resolves the printer, MCU, reactor and AFC objects; reads pressure
+        thresholds, Hall-effect sensor calibration, PTFE length, PID gains,
+        targets and retry tuning; registers MCU response callbacks and the
+        ``OAMS_*`` G-code commands; and, when available, registers itself with
+        the shared :class:`AMSHardwareService` so AFC can reach this controller.
+
+        :param config: Klipper ``ConfigWrapper`` for this ``[oams ...]`` section.
+        """
         # Core printer interface
         self.printer = config.get_printer()
         self.section_name = config.get_name().split()[-1]
@@ -165,7 +201,17 @@ class OAMS:
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
     def _register_mcu_response(self, callback, message_name, oid=None):
-        """Register MCU message callbacks across Klipper API versions."""
+        """Register MCU message callbacks across Klipper API versions.
+
+        Tries the modern ``mcu.register_response`` first, then falls back to the
+        serial object and legacy ``register_serial_response`` so the same code
+        works on differing Klipper builds.
+
+        :param callback: callable invoked with the parsed message params.
+        :param message_name: name of the MCU response message to listen for.
+        :param oid: optional object id to scope the registration to.
+        :raises: ``config_error`` if the MCU exposes no supported registration.
+        """
         if hasattr(self.mcu, "register_response"):
             self.mcu.register_response(callback, message_name, oid)
             return
@@ -181,11 +227,23 @@ class OAMS:
         )
 
     def _resolve_lane_name(self, spool_idx):
+        """Resolve the AFC lane name bound to a spool/bay index, if any.
+
+        :param spool_idx: zero-based spool/bay index on this OAMS unit.
+        :return: the lane name string, or ``None`` when no hardware service is
+            attached or no lane maps to the spool.
+        """
         if self.hardware_service is None:
             return None
         return self.hardware_service.resolve_lane_for_spool_with_afc(self.section_name, spool_idx)
 
     def get_status(self, eventtime):
+        """Return the controller status dict for Klipper's status API.
+
+        :param eventtime: reactor event time of the status query (unused).
+        :return dict: current spool, f1s/hub Hall-effect sensor values, FPS
+            value, and load/unload retry-failure statistics.
+        """
         return {
             "current_spool": self.current_spool,
             "f1s_hes_value": list(self.f1s_hes_value),
@@ -199,18 +257,36 @@ class OAMS:
         }
 
     def is_bay_ready(self, bay_index):
+        """Report whether a bay has filament present at its first-stage sensor.
+
+        :param bay_index: zero-based bay index to query.
+        :return bool: ``True`` if the f1s Hall-effect sensor for the bay is
+            triggered; ``False`` if not triggered or the index is out of range.
+        """
         if not (0 <= bay_index < len(self.f1s_hes_value)):
             self.logger.error(f"Invalid bay_index {bay_index}, must be 0-{len(self.f1s_hes_value)-1}")
             return False
         return bool(self.f1s_hes_value[bay_index])
 
     def is_bay_loaded(self, bay_index):
+        """Report whether a bay's filament has reached the hub sensor.
+
+        :param bay_index: zero-based bay index to query.
+        :return bool: ``True`` if the hub Hall-effect sensor for the bay is
+            triggered; ``False`` if not triggered or the index is out of range.
+        """
         if not (0 <= bay_index < len(self.hub_hes_value)):
             self.logger.error(f"Invalid bay_index {bay_index}, must be 0-{len(self.hub_hes_value)-1}")
             return False
         return bool(self.hub_hes_value[bay_index])
 
     def stats(self, eventtime):
+        """Build the periodic stats line for Klipper's status log.
+
+        :param eventtime: reactor event time of the stats query (unused).
+        :return tuple: ``(False, message)`` where ``message`` summarises spool,
+            FPS, sensor values, PID gains, encoder clicks and current draw.
+        """
         return (
             False,
             """
@@ -236,6 +312,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         )
 
     def handle_connect(self):
+        """Look up and cache OAMS MCU command objects on ``klippy:connect``.
+
+        Resolves the load/unload/follower/calibration/PID/LED command handles,
+        the optional cancel command (warning if the firmware lacks it), and the
+        spool-query command, then clears any latched LED error state. Lookup
+        failures are logged rather than raised.
+        """
         command_defs = {
             'load_spool': "oams_cmd_load_spool spool=%c",
             'unload_spool': "oams_cmd_unload_spool",
@@ -275,18 +358,34 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             self.logger.error(f"Failed to initialize OAMS commands: {e}")
 
     def handle_ready(self):
+        """Clear in-flight action state on ``klippy:ready``.
+
+        Resets ``action_status``/code/value so a restart never inherits a stale
+        load/unload/calibration status from a previous session.
+        """
         self.action_status = None
         self.action_status_code = None
         self.action_status_value = None
         self.logger.info(f"OAMS[{self.oams_idx}]: Cleared software error states on ready")
 
     def get_spool_status(self, bay_index):
+        """Return the raw first-stage Hall-effect value for a bay.
+
+        :param bay_index: zero-based bay index to query.
+        :return: the f1s sensor value for the bay, or ``0`` if out of range.
+        """
         if not (0 <= bay_index < len(self.f1s_hes_value)):
             self.logger.error(f"Invalid bay_index {bay_index}, must be 0-{len(self.f1s_hes_value)-1}")
             return 0
         return self.f1s_hes_value[bay_index]
 
     def clear_errors(self):
+        """Clear LED error indicators and reset cached action/spool state.
+
+        Turns off the error LED for all four bays, clears the action status
+        fields, and re-queries the firmware for the currently loaded spool.
+        Individual failures are logged but do not stop the cleanup.
+        """
         for i in range(4):
             try:
                 self.set_led_error(i, 0)
@@ -303,10 +402,21 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             self.logger.error(f"Failed to determine current spool during clear_errors on {getattr(self, 'name', 'unknown')}: {e}")
 
     def set_led_error(self, idx, value):
+        """Set the error LED state for one bay via the MCU.
+
+        :param idx: zero-based bay index whose LED to change.
+        :param value: LED state to send (non-zero lights the error LED).
+        """
         self.logger.debug(f"Setting LED {idx} to {value}")
         self.oams_set_led_error_cmd.send([idx, value])
 
     def determine_current_spool(self):
+        """Query the firmware for the currently loaded spool index.
+
+        :return: the loaded spool index (0-3), or ``None`` when no spool is
+            loaded (firmware returns 255), the response is missing, or the
+            value is unexpected.
+        """
         params = self.oams_spool_query_spool_cmd.send()
         if params is None:
             self.logger.warning(f"OAMS[{self.oams_idx}]: Failed to query current spool - no response from MCU")
@@ -331,6 +441,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         return None
 
     def register_commands(self, name):
+        """Register this unit's ``OAMS_*`` G-code commands as mux commands.
+
+        Each command is keyed on the ``OAMS`` index so multiple units coexist.
+        No-ops if the gcode object is not yet available.
+
+        :param name: short unit name (unused; index is used for muxing).
+        """
         oams_id = str(self.oams_idx)
         if self._cached_gcode is None:
             self._cached_gcode = self.printer.lookup_object("gcode", None)
@@ -363,6 +480,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
     cmd_OAMS_RETRY_STATUS_help = "Display retry configuration and state"
 
     def cmd_OAMS_RETRY_STATUS(self, gcmd):
+        """``OAMS_RETRY_STATUS`` G-code: report retry config and live counters.
+
+        :param gcmd: the G-code command object used to respond to the console.
+        """
         msg_lines = [
             f"OAMS[{self.oams_idx}] Retry Status:",
             f"  Load retry max: {self.load_retry_max}",
@@ -386,6 +507,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
     cmd_OAMS_RESET_RETRY_COUNTS_help = "Reset retry counters"
 
     def cmd_OAMS_RESET_RETRY_COUNTS(self, gcmd):
+        """``OAMS_RESET_RETRY_COUNTS`` G-code: clear all load/unload retry state.
+
+        :param gcmd: the G-code command object used to respond to the console.
+        """
         self._load_retry_state.clear()
         self._unload_retry_count = 0
         self._last_unload_attempt = 0.0
@@ -393,16 +518,42 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         gcmd.respond_info(f"OAMS[{self.oams_idx}]: Reset all retry counters")
 
     def _calculate_retry_delay(self, attempt_number):
+        """Return the delay to wait before a given retry attempt.
+
+        Currently a fixed delay regardless of attempt number.
+
+        :param attempt_number: zero-based index of the upcoming retry (unused).
+        :return float: seconds to pause before the next attempt.
+        """
         return self.retry_delay
 
     def _reset_load_retry_count(self, spool_idx):
+        """Drop any stored load-retry state for a spool.
+
+        :param spool_idx: spool index whose retry state to discard.
+        """
         self._load_retry_state.pop(spool_idx, None)
 
     def _reset_unload_retry_count(self):
+        """Reset the unload retry counter and last-attempt timestamp."""
         self._unload_retry_count  = 0
         self._last_unload_attempt = 0.0
 
     def load_spool_with_retry(self, spool_idx, max_retries=None):
+        """Load a spool, retrying on failure up to the configured limit.
+
+        Between attempts it waits the retry delay, aborts the current action,
+        and (when ``auto_unload_on_failed_load`` is set) unloads back to the AMS
+        before retrying; a failed pre-retry unload aborts the whole load.
+        Updates retry/failure bookkeeping and emits progress logs.
+
+        :param spool_idx: zero-based spool index to load.
+        :param max_retries: override for the load retry limit; ``None`` uses the
+            configured ``load_retry_max``.
+        :return tuple: ``(success, message)`` where ``success`` is ``True`` on a
+            successful (or cancelled) load and ``message`` is a human-readable
+            result, including attempt history on failure.
+        """
         retry = self._load_retry_state.setdefault(spool_idx, RetryState())
         retry_count     = retry.count
         attempt_history = []
@@ -478,17 +629,44 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         )
 
     def get_last_load_attempt_time(self, spool_idx):
+        """Return the monotonic time of the last load attempt for a spool.
+
+        :param spool_idx: spool index to query.
+        :return: monotonic timestamp of the last attempt, or ``None`` if none.
+        """
         retry = self._load_retry_state.get(spool_idx)
         return retry.last_attempt if retry is not None else None
 
     def get_last_successful_load_time(self, spool_idx):
+        """Return the monotonic time of the last successful load for a spool.
+
+        :param spool_idx: spool index to query.
+        :return: monotonic timestamp of the last success, or ``None`` if none.
+        """
         return self._last_successful_load.get(spool_idx)
 
     def last_load_was_retry(self, spool_idx):
+        """Report whether the last successful load of a spool needed a retry.
+
+        :param spool_idx: spool index to query.
+        :return bool: ``True`` if the last success followed at least one retry.
+        """
         retry = self._load_retry_state.get(spool_idx)
         return retry.was_retry if retry is not None else False
 
     def unload_spool_with_retry(self, max_retries=None):
+        """Unload the current spool, retrying on failure up to the limit.
+
+        Between attempts it waits the retry delay, aborts the current action,
+        and retracts the extruder a short distance before retrying. Updates
+        unload retry/failure bookkeeping and emits progress logs.
+
+        :param max_retries: override for the unload retry limit; ``None`` uses
+            the configured ``unload_retry_max``.
+        :return tuple: ``(success, message)`` where ``success`` is ``True`` on a
+            successful unload and ``message`` is a human-readable result,
+            including attempt history on failure.
+        """
         attempt_history = []
         retry_limit     = max_retries if max_retries is not None else self.unload_retry_max
 
@@ -551,6 +729,11 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         )
 
     def load_spool_cancel(self):
+        """Send the cancel command for an in-progress spool load.
+
+        :return str: a status message indicating the cancel was sent, or that
+            the command is unavailable on the current firmware.
+        """
         if self.oams_load_spool_cancel_cmd is not None:
             self.oams_load_spool_cancel_cmd.send()
             return "OAMS load spool operation cancelled"
@@ -558,6 +741,14 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_CURRENT_PID_SET_help = "Set the PID values for the current sensor"
     def cmd_OAMS_CURRENT_PID_SET(self, gcmd):
+        """``OAMS_CURRENT_PID_SET`` G-code: set the current-loop PID gains.
+
+        Requires ``P``, ``I`` and ``D``; ``TARGET`` defaults to the configured
+        current target. Pushes the values (as u32-encoded floats) to firmware
+        and updates the cached gains.
+
+        :param gcmd: the G-code command supplying ``P``/``I``/``D``/``TARGET``.
+        """
         p = gcmd.get_float("P", None)
         i = gcmd.get_float("I", None)
         d = gcmd.get_float("D", None)
@@ -585,6 +776,14 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_PID_SET_help = "Set the PID values for the OAMS"
     def cmd_OAMS_PID_SET(self, gcmd):
+        """``OAMS_PID_SET`` G-code: set the pressure (FPS) loop PID gains.
+
+        Requires ``P``, ``I`` and ``D``; ``TARGET`` defaults to the configured
+        FPS target. Pushes the values (as u32-encoded floats) to firmware and
+        updates the cached gains.
+
+        :param gcmd: the G-code command supplying ``P``/``I``/``D``/``TARGET``.
+        """
         p = gcmd.get_float("P", None)
         i = gcmd.get_float("I", None)
         d = gcmd.get_float("D", None)
@@ -610,6 +809,14 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_PID_AUTOTUNE_help = "Run PID autotune"
     def cmd_OAMS_PID_AUTOTUNE(self, gcmd):
+        """``OAMS_PID_AUTOTUNE`` G-code: drive a flow for PID autotuning.
+
+        Requires ``TARGET_FLOW`` (mm^3/s) and ``TARGET_TEMP`` (degrees C). Heats
+        the hotend and extrudes for ~30 s at the speed implied by the requested
+        volumetric flow through 1.75 mm filament.
+
+        :param gcmd: the G-code command supplying ``TARGET_FLOW``/``TARGET_TEMP``.
+        """
         target_flow = gcmd.get_float("TARGET_FLOW", None)
         target_temp = gcmd.get_float("TARGET_TEMP", None)
 
@@ -631,6 +838,14 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_CALIBRATE_HUB_HES_help = "Calibrate the range of a single hub HES"
     def cmd_OAMS_CALIBRATE_HUB_HES(self, gcmd):
+        """``OAMS_CALIBRATE_HUB_HES`` G-code: calibrate one hub Hall sensor.
+
+        Requires ``SPOOL`` (0-3). Runs the firmware calibration, waits for it to
+        finish, and on success stores the measured threshold into ``hub_hes_on``
+        and rewrites it to the config file.
+
+        :param gcmd: the G-code command supplying the ``SPOOL`` index.
+        """
         self.action_status = OAMSStatus.CALIBRATING
         spool_idx = gcmd.get_int("SPOOL", None)
         if spool_idx is None:
@@ -655,6 +870,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_CALIBRATE_PTFE_LENGTH_help = "Calibrate the length of the PTFE tube"
     def cmd_OAMS_CALIBRATE_PTFE_LENGTH(self, gcmd):
+        """``OAMS_CALIBRATE_PTFE_LENGTH`` G-code: measure the PTFE tube length.
+
+        Requires ``SPOOL``. Runs the firmware calibration, waits for it to
+        finish, and on success rewrites the measured ``ptfe_length`` to config.
+
+        :param gcmd: the G-code command supplying the ``SPOOL`` index.
+        """
         self.action_status = OAMSStatus.CALIBRATING
         spool = gcmd.get_int("SPOOL", None)
         if spool is None:
@@ -674,6 +896,15 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             gcmd.error("Calibration of PTFE length failed")
 
     def load_spool(self, spool_idx):
+        """Send a single load command and block until firmware reports a result.
+
+        Times out after 45 s if the MCU stops responding. On success updates
+        ``current_spool``.
+
+        :param spool_idx: zero-based spool index to load.
+        :return tuple: ``(code, message)`` where ``code`` is an
+            :class:`OAMSOpCode` and ``message`` describes the outcome.
+        """
         self.action_status = OAMSStatus.LOADING
         self.oams_load_spool_cmd.send([spool_idx])
         timeout = self.reactor.monotonic() + 45.0
@@ -700,6 +931,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_LOAD_SPOOL_help = "Load a new spool of filament"
     def cmd_OAMS_LOAD_SPOOL(self, gcmd):
+        """``OAMS_LOAD_SPOOL`` G-code: load a spool with retry.
+
+        Requires ``SPOOL`` (0-3); ``QUIET`` suppresses the success message.
+        Delegates to :meth:`load_spool_with_retry` and reports the result.
+
+        :param gcmd: the G-code command supplying ``SPOOL`` and optional ``QUIET``.
+        """
         self.action_status = OAMSStatus.LOADING
         spool_idx = gcmd.get_int("SPOOL", None)
         if spool_idx is None:
@@ -716,6 +954,14 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             gcmd.error(message)
 
     def unload_spool(self):
+        """Send a single unload command and block until firmware reports back.
+
+        Times out after 40 s if the MCU stops responding. Treats both success
+        and ``NO_SPOOL_IN_BAY`` as unloaded and clears ``current_spool``.
+
+        :return tuple: ``(success, message)`` where ``success`` is ``True`` when
+            the bay ends up empty and ``message`` describes the outcome.
+        """
         self.action_status = OAMSStatus.UNLOADING
         self.oams_unload_spool_cmd.send()
         timeout = self.reactor.monotonic() + 40.0
@@ -748,6 +994,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_UNLOAD_SPOOL_help = "Unload a spool of filament"
     def cmd_OAMS_UNLOAD_SPOOL(self, gcmd):
+        """``OAMS_UNLOAD_SPOOL`` G-code: unload the current spool with retry.
+
+        Optional ``MAX_RETRIES`` overrides the configured limit. Delegates to
+        :meth:`unload_spool_with_retry` and reports the result.
+
+        :param gcmd: the G-code command supplying optional ``MAX_RETRIES``.
+        """
         max_retries = gcmd.get_int("MAX_RETRIES", None)
         success, message = self.unload_spool_with_retry(max_retries=max_retries)
         if success:
@@ -757,14 +1010,35 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_ABORT_ACTION_help = "Abort the current OAMS action"
     def cmd_OAMS_ABORT_ACTION(self, gcmd):
+        """``OAMS_ABORT_ACTION`` G-code: abort the in-flight OAMS action.
+
+        Optional ``CODE`` sets the result code recorded for the aborted action
+        (default ``ERROR_KLIPPER_CALL``); ``WAIT`` controls whether to wait for
+        firmware to settle.
+
+        :param gcmd: the G-code command supplying optional ``CODE``/``WAIT``.
+        """
         code = gcmd.get_int("CODE", OAMSOpCode.ERROR_KLIPPER_CALL)
         wait = gcmd.get_int("WAIT", 1)
         self.abort_current_action(code=code, wait=bool(wait))
 
     def set_oams_follower(self, enable, direction):
+        """Enable/disable the follower motor and set its direction via the MCU.
+
+        :param enable: 1 to enable the follower, 0 to disable.
+        :param direction: 1 for forward, 0 for reverse.
+        """
         self.oams_follower_cmd.send([enable, direction])
 
     def abort_current_action(self, code=OAMSOpCode.ERROR_KLIPPER_CALL, wait=True):
+        """Clear the in-flight action, optionally waiting for firmware to settle.
+
+        Returns immediately if no action is in progress. When ``wait`` is set it
+        polls (with backoff) for up to 5 s before force-clearing the status.
+
+        :param code: result code to record for the aborted action.
+        :param wait: whether to wait for the current action to drain first.
+        """
         if self.action_status is None:
             return
 
@@ -793,6 +1067,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_FOLLOWER_help = "Enable or disable follower and set its direction"
     def cmd_OAMS_FOLLOWER(self, gcmd):
+        """``OAMS_FOLLOWER`` G-code: enable/disable the follower and set direction.
+
+        Requires ``ENABLE`` and ``DIRECTION``; responds describing the resulting
+        follower state.
+
+        :param gcmd: the G-code command supplying ``ENABLE`` and ``DIRECTION``.
+        """
         enable = gcmd.get_int("ENABLE", None)
         if enable is None:
             raise gcmd.error("ENABLE is required")
@@ -809,6 +1090,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             gcmd.respond_info("Follower disabled")
 
     def _oams_cmd_stats(self, params):
+        """MCU ``oams_cmd_stats`` callback: cache sensor and encoder values.
+
+        Decodes the FPS pressure value and stores the four f1s and four hub
+        Hall-effect readings plus the encoder click count.
+
+        :param params: parsed MCU message fields.
+        """
         self.fps_value = self.u32_to_float(params["fps_value"])
         self.f1s_hes_value[0] = params["f1s_hes_value_0"]
         self.f1s_hes_value[1] = params["f1s_hes_value_1"]
@@ -821,12 +1109,29 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         self.encoder_clicks = params["encoder_clicks"]
 
     def _oams_cmd_current_status(self, params):
+        """MCU ``oams_cmd_current_status`` callback: cache the motor current.
+
+        :param params: parsed MCU message fields containing ``current_value``.
+        """
         self.i_value = self.u32_to_float(params["current_value"])
 
     def get_current(self):
+        """Return the most recent motor current reading.
+
+        :return float: the last reported current value (amps).
+        """
         return self.i_value
 
     def _oams_action_status(self, params):
+        """MCU ``oams_action_status`` callback: update in-flight action state.
+
+        Clears ``action_status`` and records the result code for load, unload,
+        error and calibration actions (capturing the calibration value), and
+        logs follower/coasting/stopped and unhandled updates.
+
+        :param params: parsed MCU message fields with ``action``/``code`` and,
+            for calibration, ``value``.
+        """
         self.logger.debug("OAMS status received")
         action = params["action"]
         code   = params["code"]
@@ -856,12 +1161,33 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             )
 
     def float_to_u32(self, f):
+        """Reinterpret a float's raw IEEE-754 bits as an unsigned 32-bit int.
+
+        Used to ship float values through integer MCU command arguments.
+
+        :param f: the float value to encode.
+        :return int: the float's bit pattern as a u32.
+        """
         return _U32_STRUCT.unpack(_FLOAT_STRUCT.pack(f))[0]
 
     def u32_to_float(self, i):
+        """Reinterpret an unsigned 32-bit int's bits as an IEEE-754 float.
+
+        Inverse of :meth:`float_to_u32`, used to decode floats from u32 MCU
+        message fields.
+
+        :param i: the u32 bit pattern to decode.
+        :return float: the decoded float value.
+        """
         return _FLOAT_STRUCT.unpack(_U32_STRUCT.pack(i))[0]
 
     def _build_config(self):
+        """Emit the firmware configuration commands on MCU config build.
+
+        Sends the buffer thresholds, f1s and hub Hall-effect calibration, the
+        pressure and current PID gains/targets, the PTFE length and the logger
+        index so firmware matches this controller's configuration.
+        """
         self.mcu.add_config_cmd(
             "config_oams_buffer upper=%u lower=%u is_reversed=%u"
             % (
@@ -921,4 +1247,9 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
 
 def load_config_prefix(config):
+    """Klipper entry point for ``[oams ...]`` config sections.
+
+    :param config: the ``ConfigWrapper`` for the section being loaded.
+    :return OAMS: the constructed OAMS controller instance.
+    """
     return OAMS(config)

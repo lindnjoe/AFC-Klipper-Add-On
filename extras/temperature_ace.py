@@ -27,6 +27,12 @@ class TemperatureACE:
     AFC_ACE unit's cached hardware status."""
 
     def __init__(self, config):
+        """Initialize the ACE temperature sensor.
+
+        :param config: Klipper config wrapper for this ``[temperature_sensor]``
+            section. Reads ``ace_unit`` — the AFC_ACE unit name whose cached
+            hardware status supplies the temperature (default ``Ace1``).
+        """
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.name = config.get_name().split()[-1]
@@ -91,17 +97,36 @@ class TemperatureACE:
             self.reactor.update_timer(self.sample_timer, self.reactor.NOW)
 
     def setup_minmax(self, min_temp, max_temp):
+        """Set the allowed temperature range (Klipper sensor interface).
+
+        :param min_temp: minimum allowed temperature in C; a reading below it
+            (when temp > 0) triggers a printer shutdown.
+        :param max_temp: maximum allowed temperature in C; a reading above it
+            triggers a printer shutdown.
+        """
         self.min_temp = min_temp
         self.max_temp = max_temp
 
     def setup_callback(self, cb):
+        """Register the heaters callback that receives temperature samples.
+
+        :param cb: callable invoked as ``cb(measured_time, temp)`` each sample.
+        """
         self._callback = cb
 
     def get_report_time_delta(self):
+        """Return the sampling interval (Klipper sensor interface).
+
+        :return float: seconds between temperature reports (ACE_REPORT_TIME).
+        """
         return ACE_REPORT_TIME
 
     def _resolve_unit(self):
-        """Look up the AFC_ACE unit object via AFC's units dict."""
+        """Look up the AFC_ACE unit object via AFC's units dict.
+
+        :return: the AFC_ACE unit object for ``ace_unit_name``, or None if AFC
+            or the unit is not (yet) available.
+        """
         try:
             afc = self.printer.lookup_object("AFC")
             units = getattr(afc, "units", {})
@@ -120,7 +145,15 @@ class TemperatureACE:
             return None
 
     def _sample_ace_temperature(self, eventtime):
-        """Timer callback to read ACE temperature and feed the heaters system."""
+        """Timer callback: read ACE temperature and feed the heaters system.
+
+        Reads ``temp`` from the AFC_ACE unit's cached hardware status, tracks
+        measured min/max, enforces the min/max limits (shutdown on breach), and
+        invokes the registered heaters callback with the sample.
+
+        :param eventtime: reactor event time of this firing.
+        :return float: the next reactor time to fire (eventtime + report time).
+        """
         try:
             if not self._ace_unit:
                 self._ace_unit = self._resolve_unit()
@@ -161,12 +194,28 @@ class TemperatureACE:
         return eventtime + ACE_REPORT_TIME
 
     def get_temp(self, eventtime):
+        """Return the current temperature (Klipper sensor interface).
+
+        :param eventtime: reactor event time (unused).
+        :return tuple: (current temperature in C, measured error 0.0).
+        """
         return self.temp, 0.0
 
     def stats(self, eventtime):
+        """Return a stats line for the sensor (Klipper sensor interface).
+
+        :param eventtime: reactor event time (unused).
+        :return tuple: (False, status string carrying the current temperature).
+        """
         return False, "temperature_ace %s: temp=%.1f" % (self.name, self.temp)
 
     def get_status(self, eventtime):
+        """Return sensor status for Moonraker / status queries.
+
+        :param eventtime: reactor event time (unused).
+        :return dict: ``temperature`` plus ``measured_min_temp`` /
+            ``measured_max_temp`` and the source ``ace_unit`` name.
+        """
         return {
             "temperature": round(self.temp, 2),
             "measured_min_temp": round(self.measured_min, 2)
@@ -178,12 +227,19 @@ class TemperatureACE:
 
 
 def load_config(config):
-    """Register temperature_ace sensor factory with Klipper (config hook)."""
+    """Register the temperature_ace sensor factory with Klipper (config hook).
+
+    :param config: Klipper config wrapper (used only to reach the printer).
+    """
     _register_sensor_factory(config.get_printer())
 
 
 def _register_sensor_factory(printer):
-    """Idempotently register the temperature_ace sensor factory."""
+    """Idempotently register the temperature_ace sensor factory.
+
+    :param printer: the Klipper printer object whose ``heaters`` object the
+        ``temperature_ace`` sensor factory is added to.
+    """
     global _REGISTERED
     if _REGISTERED:
         return

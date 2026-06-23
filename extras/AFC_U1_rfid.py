@@ -36,6 +36,14 @@ class AFC_U1_RFID:
     and applies it to AFC lanes (material, color) and Spoolman."""
 
     def __init__(self, config):
+        """Configure the reader from its ``[AFC_U1_rfid]`` section.
+
+        Parses lane->channel maps, standalone scanner channels, auto-create
+        options and the OpenRFID webhook grace, registers the
+        ``afc/u1_rfid`` webhook endpoint, and defers wiring to ``klippy:ready``.
+
+        :param config: Klipper ConfigWrapper for the ``[AFC_U1_rfid]`` section.
+        """
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.logger = logging.getLogger('AFC_U1_rfid')
@@ -119,6 +127,16 @@ class AFC_U1_RFID:
         # filament_detect still owns tag-removal/clear (the daemon's
         # tag_not_present event only goes there), so that keeps working too.
         self._webhook_channels_seen: set = set()
+        # webhook_grace: seconds to defer a colour-lossy filament_detect read of
+        # a NEW tag so the OpenRFID full-colour webhook (if the daemon pushes)
+        # can land first and be the authoritative read — avoids a "misread" where
+        # filament_detect's primary-only colour wins the first scan of a tag.
+        # 0 = off (no deferral). Only ever delays the first read on a channel:
+        # once a webhook is seen, filament_detect reads are suppressed anyway.
+        # Set ~1.0 if you use the OpenRFID webhook. Harmless (just adds latency)
+        # if the daemon never pushes.
+        self._webhook_grace = config.getfloat('webhook_grace', 0.0, minval=0.0)
+        self._pending_defer: Dict[int, list] = {}  # channel -> uid awaiting grace
         try:
             webhooks = self.printer.lookup_object('webhooks')
             webhooks.register_endpoint('afc/u1_rfid', self._handle_webhook_scan)
@@ -185,6 +203,16 @@ class AFC_U1_RFID:
             return
 
         def patched_rfid_cb(channel, info, is_clear=False):
+            """filament_detect callback wrapper that protects scanner channels.
+
+            Suppresses the native print_task_config write for configured scanner
+            channels (keeping the loaded lane's display + flow K); every other
+            channel passes straight through to the original callback unchanged.
+
+            :param channel: U1 filament_detect channel index.
+            :param info: RFID info dict for the channel.
+            :param is_clear: True when the event signals tag removal/clear.
+            """
             # Suppress the native write for scanner channels — keep the loaded
             # lane's display + flow K; everything else passes through unchanged.
             if channel in scanner_channels:
@@ -206,21 +234,66 @@ class AFC_U1_RFID:
 
         Tries the AFC lane registry first (lane name). For individual-extruder
         tool setups the name is often the *extruder* name, so fall back to the
-        single lane driving that extruder. Returns None if it can't be resolved
-        unambiguously.
+        single lane driving that extruder — matching either the AFC_extruder
+        section name (extruder_obj.name) or the toolhead extruder name
+        (extruder_obj.th_extruder_name, added upstream in v1.1.22). Returns None
+        if it can't be resolved unambiguously, logging what IS available so a
+        config mismatch is obvious.
+
+        :param name: configured name — an AFC lane name or an extruder name.
+        :return: the resolved AFCLane, or None if it can't be resolved
+            unambiguously.
         """
         lane = self.afc.lanes.get(name)
         if lane is not None:
             return lane
-        matches = [l for l in self.afc.lanes.values()
-                   if getattr(getattr(l, 'extruder_obj', None), 'name', None)
-                   == name]
+
+        def _ext_names(l):
+            """Return the set of extruder names associated with a lane.
+
+            :param l: an AFC lane object.
+            :return set: the lane's AFC_extruder section name and toolhead
+                extruder name (th_extruder_name), for matching by either.
+            """
+            e = getattr(l, 'extruder_obj', None)
+            return {getattr(e, 'name', None),
+                    getattr(e, 'th_extruder_name', None)}
+
+        matches = [l for l in self.afc.lanes.values() if name in _ext_names(l)]
+        # Also consult the extruder registry directly, in case a lane's
+        # extruder_obj linkage isn't reflected in the scan above.
+        if not matches:
+            tools = getattr(self.afc, 'tools', {}) or {}
+            ext = tools.get(name)
+            if ext is None:
+                for e in tools.values():
+                    if name in {getattr(e, 'name', None),
+                                getattr(e, 'th_extruder_name', None)}:
+                        ext = e
+                        break
+            if ext is not None:
+                matches = list(getattr(ext, 'lanes', {}).values())
+
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
             self.logger.warning(
                 f"U1 RFID: '{name}' matches {len(matches)} lanes on that "
                 f"extruder — use the specific lane name instead")
+            return None
+
+        # Nothing matched — surface what's registered so the user can correct
+        # the config. (Upstream v1.1.22 made standalone lanes opt-in via
+        # 'standalone: True' instead of inferring from the lane name, so a
+        # standalone toolhead lane that's missing the flag may not be here.)
+        avail_lanes = sorted(self.afc.lanes.keys())
+        avail_ext = sorted(
+            {n for l in self.afc.lanes.values() for n in _ext_names(l) if n})
+        self.logger.warning(
+            f"U1 RFID: '{name}' resolved to no lanes. Available lanes="
+            f"{avail_lanes}; extruders={avail_ext}. If '{name}' is a standalone "
+            f"toolhead, ensure its [AFC_stepper] has 'standalone: True' and the "
+            f"[AFC_extruder {name}] section exists.")
         return None
 
     def register_lane(self, lane: AFCLane, channel: int):
@@ -296,6 +369,8 @@ class AFC_U1_RFID:
         trigger the read. Fall back to appending to the raw _notify_data_update_cb
         list (where print_task_config's own RFID callback lives) for other
         firmware revs.
+
+        :param fd: the filament_detect Klipper object to register the callback on.
         """
         if self._fd_cb_registered:
             return
@@ -464,6 +539,8 @@ class AFC_U1_RFID:
         no None check. A tag can be read before moonraker finishes connecting
         (it connects async after klippy:ready), so skip the push until it's up —
         the data is re-sent on the next read / save_vars.
+
+        :param lane: the AFC lane whose data to push to moonraker.
         """
         if getattr(self.afc, 'moonraker', None) is None:
             return
@@ -489,6 +566,9 @@ class AFC_U1_RFID:
              "hotend_min_temp": int, "hotend_max_temp": int,
              "bed_temp": int, "weight_grams": int, "card_uid": [int, ...],
              "manufacturing_date": str}   # -> Spoolman lot_nr
+
+        :param web_request: Klipper webhook request carrying the JSON body
+            described above (read via its get_int/get accessors).
         """
         try:
             channel = web_request.get_int('channel')
@@ -517,12 +597,13 @@ class AFC_U1_RFID:
             except (ValueError, TypeError):
                 continue
         # First webhook on this channel: the daemon IS pushing full data, so
-        # make the webhook authoritative for it from now on. Drop any uid a
-        # pre-webhook filament_detect read may have latched, so this richer read
-        # isn't suppressed by the dedup.
+        # make the webhook authoritative for it from now on (future colour-lossy
+        # filament_detect reads are suppressed by the source check in
+        # _check_channel). Do NOT clear _last_uid here: if a filament_detect read
+        # already processed this exact tag, the UID dedup must still suppress this
+        # duplicate webhook so the same scan isn't synced/created twice.
         if channel not in self._webhook_channels_seen:
             self._webhook_channels_seen.add(channel)
-            self._last_uid[channel] = None
         lane_name = self._channel_to_lane.get(channel)
         try:
             self._check_channel(lane_name, channel, info=info, source='webhook')
@@ -586,6 +667,22 @@ class AFC_U1_RFID:
         if not is_scanner and getattr(lane, "status", "") in self._LOCKED_STATES:
             return
 
+        # Webhook-preference grace: defer a colour-lossy filament_detect ('poll')
+        # read of a NEW tag so the full-colour webhook can land first. Don't set
+        # _last_uid yet (so an arriving webhook isn't deduped); track the pending
+        # defer so repeat polls don't re-arm it. _grace_expired falls back to the
+        # filament_detect read only if no webhook arrived. ('poll-final' bypasses
+        # this so the deferred read actually processes.)
+        if (self._webhook_grace > 0 and source == 'poll'
+                and channel not in self._webhook_channels_seen):
+            if self._pending_defer.get(channel) != card_uid:
+                self._pending_defer[channel] = card_uid
+                self.reactor.register_callback(
+                    lambda et, ln=lane_name, ch=channel, uid=card_uid:
+                        self._grace_expired(ln, ch, uid),
+                    self.reactor.monotonic() + self._webhook_grace)
+            return
+
         self._last_uid[channel] = card_uid
 
         # Dump the raw tag dict so field-mapping issues (colour, temps, vendor)
@@ -635,6 +732,26 @@ class AFC_U1_RFID:
         self.afc.save_vars()
         if getattr(lane, 'tool_loaded', False):
             self.printer.send_event("afc:tool_loaded", lane)
+
+    def _grace_expired(self, lane_name, channel, card_uid):
+        """webhook_grace timer: process the deferred filament_detect read only if
+        no webhook arrived for the channel during the grace window.
+
+        :param lane_name: AFC lane name for the channel (None for scanner-only).
+        :param channel: U1 filament_detect channel index.
+        :param card_uid: the tag UID the deferral was armed for; the read is
+            skipped if a newer tag has since superseded it.
+        """
+        if self._pending_defer.get(channel) != card_uid:
+            return  # superseded by a newer tag, or already cleared
+        self._pending_defer.pop(channel, None)
+        if channel in self._webhook_channels_seen:
+            return  # a webhook landed during the grace and handled the tag
+        try:
+            self._check_channel(lane_name, channel, source='poll-final')
+        except Exception as e:
+            self.logger.warning(
+                f"U1 RFID: deferred read error ch{channel}: {e}")
 
     def _clear_lane(self, lane, lane_name: str):
         """Clear RFID data from a lane when tag is removed.
@@ -701,6 +818,9 @@ class AFC_U1_RFID:
         key that means "colour count" (contains COLOR/COLOUR and COUNT/NUM/NUMS)
         rather than hard-coding one name. The OpenRFID Bambu processor decodes
         this as "Color Count", so the forwarded info dict should expose it.
+
+        :param info: raw RFID info dict from filament_detect / the webhook.
+        :return: the declared colour count (>= 1), or None if no such field.
         """
         for k, v in info.items():
             ku = str(k).upper()
@@ -794,7 +914,11 @@ class AFC_U1_RFID:
     def _fmt_mfg_date(raw):
         """Normalize a tag manufacturing date to a clean string (lot_nr), or
         None if unset. Accepts YYYYMMDD (filament_detect) or ISO YYYY-MM-DD
-        (OpenRFID webhook); treats epoch/1970 as 'unset'."""
+        (OpenRFID webhook); treats epoch/1970 as 'unset'.
+
+        :param raw: the tag's raw manufacturing-date value (str/int/None).
+        :return: a normalised 'YYYY-MM-DD' string (Spoolman lot_nr), or None.
+        """
         if not raw:
             return None
         s = str(raw).strip()
@@ -807,7 +931,11 @@ class AFC_U1_RFID:
     @staticmethod
     def _fmt_uid(raw):
         """Format a card UID (list of byte ints, e.g. [123,240,175,255]) as an
-        uppercase hex string ('7BF0AFFF'); pass through a non-empty string."""
+        uppercase hex string ('7BF0AFFF'); pass through a non-empty string.
+
+        :param raw: a card UID as a list/tuple of byte ints, or a string.
+        :return: the formatted uppercase-hex UID string, or None if empty.
+        """
         if not raw:
             return None
         if isinstance(raw, (list, tuple)):
@@ -933,4 +1061,9 @@ class AFC_U1_RFID:
 
 
 def load_config(config):
+    """Klipper config hook: instantiate the U1 RFID reader.
+
+    :param config: Klipper config wrapper for the [AFC_U1_rfid] section.
+    :return: the AFC_U1_RFID instance.
+    """
     return AFC_U1_RFID(config)
