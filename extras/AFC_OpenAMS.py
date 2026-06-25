@@ -151,8 +151,8 @@ class LaneInfo:
         self.fps_name = fps_name
         self.hub_name = hub_name
         self.led_index = led_index
-        self.custom_load_cmd = custom_load_cmd
-        self.custom_unload_cmd = custom_unload_cmd
+        # self.custom_load_cmd = custom_load_cmd
+        # self.custom_unload_cmd = custom_unload_cmd
 
 
 class LaneRegistry:
@@ -803,8 +803,8 @@ class afcAMS(afcUnit):
             if slot < 0:
                 slot = 0
             self._spool_map[lane_name] = slot
-            lane.custom_load_cmd = f"{self._custom_load_cmd_name} UNIT={self.name} LANE={lane_name}"
-            lane.custom_unload_cmd = f"{self._custom_unload_cmd_name} UNIT={self.name} LANE={lane_name}"
+            # lane.custom_load_cmd = f"{self._custom_load_cmd_name} UNIT={self.name} LANE={lane_name}"
+            # lane.custom_unload_cmd = f"{self._custom_unload_cmd_name} UNIT={self.name} LANE={lane_name}"
             eng_len = getattr(lane, 'engagement_length', None)
             if eng_len is not None:
                 eng_speed = getattr(lane, 'engagement_speed', None) or self._engagement_speed
@@ -1391,6 +1391,11 @@ class afcAMS(afcUnit):
         return cur_lane.get_toolhead_pre_sensor_state()
 
     # ── Custom load/unload gcode handlers ───────────────────────────
+    def unit_load_lane(self, cur_lane, cur_extruder) -> bool:
+        # TODO: do the same thing for ACE
+        # TODO: remove setting custom unload per lane, line 154/155
+        # TODO: add error handling
+        return self._oams_load_sequence(cur_lane, cur_extruder)
 
     def _cmd_oams_custom_load(self, gcmd):
         """Handle _OAMS_CUSTOM_LOAD — filament transport to toolhead area.
@@ -1405,6 +1410,19 @@ class afcAMS(afcUnit):
         result = self._oams_load_sequence(cur_lane, cur_extruder)
         if not result:
             raise gcmd.error(f"OAMS load failed for {lane_name}")
+
+    def unit_unload_lane(self, cur_lane, cur_extruder) -> bool:
+        # TODO: do the same thing for ACE
+        # TODO: remove setting custom unload per lane, line 154/155
+        # TODO: add error handling
+        self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
+                        wait_tool=False)
+        cur_lane.disable_buffer()
+        cur_lane.sync_to_extruder()
+        cur_lane.select_lane()
+        self.afc.do_tool_cut_tip_form(cur_lane, cur_extruder)
+
+        return self._oams_unload_sequence(cur_lane, cur_extruder)
 
     def _cmd_oams_custom_unload(self, gcmd):
         """Handle _OAMS_CUSTOM_UNLOAD — filament transport from toolhead.

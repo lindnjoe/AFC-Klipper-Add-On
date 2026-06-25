@@ -122,51 +122,52 @@ def _patch_afc_unload_shared_phase():
     commands to just the hardware transport and rely on the shared phase (as our
     two-phase load/unload did) — otherwise the transport / post-load purge hits
     a cold extruder and park/form_tip/exit-bin never fire."""
-    try:
-        from extras import AFC as _afc_mod
-    except Exception:
-        return
-    AFCcls = getattr(_afc_mod, 'afc', None)
-    if AFCcls is None or getattr(AFCcls, '_afc_custom_unload_phase_patched', False):
-        return
-    _orig_unload = AFCcls.unload_sequence
-    _orig_load = AFCcls.load_sequence
+    return
+    # try:
+    #     from extras import AFC as _afc_mod
+    # except Exception:
+    #     return
+    # AFCcls = getattr(_afc_mod, 'afc', None)
+    # if AFCcls is None or getattr(AFCcls, '_afc_custom_unload_phase_patched', False):
+    #     return
+    # _orig_unload = AFCcls.unload_sequence
+    # _orig_load = AFCcls.load_sequence
 
-    def _afc_shared_toolhead_unload(self, cur_lane, cur_extruder):
+    # def _afc_shared_toolhead_unload(self, cur_lane, cur_extruder):
         # lane_unloading: LED + (ACE/OpenAMS) follower/assist stop.
         # cur_lane.unit_obj.lane_unloading(cur_lane)
         # if self._check_extruder_temp(cur_lane):
         #     self.afcDeltaTime.log_with_time("Done heating toolhead")
-        self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
-                        wait_tool=False)
-        cur_lane.disable_buffer()
-        cur_lane.sync_to_extruder()
-        cur_lane.select_lane()
-        if self.tool_cut:
-            cur_lane.extruder_obj.estats.increase_cut_total()
-            self.gcode.run_script_from_command(
-                "{} EXTRUDER={}".format(self.tool_cut_cmd, cur_extruder.name))
-            if self.park:
-                self.gcode.run_script_from_command(
-                    "{} EXTRUDER={}".format(self.park_cmd, cur_extruder.name))
-        if self.form_tip:
-            if self.park:
-                self.gcode.run_script_from_command(
-                    "{} EXTRUDER={}".format(self.park_cmd, cur_extruder.name))
-            if self.form_tip_cmd == "AFC":
-                self.printer.lookup_object('AFC_form_tip').tip_form()
-            else:
-                self.gcode.run_script_from_command(self.form_tip_cmd)
+        # self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
+        #                 wait_tool=False)
+        # cur_lane.disable_buffer()
+        # cur_lane.sync_to_extruder()
+        # cur_lane.select_lane()
+        # if self.tool_cut:
+        #     cur_lane.extruder_obj.estats.increase_cut_total()
+        #     self.gcode.run_script_from_command(
+        #         "{} EXTRUDER={}".format(self.tool_cut_cmd, cur_extruder.name))
+        #     if self.park:
+        #         self.gcode.run_script_from_command(
+        #             "{} EXTRUDER={}".format(self.park_cmd, cur_extruder.name))
+        # if self.form_tip:
+        #     if self.park:
+        #         self.gcode.run_script_from_command(
+        #             "{} EXTRUDER={}".format(self.park_cmd, cur_extruder.name))
+        #     if self.form_tip_cmd == "AFC":
+        #         self.printer.lookup_object('AFC_form_tip').tip_form()
+        #     else:
+        #         self.gcode.run_script_from_command(self.form_tip_cmd)
 
-    def _wrapped_unload(self, cur_lane, cur_hub, cur_extruder):
-        is_custom = bool(cur_lane.custom_unload_cmd)
-        if is_custom:
-            try:
-                self._afc_shared_toolhead_unload(cur_lane, cur_extruder)
-            except Exception as e:
-                self.logger.error(
-                    "AFC shared toolhead unload phase error: %s" % e)
-        result = _orig_unload(self, cur_lane, cur_hub, cur_extruder)
+    # def _wrapped_unload(self, cur_lane, cur_hub, cur_extruder):
+    #     is_custom = bool(cur_lane.custom_unload_cmd)
+    #     if is_custom:
+    #         try:
+    #             self._afc_shared_toolhead_unload(cur_lane, cur_extruder)
+    #         except Exception as e:
+    #             self.logger.error(
+    #                 "AFC shared toolhead unload phase error: %s" % e)
+    #     result = _orig_unload(self, cur_lane, cur_hub, cur_extruder)
         # Upstream runs post_unload_macro only in the stepper branch, so a custom
         # unload skips it (e.g. SNAPMAKER_EXIT_DISCARD_BIN). Run it here, after
         # the transport. (The load side already runs post_load_macro for both.)
@@ -175,7 +176,7 @@ def _patch_afc_unload_shared_phase():
         #         self.gcode.run_script_from_command(self.post_unload_macro)
         #     except Exception as e:
         #         self.logger.error("AFC post_unload_macro error: %s" % e)
-        return result
+        # return result
 
     # def _wrapped_load(self, cur_lane, cur_hub, cur_extruder):
     #     # Upstream's custom_load_cmd branch skips _check_extruder_temp (only the
@@ -189,10 +190,10 @@ def _patch_afc_unload_shared_phase():
     #             self.logger.error("AFC custom-load heat error: %s" % e)
     #     return _orig_load(self, cur_lane, cur_hub, cur_extruder)
 
-    AFCcls._afc_shared_toolhead_unload = _afc_shared_toolhead_unload
-    AFCcls.unload_sequence = _wrapped_unload
-    # AFCcls.load_sequence = _wrapped_load
-    AFCcls._afc_custom_unload_phase_patched = True
+    # AFCcls._afc_shared_toolhead_unload = _afc_shared_toolhead_unload
+    # AFCcls.unload_sequence = _wrapped_unload
+    # # AFCcls.load_sequence = _wrapped_load
+    # AFCcls._afc_custom_unload_phase_patched = True
 
 
 def _patch_afc_bowden_serial_unit():
@@ -439,7 +440,7 @@ def apply_compat_patches():
     # _patch_afc_lane_virtual_hub()
     # _patch_afc_buffer_steppermless()
     # _patch_afc_hub_virtual_state()
-    _patch_afc_unload_shared_phase()
+    # _patch_afc_unload_shared_phase()
     # _patch_afc_bowden_serial_unit()
     _patch_afc_lane_load_runout()
     _patch_afc_unit_filament_hooks()
