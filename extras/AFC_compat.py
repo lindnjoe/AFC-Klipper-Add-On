@@ -269,91 +269,92 @@ def _patch_afc_lane_load_runout():
     Falls back to upstream's infinite-spool / pause behaviour otherwise. HTLF
     lanes keep behaving exactly as before (button + fila_load present, hooks
     guarded by hasattr)."""
-    try:
-        from extras import AFC_lane as _lane_mod
-    except Exception:
-        return
-    LaneCls = getattr(_lane_mod, 'AFCLane', None)
-    if LaneCls is None or getattr(LaneCls, '_afc_load_runout_patched', False):
-        return
+    return
+    # try:
+    #     from extras import AFC_lane as _lane_mod
+    # except Exception:
+    #     return
+    # LaneCls = getattr(_lane_mod, 'AFCLane', None)
+    # if LaneCls is None or getattr(LaneCls, '_afc_load_runout_patched', False):
+    #     return
 
-    # Units whose prep and load are the same (serial-polled) sensor.
-    _ONLY_LOAD_TYPES = ("HTLF", "Claymore", "OpenAMS", "ACE")
+    # # Units whose prep and load are the same (serial-polled) sensor.
+    # _ONLY_LOAD_TYPES = ("HTLF", "Claymore", "OpenAMS", "ACE")
 
-    def handle_load_runout(self, eventtime, load_state):
-        # Register state with the physical filament switch if this lane has one;
-        # serial-polled AMS/ACE lanes have no load: pin, so no debounce button.
-        button = getattr(self, 'load_debounce_button', None)
-        if button is not None:
-            try:
-                button._old_note_filament_present(is_filament_present=load_state)
-            except Exception:
-                button._old_note_filament_present(eventtime, load_state)
+    # def handle_load_runout(self, eventtime, load_state):
+    #     # Register state with the physical filament switch if this lane has one;
+    #     # serial-polled AMS/ACE lanes have no load: pin, so no debounce button.
+    #     button = getattr(self, 'load_debounce_button', None)
+    #     if button is not None:
+    #         try:
+    #             button._old_note_filament_present(is_filament_present=load_state)
+    #         except Exception:
+    #             button._old_note_filament_present(eventtime, load_state)
 
-        unit = self.unit_obj
-        is_only_load = (unit.type in _ONLY_LOAD_TYPES
-                        or hasattr(unit, 'on_filament_remove'))
-        if (self.printer.state_message == 'Printer is ready'
-                and is_only_load
-                and self._afc_prep_done is True):
-            if load_state:
-                # Stash any externally-staged spool (scanner -> next_spool_id)
-                # before set_loaded() consumes it via _set_values, so a unit's
-                # on_filament_insert (e.g. ACE, which clear_values()) can tell a
-                # fresh scan apart from a stale/remembered id and keep it.
-                try:
-                    self._afc_staged_spool_id = getattr(
-                        self.afc.spool, 'next_spool_id', None)
-                except Exception:
-                    self._afc_staged_spool_id = None
-                self.set_loaded()
-                # on_filament_insert only when this wasn't a suppressed
-                # (operation-driven) state change.
-                if not getattr(self, '_load_suppressed', False):
-                    if hasattr(unit, 'on_filament_insert'):
-                        unit.on_filament_insert(self)
-                self._load_suppressed = False
+    #     unit = self.unit_obj
+    #     is_only_load = (unit.type in _ONLY_LOAD_TYPES
+    #                     or hasattr(unit, 'on_filament_remove'))
+    #     if (self.printer.state_message == 'Printer is ready'
+    #             and is_only_load
+    #             and self._afc_prep_done is True):
+    #         if load_state:
+    #             # Stash any externally-staged spool (scanner -> next_spool_id)
+    #             # before set_loaded() consumes it via _set_values, so a unit's
+    #             # on_filament_insert (e.g. ACE, which clear_values()) can tell a
+    #             # fresh scan apart from a stale/remembered id and keep it.
+    #             try:
+    #                 self._afc_staged_spool_id = getattr(
+    #                     self.afc.spool, 'next_spool_id', None)
+    #             except Exception:
+    #                 self._afc_staged_spool_id = None
+    #             self.set_loaded()
+    #             # on_filament_insert only when this wasn't a suppressed
+    #             # (operation-driven) state change.
+    #             if not getattr(self, '_load_suppressed', False):
+    #                 if hasattr(unit, 'on_filament_insert'):
+    #                     unit.on_filament_insert(self)
+    #             self._load_suppressed = False
 
-                if self.td1_device_id and not self.tool_loaded:
-                    self._prep_capture_td1()
+    #             if self.td1_device_id and not self.tool_loaded:
+    #                 self._prep_capture_td1()
 
-                if self.hub == 'direct_load':  # TODO: is_direct_hub
-                    if self.afc.function.is_printing(check_movement=True):
-                        self.afc.error.AFC_error(
-                            "Cannot load spool to toolhead while printer is "
-                            "actively moving or homing", False)
-                    else:
-                        self.afc.TOOL_LOAD(self)
+    #             if self.hub == 'direct_load':  # TODO: is_direct_hub
+    #                 if self.afc.function.is_printing(check_movement=True):
+    #                     self.afc.error.AFC_error(
+    #                         "Cannot load spool to toolhead while printer is "
+    #                         "actively moving or homing", False)
+    #                 else:
+    #                     self.afc.TOOL_LOAD(self)
 
-                self._post_prep_user_macro()
-            else:
-                if hasattr(unit, 'on_filament_remove'):
-                    unit.on_filament_remove(self)
-                # Don't run if user disabled the sensor in the GUI.
-                fila_load = getattr(self, 'fila_load', None)
-                if (fila_load is not None
-                        and not fila_load.runout_helper.sensor_enabled
-                        and self.afc.function.is_printing()):
-                    self.logger.warning(
-                        "Load runout has been detected, but pause and runout "
-                        "detection has been disabled")
-                elif unit.check_runout(self):
-                    # Let the unit handle runout if it provides custom logic
-                    # (e.g. OAMS cannot unload once F1S is empty).
-                    handler = getattr(unit, 'handle_runout', None)
-                    if handler is not None and handler(self):
-                        pass
-                    elif self.runout_lane is not None:
-                        self._perform_infinite_runout()
-                    else:
-                        self._perform_pause_runout()
-                elif self.status != "calibrating":
-                    self.set_unloaded()
+    #             self._post_prep_user_macro()
+    #         else:
+    #             if hasattr(unit, 'on_filament_remove'):
+    #                 unit.on_filament_remove(self)
+    #             # Don't run if user disabled the sensor in the GUI.
+    #             fila_load = getattr(self, 'fila_load', None)
+    #             if (fila_load is not None
+    #                     and not fila_load.runout_helper.sensor_enabled
+    #                     and self.afc.function.is_printing()):
+    #                 self.logger.warning(
+    #                     "Load runout has been detected, but pause and runout "
+    #                     "detection has been disabled")
+    #             elif unit.check_runout(self):
+    #                 # Let the unit handle runout if it provides custom logic
+    #                 # (e.g. OAMS cannot unload once F1S is empty).
+    #                 handler = getattr(unit, 'handle_runout', None)
+    #                 if handler is not None and handler(self):
+    #                     pass
+    #                 elif self.runout_lane is not None:
+    #                     self._perform_infinite_runout()
+    #                 else:
+    #                     self._perform_pause_runout()
+    #             elif self.status != "calibrating":
+    #                 self.set_unloaded()
 
-        self.afc.save_vars()
+    #     self.afc.save_vars()
 
-    LaneCls.handle_load_runout = handle_load_runout
-    LaneCls._afc_load_runout_patched = True
+    # LaneCls.handle_load_runout = handle_load_runout
+    # LaneCls._afc_load_runout_patched = True
 
 
 def _patch_afc_unit_filament_hooks():
@@ -365,29 +366,30 @@ def _patch_afc_unit_filament_hooks():
     afcUnit has no such method, so the super() call AttributeErrors when a spool
     is inserted into an empty lane. Add the base hooks (insert -> send event,
     remove -> no-op) when upstream lacks them."""
-    try:
-        from extras import AFC_unit as _unit_mod
-    except Exception:
-        return
-    UnitCls = getattr(_unit_mod, 'afcUnit', None)
-    if UnitCls is None or getattr(UnitCls, '_afc_filament_hooks_patched', False):
-        return
+    return
+    # try:
+    #     from extras import AFC_unit as _unit_mod
+    # except Exception:
+    #     return
+    # UnitCls = getattr(_unit_mod, 'afcUnit', None)
+    # if UnitCls is None or getattr(UnitCls, '_afc_filament_hooks_patched', False):
+    #     return
 
-    # Bring over later
-    if not hasattr(UnitCls, 'on_filament_insert'):
-        def on_filament_insert(self, lane):
-            # Fired after set_loaded() when filament is newly detected; the U1
-            # bridge listens for this. Subclasses override for RFID sync etc.
-            self.printer.send_event("afc:lane_inserted", lane)
-        UnitCls.on_filament_insert = on_filament_insert
+    # # Bring over later
+    # if not hasattr(UnitCls, 'on_filament_insert'):
+    #     def on_filament_insert(self, lane):
+    #         # Fired after set_loaded() when filament is newly detected; the U1
+    #         # bridge listens for this. Subclasses override for RFID sync etc.
+    #         self.printer.send_event("afc:lane_inserted", lane)
+    #     UnitCls.on_filament_insert = on_filament_insert
 
-    if not hasattr(UnitCls, 'on_filament_remove'):
-        def on_filament_remove(self, lane):
-            # Base no-op; subclasses override for inventory cleanup.
-            pass
-        UnitCls.on_filament_remove = on_filament_remove
+    # if not hasattr(UnitCls, 'on_filament_remove'):
+    #     def on_filament_remove(self, lane):
+    #         # Base no-op; subclasses override for inventory cleanup.
+    #         pass
+    #     UnitCls.on_filament_remove = on_filament_remove
 
-    UnitCls._afc_filament_hooks_patched = True
+    # UnitCls._afc_filament_hooks_patched = True
 
 
 def _patch_afc_hub_virtual_load_check():
@@ -442,6 +444,6 @@ def apply_compat_patches():
     # _patch_afc_hub_virtual_state()
     # _patch_afc_unload_shared_phase()
     # _patch_afc_bowden_serial_unit()
-    _patch_afc_lane_load_runout()
-    _patch_afc_unit_filament_hooks()
+    # _patch_afc_lane_load_runout()
+    # _patch_afc_unit_filament_hooks()
     # _patch_afc_hub_virtual_load_check()

@@ -36,7 +36,7 @@ try: from extras.AFC_stats import AFCStats_var
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
 # Unit types that only have load switch
-ONLY_LOAD_TYPES = ["HTLF", "Claymore"]
+ONLY_LOAD_TYPES = ["HTLF", "Claymore", "OpenAMS"]
 EXCLUDE_TYPES = ONLY_LOAD_TYPES + [ "ViViD"]
 # Class for holding different states so its clear what all valid states are
 
@@ -1093,17 +1093,36 @@ class AFCLane:
 
         :param eventtime: Event time from the button press
         """
-        # Call filament sensor callback so that state is registered
-        try:
-            self.load_debounce_button._old_note_filament_present(is_filament_present=load_state)
-        except:
-            self.load_debounce_button._old_note_filament_present(eventtime, load_state)
+        button = getattr(self, "load_debounce_button", None)
+        if button:
+            # Call filament sensor callback so that state is registered
+            try:
+                self.load_debounce_button._old_note_filament_present(is_filament_present=load_state)
+            except:
+                self.load_debounce_button._old_note_filament_present(eventtime, load_state)
 
         if (self.printer.state_message == 'Printer is ready'
             and self.unit_obj.type in ONLY_LOAD_TYPES
             and True == self._afc_prep_done):
             if load_state:
+                # Stash any externally-staged spool (scanner -> next_spool_id)
+                # before set_loaded() consumes it via _set_values, so a unit's
+                # on_filament_insert (e.g. ACE, which clear_values()) can tell a
+                # fresh scan apart from a stale/remembered id and keep it.
+                try:
+                    self._afc_staged_spool_id = getattr(
+                        self.afc.spool, 'next_spool_id', None)
+                except Exception:
+                    self._afc_staged_spool_id = None
+                # TODO: maybe set_loaded can happen after the on_filament_insert call so next spool id 
+                # does not have to be stored into _afc_staged_spool_id. need to understand ACE logic better
                 self.set_loaded()
+                # on_filament_insert only when this wasn't a suppressed
+                # (operation-driven) state change.
+                if not getattr(self, '_load_suppressed', False):
+                    if hasattr(self.unit_obj, 'on_filament_insert'):
+                        self.unit_obj.on_filament_insert(self)
+                self._load_suppressed = False
 
                 # Check if user wants to get TD-1 data when loading
                 if (self.td1_device_id
@@ -1119,12 +1138,21 @@ class AFCLane:
 
                 self._post_prep_user_macro()
             else:
+                self.unit_obj.on_filament_remove()
                 # Don't run if user disabled sensor in gui
-                if not self.fila_load.runout_helper.sensor_enabled and self.afc.function.is_printing():
-                    self.logger.warning("Load runout has been detected, but pause and runout detection has been disabled")
+                fila_load = getattr(self, 'fila_load', None)
+                if (fila_load and
+                    not fila_load.runout_helper.sensor_enabled
+                    and self.afc.function.is_printing()):
+                    self.logger.warning("Load runout has been detected, but pause and runout "
+                                        "detection has been disabled")
                 elif self.unit_obj.check_runout(self):
+                    # Let the unit handle runout if it provides custom logic
+                    handle_runout = getattr(self.unit_obj, "handle_runout", None)
+                    if handle_runout:
+                        handle_runout(self)
                     # Checking to make sure runout_lane is set
-                    if self.runout_lane is not None:
+                    elif self.runout_lane is not None:
                         self._perform_infinite_runout()
                     else:
                         self._perform_pause_runout()

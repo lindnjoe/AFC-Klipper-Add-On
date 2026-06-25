@@ -1545,6 +1545,8 @@ class afcACE(afcUnit):
             self._prev_states_stale = True
 
     # ── Custom load/unload gcode handlers ───────────────────────────
+    def unit_load_lane(self, cur_lane, cur_extruder) -> bool:
+        return self._ace_load_sequence(cur_lane, cur_extruder)
 
     def _cmd_ace_custom_load(self, gcmd):
         """Handle _ACE_CUSTOM_LOAD — filament transport to toolhead area.
@@ -1560,6 +1562,19 @@ class afcACE(afcUnit):
         result = self._ace_load_sequence(cur_lane, cur_extruder)
         if not result:
             raise gcmd.error(f"ACE load failed for {lane_name}")
+
+    def unit_unload_lane(self, cur_lane, cur_extruder) -> bool:
+        # TODO: do the same thing for ACE
+        # TODO: remove setting custom unload per lane, line 154/155
+        # TODO: add error handling
+        self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
+                        wait_tool=False)
+        cur_lane.disable_buffer()
+        cur_lane.sync_to_extruder()
+        cur_lane.select_lane()
+        self.afc.do_tool_cut_tip_form(cur_lane, cur_extruder)
+
+        return self._ace_unload_sequence(cur_lane, cur_extruder)
 
     def _cmd_ace_custom_unload(self, gcmd):
         """Handle _ACE_CUSTOM_UNLOAD — filament transport from toolhead.
