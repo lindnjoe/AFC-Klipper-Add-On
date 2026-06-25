@@ -358,8 +358,8 @@ class afcACE(afcUnit):
             idx = getattr(lane, 'index', 0)
             slot = max(0, idx - 1)
             self._slot_map[lane_name] = slot
-            lane.custom_load_cmd = f"{self._custom_load_cmd_name} UNIT={self.name} LANE={lane_name}"
-            lane.custom_unload_cmd = f"{self._custom_unload_cmd_name} UNIT={self.name} LANE={lane_name}"
+            # lane.custom_load_cmd = f"{self._custom_load_cmd_name} UNIT={self.name} LANE={lane_name}"
+            # lane.custom_unload_cmd = f"{self._custom_unload_cmd_name} UNIT={self.name} LANE={lane_name}"
             # ACE lanes have no physical load pin, so raw_load_state (_load_state)
             # would default True (loadless default). Start it False so the native
             # virtual hub (any(lane.raw_load_state)) reads clear until a sync or
