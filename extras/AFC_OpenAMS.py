@@ -702,6 +702,7 @@ class afcAMS(afcUnit):
         """
         super().__init__(config)
         self.type = config.get('type', 'OpenAMS')
+        self.stepperless_drive: bool = True
 
         # Hardware identifier
         self.oams_name = config.get("oams", "oams1")

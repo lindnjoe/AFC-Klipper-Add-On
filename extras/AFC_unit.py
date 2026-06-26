@@ -67,6 +67,7 @@ class afcUnit:
         self.extruder_obj: Optional[AFCExtruder|None] = None
         self.drive_stepper_obj: AFCExtruderStepper = None
         self.selector_stepper_obj: AFCExtruderStepper = None
+        self.stepperless_drive: bool = False
 
         # Config get section
         self.full_name                   = config.get_name().split()

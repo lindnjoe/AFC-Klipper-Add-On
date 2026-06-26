@@ -212,6 +212,7 @@ class afcACE(afcUnit):
         """
         super().__init__(config)
         self.type = config.get('type', 'ACE')
+        self.stepperless_drive: bool = True
 
         self.serial_port = config.get("serial_port")
         mode = config.get("mode", MODE_COMBINED).lower().strip()

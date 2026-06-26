@@ -712,6 +712,9 @@ class AFCLane:
                 and not any(x in s for x in INVALID_UNIT_NAMES))
             self.unit_obj: afcUnit = self.printer.load_object(config, unit_cfg.get_name())
 
+            if getattr(self.unit_obj, "stepperless_drive", False):
+                return
+
             drive_stepper = self
             if not config.get("step_pin", None):
                 self.only_lane = True
