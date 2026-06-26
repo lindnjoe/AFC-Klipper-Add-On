@@ -36,7 +36,7 @@ try: from extras.AFC_stats import AFCStats_var
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
 # Unit types that only have load switch
-ONLY_LOAD_TYPES = ["HTLF", "Claymore", "OpenAMS"]
+ONLY_LOAD_TYPES = ["HTLF", "Claymore", "OpenAMS", "ACE", "ACE2"]
 EXCLUDE_TYPES = ONLY_LOAD_TYPES + [ "ViViD"]
 # Class for holding different states so its clear what all valid states are
 
@@ -1141,7 +1141,7 @@ class AFCLane:
 
                 self._post_prep_user_macro()
             else:
-                self.unit_obj.on_filament_remove()
+                self.unit_obj.on_filament_remove(self)
                 # Don't run if user disabled sensor in gui
                 fila_load = getattr(self, 'fila_load', None)
                 if (fila_load and

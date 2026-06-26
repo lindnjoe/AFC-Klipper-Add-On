@@ -37,6 +37,12 @@ class TemperatureACE:
         self.reactor = self.printer.get_reactor()
         self.name = config.get_name().split()[-1]
         self.ace_unit_name = config.get("ace_unit", "Ace1")
+        # Register under a Mainsail-recognized sensor name so the web UI shows
+        # temperature AND humidity. Mainsail reads humidity only from sensors it
+        # knows (e.g. aht3x); a plain temperature_ace object surfaces temp only.
+        # Mirrors temperature_oams' simulate_supported_sensor_mainsail option.
+        self.simulate_aht3x = config.getboolean(
+            "simulate_supported_sensor_mainsail", True)
 
         # Temperature state
         self.temp = 0.0
@@ -44,6 +50,11 @@ class TemperatureACE:
         self.max_temp = 70.0
         self.measured_min = float("inf")
         self.measured_max = 0.0
+        # Humidity (%RH) from the dryer sensor — only ACE 2 reports it (V1 ACE
+        # omits the key). Surfaced in get_status when present so the UI shows it
+        # alongside temp, like the OpenAMS temperature sensor.
+        self.humidity = 0.0
+        self._has_humidity = False
 
         # AFC_ACE reference resolved on ready
         self._ace_unit = None
@@ -54,8 +65,13 @@ class TemperatureACE:
         # Klipper temperature callback
         self._callback = None
 
-        # Register object
-        self.printer.add_object("temperature_ace " + self.name, self)
+        # Register object. Registering as "aht3x <name>" makes Mainsail treat
+        # this as a humidity-capable sensor and display the humidity field
+        # (ACE 2); falls back to the plain name when simulation is disabled.
+        if self.simulate_aht3x:
+            self.printer.add_object("aht3x " + self.name, self)
+        else:
+            self.printer.add_object("temperature_ace " + self.name, self)
 
         # Skip timers in debug mode
         if self.printer.get_start_args().get("debugoutput") is not None:
@@ -84,6 +100,12 @@ class TemperatureACE:
             pass
 
         if self._ace_unit:
+            # Decide humidity support now (ACE 2 reports it, V1 ACE doesn't) so
+            # the field is present in get_status from the first query — Mainsail
+            # registers a sensor's humidity field early, before the first sample
+            # would otherwise set it.
+            if getattr(self._ace_unit, "type", "") == "ACE2":
+                self._has_humidity = True
             self._log().info(
                 f"temperature_ace: linked to AFC_ACE unit '{self.ace_unit_name}'"
             )
@@ -163,6 +185,10 @@ class TemperatureACE:
                 ace_temp = float(hw_status.get("temp", 0.0) or 0.0)
 
                 self.temp = ace_temp
+                # Only ACE 2 reports humidity; V1 ACE omits the key entirely.
+                if "humidity" in hw_status:
+                    self._has_humidity = True
+                    self.humidity = float(hw_status.get("humidity", 0.0) or 0.0)
 
                 if self.temp > 0:
                     self.measured_min = min(self.measured_min, self.temp)
@@ -214,16 +240,19 @@ class TemperatureACE:
 
         :param eventtime: reactor event time (unused).
         :return dict: ``temperature`` plus ``measured_min_temp`` /
-            ``measured_max_temp`` and the source ``ace_unit`` name.
+            ``measured_max_temp``, the source ``ace_unit`` name, and
+            ``humidity`` when the unit reports it (ACE 2 only).
         """
-        return {
-            "temperature": round(self.temp, 2),
-            "measured_min_temp": round(self.measured_min, 2)
-            if self.measured_min != float("inf")
-            else 0.0,
-            "measured_max_temp": round(self.measured_max, 2),
-            "ace_unit": self.ace_unit_name,
-        }
+        # Mirror the OpenAMS sensor's status shape so Mainsail's card shows just
+        # temperature (plus humidity for ACE 2). measured_min/max were extra
+        # numeric fields Mainsail rendered as unlabeled values that cluttered the
+        # card. measured_min/max stay tracked internally for the shutdown limits.
+        status = {"temperature": round(self.temp, 2)}
+        # Only present for ACE 2 (V1 ACE has no humidity sensor), matching how
+        # the OpenAMS temperature sensor surfaces humidity.
+        if self._has_humidity:
+            status["humidity"] = round(self.humidity, 2)
+        return status
 
 
 def load_config(config):

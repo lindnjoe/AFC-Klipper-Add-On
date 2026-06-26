@@ -34,12 +34,15 @@ except: raise error(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.form
 try: from extras.AFC_unit import afcUnit
 except: raise error(ERROR_STR.format(import_lib="AFC_unit", trace=traceback.format_exc()))
 
+from extras.AFC_OAMS import OAMSStatus
+except: raise error(ERROR_STR.format(import_lib="AFC_OAMS", trace=traceback.format_exc()))
+
 # FollowerController, OAMSMonitor and FPSLoadState/FPSState are defined inline
 # at the bottom of this file so the OpenAMS unit is self-contained. The [oams]
-# hardware controller lives in its own oams.py because Klipper resolves the
-# [oams ...] config section to that module name.
+# hardware controller lives in its own AFC_OAMS.py because Klipper resolves the
+# [AFC_OAMS ...] config section to that module name.
 
-# ── Support classes used by external oams.py module ────────────────
+
 
 class AMSEventBus:
     """Process-wide singleton publish/subscribe bus for OpenAMS events.
@@ -300,7 +303,7 @@ class LaneRegistry:
 class AMSHardwareService:
     """Per-(printer, unit) façade over the [oams] hardware controller.
 
-    Resolves and caches the ``[oams <name>]`` controller, polls its sensors on
+    Resolves and caches the ``[AFC_OAMS <name>]`` controller, polls its sensors on
     a reactor timer, caches the latest status and per-lane snapshots, and
     publishes f1s/hub/spool change events on the shared ``AMSEventBus``. One
     instance exists per (printer, unit name) pair.
@@ -311,7 +314,7 @@ class AMSHardwareService:
         """Initialize service state, lookup the AFC logger, and wire shared singletons.
 
         :param printer: Klipper printer object.
-        :param name: OpenAMS unit name (matches the ``[oams <name>]`` section).
+        :param name: OpenAMS unit name (matches the ``[AFC_OAMS <name>]`` section).
         :param logger: optional logger; falls back to the AFC object's logger.
         """
         self.printer = printer
@@ -377,13 +380,13 @@ class AMSHardwareService:
     def resolve_controller(self):
         """Return the [oams] controller, looking it up and caching it if needed.
 
-        :return: the ``[oams <name>]`` controller object, or None if not found.
+        :return: the ``[AFC_OAMS <name>]`` controller object, or None if not found.
         """
         with self._lock:
             controller = self._controller
         if controller is not None:
             return controller
-        lookup_name = f"oams {self.name}"
+        lookup_name = f"AFC_OAMS {self.name}"
         try:
             controller = self.printer.lookup_object(lookup_name, None)
         except Exception:
@@ -741,26 +744,29 @@ class afcAMS(afcUnit):
 
         self.gcode = self.printer.lookup_object('gcode')
         unit_suffix = self.name.upper().replace(" ", "_")
-        self._custom_load_cmd_name = f'_OAMS_CUSTOM_LOAD_{unit_suffix}'
-        self._custom_unload_cmd_name = f'_OAMS_CUSTOM_UNLOAD_{unit_suffix}'
-        self.gcode.register_command(
-            self._custom_load_cmd_name, self._cmd_oams_custom_load,
-            desc=f"OpenAMS internal load command ({self.name})")
-        self.gcode.register_command(
-            self._custom_unload_cmd_name, self._cmd_oams_custom_unload,
-            desc=f"OpenAMS internal unload command ({self.name})")
-        self.gcode.register_command(
-            f'AFC_OAMS_CALIBRATE_PTFE_{unit_suffix}', self.cmd_AFC_OAMS_CALIBRATE_PTFE,
-            desc=f"Calibrate OpenAMS PTFE length ({self.name})")
-        self.gcode.register_command(
-            f'AFC_OAMS_CALIBRATE_HUB_HES_{unit_suffix}', self.cmd_AFC_OAMS_CALIBRATE_HUB_HES,
-            desc=f"Calibrate OpenAMS hub HES for a spool ({self.name})")
-        self.gcode.register_command(
-            f'AFC_OAMS_CALIBRATE_HUB_HES_ALL_{unit_suffix}', self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL,
-            desc=f"Calibrate all loaded OpenAMS hub HES sensors ({self.name})")
-        self.gcode.register_command(
-            f'AFC_OAMS_CLEAR_ERRORS_{unit_suffix}', self.cmd_AFC_OAMS_CLEAR_ERRORS,
-            desc=f"Clear OpenAMS errors and resync state ({self.name})")
+        # Dont need these anymore
+        # self._custom_load_cmd_name = f'_OAMS_CUSTOM_LOAD_{unit_suffix}'
+        # self._custom_unload_cmd_name = f'_OAMS_CUSTOM_UNLOAD_{unit_suffix}'
+        # self.gcode.register_mux_command(
+        #     self._custom_load_cmd_name, self._cmd_oams_custom_load,
+        #     desc=f"OpenAMS internal load command ({self.name})")
+        # self.gcode.register_command(
+        #     self._custom_unload_cmd_name, self._cmd_oams_custom_unload,
+        #     desc=f"OpenAMS internal unload command ({self.name})")
+        self.gcode.register_mux_command(
+            'AFC_OAMS_CALIBRATE_PTFE', "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_PTFE,
+            desc="Calibrate OpenAMS PTFE length")
+        self.gcode.register_mux_command(
+            'AFC_OAMS_CALIBRATE_HUB_HES', "UNIT", self.name,
+            self.cmd_AFC_OAMS_CALIBRATE_HUB_HES,
+            desc="Calibrate OpenAMS hub HES for a spool")
+        self.gcode.register_mux_command(
+            'AFC_OAMS_CALIBRATE_HUB_HES_ALL', "UNIT", self.name,
+            self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL,
+            desc="Calibrate all loaded OpenAMS hub HES sensors")
+        self.gcode.register_mux_command(
+            'AFC_OAMS_CLEAR_ERRORS', "UNIT", self.name, self.cmd_AFC_OAMS_CLEAR_ERRORS,
+            desc="Clear OpenAMS errors and resync state")
 
         # Sensor polling state
         self._last_f1s = [None] * 4
@@ -804,8 +810,10 @@ class afcAMS(afcUnit):
             if slot < 0:
                 slot = 0
             self._spool_map[lane_name] = slot
-            # lane.custom_load_cmd = f"{self._custom_load_cmd_name} UNIT={self.name} LANE={lane_name}"
-            # lane.custom_unload_cmd = f"{self._custom_unload_cmd_name} UNIT={self.name} LANE={lane_name}"
+            # Load and unload both go through the unit_load_lane / unit_unload_lane
+            # hooks (below), not custom_load_cmd / custom_unload_cmd, so the shared
+            # toolhead phase lives in the unit driver and AFC.py needs no fork.
+            # Leave both custom_*_cmd unset so those upstream branches are taken.
             eng_len = getattr(lane, 'engagement_length', None)
             if eng_len is not None:
                 eng_speed = getattr(lane, 'engagement_speed', None) or self._engagement_speed
@@ -874,11 +882,11 @@ class afcAMS(afcUnit):
         # Vivid-style hub: each lane's raw_load_state carries the hub HES and the
         # native AFC_hub reports any(lane.raw_load_state). The hub stays
         # non-driven (_state_driven False) — no set_state_driven needed.
-        self.oams = self.printer.lookup_object(f"oams {self.oams_name}", None)
+        self.oams = self.printer.lookup_object(f"AFC_OAMS {self.oams_name}", None)
 
         if self.oams is None:
             self.logger.warning(
-                f"OpenAMS hardware '[oams {self.oams_name}]' not found for "
+                f"OpenAMS hardware '[AFC_OAMS {self.oams_name}]' not found for "
                 f"'{self.name}'. Sensor state will not update.")
             return
 
@@ -1418,12 +1426,22 @@ class afcAMS(afcUnit):
         # TODO: add error handling
         self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
                         wait_tool=False)
+        cur_lane.status = AFCLaneState.TOOL_UNLOADING
         cur_lane.disable_buffer()
         cur_lane.sync_to_extruder()
         cur_lane.select_lane()
         self.afc.do_tool_cut_tip_form(cur_lane, cur_extruder)
+        success = self._oams_unload_sequence(cur_lane, cur_extruder)
+        if not success:
+            return success
 
-        return self._oams_unload_sequence(cur_lane, cur_extruder)
+        if self.afc.post_unload_macro is not None:
+            self.gcode.run_script_from_command(self.afc.post_unload_macro)
+
+        cur_lane.set_tool_unloaded(normal_toolchange=True)
+        cur_lane.status = AFCLaneState.NONE
+        self.afc.save_vars()
+        return True
 
     def _cmd_oams_custom_unload(self, gcmd):
         """Handle _OAMS_CUSTOM_UNLOAD — filament transport from toolhead.
@@ -1476,6 +1494,8 @@ class afcAMS(afcUnit):
         # Latch loaded_to_hub True; raw_load_state (live hub HES) is updated by
         # the sensor poll as filament passes/clears the hub junction.
         cur_lane.loaded_to_hub = True
+        cur_lane.status = AFCLaneState.TOOL_LOADED
+        self.afc.save_vars()
 
         return True
 
@@ -2575,7 +2595,6 @@ class afcAMS(afcUnit):
 
         self.logger.raw(f"TD-1 calibration: continuous load for {cur_lane.name}")
 
-        from extras.oams import OAMSStatus
         FPS_STOP_THRESHOLD = 0.45
         TD1_POLL_INTERVAL = 2.0
 
@@ -2728,7 +2747,6 @@ class afcAMS(afcUnit):
             return False, "Another OpenAMS hub already loaded"
 
         # Load the spool to move filament to hub
-        from extras.oams import OAMSStatus
         self.oams.action_status = OAMSStatus.LOADING
         try:
             self.oams.oams_load_spool_cmd.send([spool_index])
@@ -2994,7 +3012,7 @@ class afcAMS(afcUnit):
 # ══════════════════════════════════════════════════════════════════════
 # Helpers for the OpenAMS unit, kept here so it's self-contained: the follower
 # motor controller and the real-time stuck/clog monitor. The [oams] hardware
-# controller lives in oams.py because Klipper maps the [oams ...] config
+# controller lives in AFC_OAMS.py because Klipper maps the [AFC_OAMS ...] config
 # section to that module name.
 # ══════════════════════════════════════════════════════════════════════
 

@@ -72,13 +72,13 @@ class RetryState:
 
 
 class AFC_OAMS:
-    """Klipper hardware controller for a single OpenAMS ([oams ...]) unit.
+    """Klipper hardware controller for a single OpenAMS ([AFC_OAMS ...]) unit.
 
     Wraps the OAMS MCU: it configures the pressure (FPS) buffer, the first-stage
     (f1s) and hub Hall-effect sensors, and the pressure/current PID loops; sends
     load/unload/follower/calibration commands; receives sensor and status
     updates from firmware; and provides retry wrappers and the ``OAMS_*`` G-code
-    commands. One instance is created per ``[oams ...]`` config section.
+    commands. One instance is created per ``[AFC_OAMS ...]`` config section.
     """
     def __init__(self, config):
         """Construct the controller from its Klipper config section.
@@ -89,7 +89,7 @@ class AFC_OAMS:
         ``OAMS_*`` G-code commands; and, when available, registers itself with
         the shared :class:`AMSHardwareService` so AFC can reach this controller.
 
-        :param config: Klipper ``ConfigWrapper`` for this ``[oams ...]`` section.
+        :param config: Klipper ``ConfigWrapper`` for this ``[AFC_OAMS ...]`` section.
         """
         # Core printer interface
         self.printer = config.get_printer()
@@ -1253,9 +1253,9 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
 
 def load_config_prefix(config):
-    """Klipper entry point for ``[oams ...]`` config sections.
+    """Klipper entry point for ``[AFC_OAMS ...]`` config sections.
 
     :param config: the ``ConfigWrapper`` for the section being loaded.
-    :return OAMS: the constructed OAMS controller instance.
+    :return AFC_OAMS: the constructed AFC_OAMS controller instance.
     """
     return AFC_OAMS(config)
