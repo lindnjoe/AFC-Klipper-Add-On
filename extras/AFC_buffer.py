@@ -797,7 +797,7 @@ class FPSEndstopWrapper:
         """
         return 1 if self._trigger_func() else 0
 
-class AFCFPSBuffer:
+class AFCFPSBuffer(AFCBuffer):
     """
     FPS-based buffer driver for AFC.
 
@@ -1408,7 +1408,7 @@ class AFCFPSBuffer:
         """
         response = {}
 
-        response = super.get_status(eventtime)
+        response = super().get_status(eventtime)
 
         response['fps_value'] = round(self.fps_value, 3)
         response['smoothed_fps'] = round(self.smoothed_fps, 3)

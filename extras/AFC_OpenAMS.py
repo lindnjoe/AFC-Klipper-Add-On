@@ -4,6 +4,8 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+# TODO: put in attribution to radiant knight and joebol
+
 """AFC unit driver for OpenAMS filament changers with stuck spool,
 clog detection, and engagement verification."""
 
