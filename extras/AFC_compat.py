@@ -69,7 +69,7 @@ def _patch_afc_buffer_steppermless():
     #     from extras import AFC_buffer as _buf_mod
     # except Exception:
     #     return
-    # BufCls = getattr(_buf_mod, 'AFCTrigger', None)
+    # BufCls = getattr(_buf_mod, 'AFCBuffer', None)
     # if BufCls is None or getattr(BufCls, '_afc_steppermless_patched', False):
     #     return
     # _timeout = getattr(_buf_mod, 'CHECK_RUNOUT_TIMEOUT', 0.5)

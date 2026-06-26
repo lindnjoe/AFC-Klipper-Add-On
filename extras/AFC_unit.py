@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 if TYPE_CHECKING:
     from extras.AFC_lane import afc, AFCLane, AFCMoveWarning
     from extras.AFC_stepper import AFCExtruderStepper
-    from extras.AFC_buffer import AFCTrigger
+    from extras.AFC_buffer import AFCBuffer
     from extras.AFC_hub import afc_hub
     from extras.AFC_extruder import AFCExtruder
     from gcode import GCodeCommand
@@ -62,7 +62,7 @@ class afcUnit:
         self._eject_to_calibrate = False
 
         # Objects
-        self.buffer_obj: Optional[AFCTrigger|None] = None
+        self.buffer_obj: Optional[AFCBuffer|None] = None
         self.hub_obj: Optional[afc_hub|None]       = None
         self.extruder_obj: Optional[AFCExtruder|None] = None
         self.drive_stepper_obj: AFCExtruderStepper = None
