@@ -1,10 +1,14 @@
-# Armored Turtle Automated Filament Control
+# AFCProject Automated Filament Changer
 #
-# Copyright (C) 2024-2026 Armored Turtle
+# Copyright (C) 2024-2026 AFCProject
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-# TODO: put in attribution to radiant knight and joebol
+# This file include code inspired/modified from OpenAms Project. https://github.com/OpenAMSOrg/klipper_openams
+# Originally authored by JR Lomas(aka KnightRadiant) and licensed under the MIT license
+# Full license text available at: https://mit-license.org/
+
+# This code was updated and contributed by lindnjoe(aka J0eB0l)
 
 """AFC unit driver for OpenAMS filament changers with stuck spool,
 clog detection, and engagement verification."""
