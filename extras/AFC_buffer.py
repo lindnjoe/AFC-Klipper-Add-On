@@ -804,6 +804,22 @@ class FPSEndstopWrapper:
         """
         return 1 if self._trigger_func() else 0
 
+# - Any Hall-effect + spring slider producing a 0.0-1.0 analog signal
+#
+# FPS reading semantics:
+#   0.1 (low)  -> buffer stretched / tension -> increase feed
+#   0.5 (mid)  -> buffer centered / ideal state
+#   0.9 (high) -> buffer compressed / pushing -> decrease feed
+#
+# PSF users: this driver accepts PSF-compatible config aliases:
+#   neutral_point  -> set_point    (default 0.5)
+#   max_tension    -> low_point    (default 0.1)
+#   max_compression -> high_point  (default 0.9)
+#
+# For units WITHOUT stepper motors (OpenAMS, etc.), the driver simply
+# provides the ADC reading. The unit's own code (AFC_OpenAMS) manages
+# tool_start_state and virtual sensors exactly as it already does, this
+# driver just acts as the FPS hardware interface and config entry point.
 class AFCFPSBuffer(AFCBuffer):
     """
     FPS-based buffer driver for AFC.

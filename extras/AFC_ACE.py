@@ -128,13 +128,6 @@ except: QueueHandler = None
 MODE_COMBINED = "combined"
 MODE_DIRECT = "direct"
 
-
-# ── Compatibility shims for the frozen upstream core (see AFC_compat.py) ──
-from extras.AFC_compat import apply_compat_patches
-apply_compat_patches()
-
-
-
 def _ams_box_logo(title, n_slots, name):
     """AMS-style unit logo: a titled box with one spool bay per slot, fronted by
     the R/E/A/D/Y banner (prep console output). ASCII borders for portability.

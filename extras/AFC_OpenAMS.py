@@ -20,7 +20,7 @@ import threading
 import traceback
 from datetime import datetime
 from configparser import Error as error
-from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from extras.AFC_lane import AFCLane
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 try: from extras.AFC_utils import ERROR_STR
 except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
 
-try: from extras.AFC_lane import AFCLaneState, SpeedMode, AssistActive
+try: from extras.AFC_lane import AFCLaneState
 except: raise error(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.format_exc()))
 
 try: from extras.AFC_unit import afcUnit
@@ -38,12 +38,6 @@ except: raise error(ERROR_STR.format(import_lib="AFC_unit", trace=traceback.form
 # at the bottom of this file so the OpenAMS unit is self-contained. The [oams]
 # hardware controller lives in its own oams.py because Klipper resolves the
 # [oams ...] config section to that module name.
-
-
-# ── Compatibility shims for the frozen upstream core (see AFC_compat.py) ──
-from extras.AFC_compat import apply_compat_patches
-apply_compat_patches()
-
 
 # ── Support classes used by external oams.py module ────────────────
 

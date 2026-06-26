@@ -71,7 +71,7 @@ class RetryState:
         self.was_retry    = False
 
 
-class OAMS:
+class AFC_OAMS:
     """Klipper hardware controller for a single OpenAMS ([oams ...]) unit.
 
     Wraps the OAMS MCU: it configures the pressure (FPS) buffer, the first-stage
@@ -1258,4 +1258,4 @@ def load_config_prefix(config):
     :param config: the ``ConfigWrapper`` for the section being loaded.
     :return OAMS: the constructed OAMS controller instance.
     """
-    return OAMS(config)
+    return AFC_OAMS(config)
