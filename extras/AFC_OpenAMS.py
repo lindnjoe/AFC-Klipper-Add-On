@@ -1424,7 +1424,7 @@ class afcAMS(afcUnit):
         # TODO: do the same thing for ACE
         # TODO: remove setting custom unload per lane, line 154/155
         # TODO: add error handling
-        self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
+        self.afc.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
                         wait_tool=False)
         cur_lane.status = AFCLaneState.TOOL_UNLOADING
         cur_lane.disable_buffer()
