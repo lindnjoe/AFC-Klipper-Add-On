@@ -34,15 +34,25 @@ except: raise error(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.form
 try: from extras.AFC_unit import afcUnit
 except: raise error(ERROR_STR.format(import_lib="AFC_unit", trace=traceback.format_exc()))
 
-try: from extras.AFC_OAMS import OAMSStatus
-except: raise error(ERROR_STR.format(import_lib="AFC_OAMS", trace=traceback.format_exc()))
-
 # FollowerController, OAMSMonitor and FPSLoadState/FPSState are defined inline
 # at the bottom of this file so the OpenAMS unit is self-contained. The [oams]
 # hardware controller lives in its own AFC_OAMS.py because Klipper resolves the
 # [AFC_OAMS ...] config section to that module name.
 
+class OAMSStatus:
+    """Enumeration of firmware action/status codes reported by the OAMS MCU.
 
+    These values mirror the ``action`` field of ``oams_action_status`` MCU
+    messages and the local ``action_status`` used to track in-flight operations.
+    """
+    LOADING = 0
+    UNLOADING = 1
+    FORWARD_FOLLOWING = 2
+    REVERSE_FOLLOWING = 3
+    COASTING = 4
+    STOPPED = 5
+    CALIBRATING = 6
+    ERROR = 7
 
 class AMSEventBus:
     """Process-wide singleton publish/subscribe bus for OpenAMS events.
