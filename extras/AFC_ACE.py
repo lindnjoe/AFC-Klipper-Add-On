@@ -281,16 +281,6 @@ class afcACE(afcUnit):
         self._hub_load_suppressed: set[str] = set()
 
         self.gcode = self.printer.lookup_object('gcode')
-        unit_suffix = self.name.upper().replace(" ", "_")
-        # TODO: remove these
-        # self._custom_load_cmd_name = f'_ACE_CUSTOM_LOAD_{unit_suffix}'
-        # self._custom_unload_cmd_name = f'_ACE_CUSTOM_UNLOAD_{unit_suffix}'
-        # self.gcode.register_command(
-        #     self._custom_load_cmd_name, self._cmd_ace_custom_load,
-        #     desc=f"ACE internal load command ({self.name})")
-        # self.gcode.register_command(
-        #     self._custom_unload_cmd_name, self._cmd_ace_custom_unload,
-        #     desc=f"ACE internal unload command ({self.name})")
         self.gcode.register_mux_command(
             'ACE_CALIBRATE', "UNIT", self.name, self.cmd_ACE_CALIBRATE,
             desc="Calibrate ACE feed distance to toolhead")

@@ -34,7 +34,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.form
 try: from extras.AFC_unit import afcUnit
 except: raise error(ERROR_STR.format(import_lib="AFC_unit", trace=traceback.format_exc()))
 
-from extras.AFC_OAMS import OAMSStatus
+try: from extras.AFC_OAMS import OAMSStatus
 except: raise error(ERROR_STR.format(import_lib="AFC_OAMS", trace=traceback.format_exc()))
 
 # FollowerController, OAMSMonitor and FPSLoadState/FPSState are defined inline
@@ -743,16 +743,6 @@ class afcAMS(afcUnit):
         self._spool_map: dict[str, int] = {}
 
         self.gcode = self.printer.lookup_object('gcode')
-        unit_suffix = self.name.upper().replace(" ", "_")
-        # Dont need these anymore
-        # self._custom_load_cmd_name = f'_OAMS_CUSTOM_LOAD_{unit_suffix}'
-        # self._custom_unload_cmd_name = f'_OAMS_CUSTOM_UNLOAD_{unit_suffix}'
-        # self.gcode.register_mux_command(
-        #     self._custom_load_cmd_name, self._cmd_oams_custom_load,
-        #     desc=f"OpenAMS internal load command ({self.name})")
-        # self.gcode.register_command(
-        #     self._custom_unload_cmd_name, self._cmd_oams_custom_unload,
-        #     desc=f"OpenAMS internal unload command ({self.name})")
         self.gcode.register_mux_command(
             'AFC_OAMS_CALIBRATE_PTFE', "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_PTFE,
             desc="Calibrate OpenAMS PTFE length")
