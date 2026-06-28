@@ -705,9 +705,11 @@ class AFCExtruder:
         if self.current_move_distance > 0:
             info_str = "loading"
             self.tc_lane.status = AFCLaneState.TOOLED
+            self.tc_lane.need_purge = True
         else:
             info_str = "unloading"
             self.tc_lane.status = AFCLaneState.NONE
+            self.tc_lane.need_purge = False
 
         self.logger.info(f"{self.name} {info_str} done")
 
