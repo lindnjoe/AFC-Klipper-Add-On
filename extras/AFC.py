@@ -1520,7 +1520,8 @@ class afc:
                 self.error.handle_lane_failure(cur_lane, message)
                 return False
         elif hasattr(cur_lane.unit_obj, "unit_load_lane"):
-            result = cur_lane.unit_obj.unit_load_lane(cur_lane, cur_extruder)
+            if not cur_lane.unit_obj.unit_load_lane(cur_lane, cur_extruder):
+                return False
         else:
             use_direct_dist = False
             if (cur_lane.hub_obj
@@ -1908,8 +1909,8 @@ class afc:
             cur_lane.status = AFCLaneState.NONE
             self.save_vars()
         elif hasattr(cur_lane.unit_obj, "unit_unload_lane"):
-            result = cur_lane.unit_obj.unit_unload_lane(cur_lane, cur_extruder)
-            # TODO: add error checking here
+            if not cur_lane.unit_obj.unit_unload_lane(cur_lane, cur_extruder):
+                return False
         else:
             use_direct_dist = False
             if (cur_lane.hub_obj

@@ -36,7 +36,6 @@ class afc_hub:
         self.unit = None
         self.lanes: Dict[str, AFCLane] = {}
         self._state: bool = False
-        self._state_driven = False
 
         self.switch_pin = config.get('switch_pin', None)
         # HUB Cut variables
@@ -141,13 +140,9 @@ class afc_hub:
         sensor is triggered.
         """
         state = self._state
-        if (self.is_virtual_pin()
-            and not self._state_driven):
+        if self.is_virtual_pin():
             state = any(lane.raw_load_state for lane in self.lanes.values())
         return state
-
-    def set_state_driven(self):
-        self._state_driven = True
 
     def switch_pin_callback(self, eventtime, state):
         self._state = state
