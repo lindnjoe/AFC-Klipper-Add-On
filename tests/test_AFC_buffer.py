@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from extras.AFC_buffer import (
-    AFCTrigger,
+    AFCBuffer,
     TRAILING_STATE_NAME,
     ADVANCING_STATE_NAME,
     CHECK_RUNOUT_TIMEOUT,
@@ -33,8 +33,8 @@ from tests.test_AFC_lane import _make_afc_lane
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_buffer(name="TN", error_sensitivity=0.0):
-    """Build an AFCTrigger by bypassing __init__ and setting attributes."""
-    buf = AFCTrigger.__new__(AFCTrigger)
+    """Build an AFCBuffer by bypassing __init__ and setting attributes."""
+    buf = AFCBuffer.__new__(AFCBuffer)
 
     from tests.conftest import MockAFC, MockReactor, MockLogger
 
@@ -51,7 +51,7 @@ def _make_buffer(name="TN", error_sensitivity=0.0):
     buf.lanes = {}
     buf.last_state = "Unknown"
     buf.enable = False
-    buf.current = ""
+    buf.current_lane = None
     buf.advance_state = False
     buf.trailing_state = False
 
@@ -72,6 +72,7 @@ def _make_buffer(name="TN", error_sensitivity=0.0):
     buf.led_buffer_disabled = "0,0,0,0.25"
 
     buf.min_event_systime = 0.0
+    buf.type = "switched"
 
     return buf
 

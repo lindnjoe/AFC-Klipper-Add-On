@@ -836,8 +836,7 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
         gcode = self._cached_gcode or self.printer.lookup_object("gcode", None)
         if gcode is None:
-            gcmd.error("Failed to access gcode object")
-            return
+            raise gcmd.error("Failed to access gcode object")
 
         gcode.run_script_from_command("M104 S%f" % target_temp)
         gcode.run_script_from_command("G1 E%f F%f" % (extrusion_length, extrusion_speed_per_min))

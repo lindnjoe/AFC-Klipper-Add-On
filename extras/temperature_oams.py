@@ -126,8 +126,11 @@ class TemperatureOAMS:
         """
         Configure the HDC1080: set resolutions, optional heater, and read IDs.
 
-        Reads the manufacturer/device IDs, applies the configured temperature and
-        humidity resolutions, enables the heater when requested, and marks the
+        First configures HFC1080 configuration register mode of acquisition into "Temperature
+        and Humidity are acquired in sequence. Temperature first."
+
+        Then Reads the manufacturer/device IDs, and device ID, applies the configured temperature
+        and humidity resolutions, enables the heater when requested, and marks the
         device as initialized so sampling can begin.
         """
         data = [CONF_REG, 1 << 4, 0x00]

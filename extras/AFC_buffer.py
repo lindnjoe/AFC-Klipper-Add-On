@@ -19,6 +19,7 @@ from configparser import Error as error
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    from extras.AFC import afc
     from extras.AFC_lane import AFCLane
     from extras.AFC_stepper import AFCExtruderStepper
     from gcode import GCodeCommand
@@ -35,7 +36,7 @@ FPS_ENDSTOP_POLL_TIME = 0.01  # 10ms poll interval for software endstop
 class AFCBuffer:
     def __init__(self, config):
         self.printer    = config.get_printer()
-        self.afc        = self.printer.load_object(config, 'AFC')
+        self.afc: afc    = self.printer.load_object(config, 'AFC')
         self.reactor    = self.afc.reactor
         self.gcode      = self.afc.gcode
         self.logger     = self.afc.logger
@@ -70,9 +71,10 @@ class AFCBuffer:
         # LED SETTINGS
         self.led                    = False
         self.led_index              = config.get('led_index', None)
-        self.led_advancing          = config.get('led_buffer_advancing','0,0,1,0')
-        self.led_trailing           = config.get('led_buffer_trailing','0,1,0,0')
-        self.led_buffer_disabled    = config.get('led_buffer_disable', '0,0,0,0.25')
+        self.led_advancing          = config.get('led_buffer_advancing', self.afc.led_buffer_advancing)
+        self.led_trailing           = config.get('led_buffer_trailing', self.afc.led_buffer_trailing)
+        self.led_neutral            = config.get('led_buffer_neutral', self.afc.led_buffer_neutral)
+        self.led_buffer_disabled    = config.get('led_buffer_disable', self.afc.led_buffer_disabled)
 
         if self.led_index is not None:
             self.led = True
@@ -936,9 +938,11 @@ class AFCFPSBuffer(AFCBuffer):
         # that gets updated in _adc_callback.
         self.adv_filament_switch_name = f"{self.name}_expanded"
         self.fila_adv = VirtualFilamentSensor(self.printer, self.adv_filament_switch_name,
+                                              logger=self.logger,
                                               show_in_gui=self.enable_sensors_in_gui)
         self.trail_filament_switch_name = f"{self.name}_compressed"
         self.fila_trail = VirtualFilamentSensor(self.printer, self.trail_filament_switch_name,
+                                                logger=self.logger,
                                                 show_in_gui=self.enable_sensors_in_gui)
 
         # ---- Correction timer ----
@@ -1409,12 +1413,23 @@ class AFCFPSBuffer(AFCBuffer):
 
         Usage: ``SET_FPS_SET_POINT BUFFER=<name> SET_POINT=<0.1-0.9> [DEADBAND=<0.0-0.6>]``
         """
+        # TODO: turn this into a common method to validate and put validating in __INIT__
+        # into the common method as well
         new_set_point = gcmd.get_float('SET_POINT', self.set_point, minval=0.1, maxval=0.9)
         new_deadband = gcmd.get_float('DEADBAND', self.deadband, minval=0.0, maxval=0.6)
+        half_db = new_deadband / 2.0
+        if new_set_point <= self.low_point or new_set_point >= self.high_point:
+            error_msg = (f"SET_POINT must be between low_point({self.low_point}) "
+                         f"and high_point({self.high_point})")
+            raise gcmd.error(error_msg)
+        deadband_low = new_set_point - half_db
+        deadband_high = new_set_point + half_db
+        if deadband_low <= self.low_point or deadband_high >= self.high_point:
+            error_msg = "DEADBAND is too wide for the configured FPS thresholds"
+            raise gcmd.error()
 
         self.set_point = new_set_point
         self.deadband = new_deadband
-        half_db = self.deadband / 2.0
         self.logger.info("FPS set_point={:.2f} deadband={:.2f} (neutral window {:.2f}-{:.2f})".format(
             self.set_point, self.deadband,
             self.set_point - half_db, self.set_point + half_db

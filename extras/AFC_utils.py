@@ -247,7 +247,7 @@ class VirtualFilamentSensor:
     QUERY_HELP = "Query the status of the Filament Sensor"
     SET_HELP = "Sets the filament sensor on/off"
 
-    def __init__(self, printer, name, show_in_gui=True, runout_cb=None, enable_runout=False):
+    def __init__(self, printer, name, logger: AFC_logger, show_in_gui=True, runout_cb=None, enable_runout=False):
         """
         Register a lightweight virtual filament sensor.
 
@@ -263,6 +263,7 @@ class VirtualFilamentSensor:
         """
         self.printer = printer
         self.name = name
+        self.logger = logger
         self._object_name = f"filament_switch_sensor {name}"
         self.runout_helper = VirtualRunoutHelper(printer, name, runout_cb=runout_cb, enable_runout=enable_runout)
 
