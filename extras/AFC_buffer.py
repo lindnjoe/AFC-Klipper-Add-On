@@ -189,17 +189,9 @@ class AFCBuffer:
         """
         self.update_filament_error_pos()
 
-        # Check for stepper less motors
-        not_stepperless = bool(self.current_lane
-                               and getattr(self.current_lane, "extruder_stepper", None))
-
         # register timer that will run to check buffer state changes
-        if (self.extruder_pos_timer is None
-            and not_stepperless
-            ):
+        if self.extruder_pos_timer is None:
             self.extruder_pos_timer = self.reactor.register_timer(self.extruder_pos_update_event)
-        else:
-            self.logger.info("Stepperless unit not setting setup fault timer, remove before pushing to dev")
 
     def start_fault_timer(self, print_time):
         """
@@ -207,8 +199,9 @@ class AFCBuffer:
 
         :param print_time: Current print time for timer scheduling
         """
-        self.fault_timer = "Running"
-        self.reactor.update_timer(self.extruder_pos_timer, self.reactor.NOW)
+        if self.extruder_pos_timer:
+            self.fault_timer = "Running"
+            self.reactor.update_timer(self.extruder_pos_timer, self.reactor.NOW)
 
     def stop_fault_timer(self, print_time):
         """
@@ -216,8 +209,9 @@ class AFCBuffer:
 
         :param print_time: Current print time for timer scheduling
         """
-        self.fault_timer = "Stopped"
-        self.reactor.update_timer(self.extruder_pos_timer, self.reactor.NEVER)
+        if self.extruder_pos_timer:
+            self.fault_timer = "Stopped"
+            self.reactor.update_timer(self.extruder_pos_timer, self.reactor.NEVER)
 
     def fault_detection_enabled(self):
         """
@@ -268,8 +262,14 @@ class AFCBuffer:
         :return float: Next scheduled event time (eventtime + CHECK_RUNOUT_TIMEOUT)
         """
         extruder_pos = self.get_extruder_pos()
+
+        stepper_less_drive = False
+        if (self.current_lane is not None
+            and getattr(self.current_lane.unit_obj, "stepperless_drive", None)):
+            stepper_less_drive = True
         # Check for filament problems
-        if (self.afc.function.is_printing(check_movement=True)
+        if (not stepper_less_drive
+            and self.afc.function.is_printing(check_movement=True)
             and extruder_pos is not None
             and self.filament_error_pos is not None):
             if extruder_pos > self.filament_error_pos:
