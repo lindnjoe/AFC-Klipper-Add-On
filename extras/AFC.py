@@ -497,53 +497,6 @@ class afc:
 
         self.units = sorted_units
 
-    def handle_ready(self):
-        """
-        Handle the ready event.
-
-        Sorts units base on lane numbering so that units/lanes show up in fluidd/mainsail panels
-        in the correct order.
-        """
-        def natural_lane_num(key: int, lane: AFCLane):
-            """
-            Helper function for returning lane number, if lane name matches extruder name then this
-            is a standalone toolhead and returns 9999 to force Tools to the bottom of this list
-
-            :param key: Key name to extract number from
-            :param lane: AFCLane to check if its extruder name matches its name
-            :return int: Lane integer if not standalone lane, 9999 if standalone lane
-            """
-            if lane.extruder_obj.name == lane.name:
-                return 9999
-
-            m = re.search(r'\d+', key)
-            return int(m.group()) if m else 9999
-
-        def unit_min_lane(unit_dict: dict):
-            """
-            Helper function for getting minimum lane number found in unit
-
-            :param unit_dict: Units lane dictionary to extract lane numbers from
-            :return int: Minimum integer found in units lanes, if no list returns float("inf")
-            """
-            nums = [
-                natural_lane_num(k, lanes) for k, lanes in unit_dict.lanes.items()
-            ]
-
-            minimum = float("inf")
-            if nums:
-                minimum = min(nums)
-            return minimum
-
-        sorted_units = dict(
-            sorted(
-                self.units.items(),
-                key=lambda x: unit_min_lane(x[1])
-            )
-        )
-
-        self.units = sorted_units
-
     def _rename_macros(self):
         self.function._rename(self.BASE_M104, self.RENAMED_M104, self.cmd_AFC_M104, self.cmd_AFC_M104_help)
         self.function._rename(self.BASE_M109, self.RENAMED_M109, self.cmd_AFC_M109, self.cmd_AFC_M109_help)

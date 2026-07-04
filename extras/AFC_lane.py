@@ -1151,15 +1151,18 @@ class AFCLane:
                     self.logger.warning("Load runout has been detected, but pause and runout "
                                         "detection has been disabled")
                 elif self.unit_obj.check_runout(self):
-                    # Let the unit handle runout if it provides custom logic
+                    # Let the unit handle runout if it provides custom logic.
+                    # handle_runout() returns True when it fully handled the
+                    # runout itself, or False to defer to AFC's generic
+                    # infinite-spool / pause behavior below.
                     handle_runout = getattr(self.unit_obj, "handle_runout", None)
-                    if handle_runout:
-                        handle_runout(self)
-                    # Checking to make sure runout_lane is set
-                    elif self.runout_lane is not None:
-                        self._perform_infinite_runout()
-                    else:
-                        self._perform_pause_runout()
+                    handled = handle_runout(self) if handle_runout else False
+                    if not handled:
+                        # Checking to make sure runout_lane is set
+                        if self.runout_lane is not None:
+                            self._perform_infinite_runout()
+                        else:
+                            self._perform_pause_runout()
                 elif self.status != "calibrating":
                     self.set_unloaded()
 

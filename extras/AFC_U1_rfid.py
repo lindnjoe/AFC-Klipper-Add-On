@@ -13,12 +13,10 @@ import re
 from typing import TYPE_CHECKING, Optional, Dict
 
 if TYPE_CHECKING:
-    from extras.AFC import afc
     from extras.AFC_lane import AFCLane
 
 from extras.AFC_RFID import (
-    color_name, color_label, color_distance, density_for_material,
-    log_new_filament, log_new_spool,
+    color_name, color_label,
     get_auto_spoolman_create, apply_filament_defaults,
     sync_rfid_to_spoolman,
 )

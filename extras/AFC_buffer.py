@@ -94,12 +94,12 @@ class AFCBuffer:
             self.trailing_pin       = config.get('trailing_pin') # Trailing pin for buffer
 
             self.adv_filament_switch_name = "{}_{}".format(self.name, "expanded")
-            self.fila_avd = add_filament_switch(self.adv_filament_switch_name, self.advance_pin,
-                                                self.printer, show_sensor=self.enable_sensors_in_gui)
+            self.fila_avd, _ = add_filament_switch(self.adv_filament_switch_name, self.advance_pin,
+                                                   self.printer, show_sensor=self.enable_sensors_in_gui)
 
             self.trail_filament_switch_name = "{}_{}".format(self.name, "compressed")
-            self.fila_trail = add_filament_switch(self.trail_filament_switch_name, self.trailing_pin,
-                                                  self.printer, show_sensor=self.enable_sensors_in_gui)
+            self.fila_trail, _ = add_filament_switch(self.trail_filament_switch_name, self.trailing_pin,
+                                                     self.printer, show_sensor=self.enable_sensors_in_gui)
 
             # Turtleneck Buffer
             self.buttons.register_buttons([self.advance_pin], self.advance_callback)
@@ -1426,7 +1426,7 @@ class AFCFPSBuffer(AFCBuffer):
         deadband_high = new_set_point + half_db
         if deadband_low <= self.low_point or deadband_high >= self.high_point:
             error_msg = "DEADBAND is too wide for the configured FPS thresholds"
-            raise gcmd.error()
+            raise gcmd.error(error_msg)
 
         self.set_point = new_set_point
         self.deadband = new_deadband

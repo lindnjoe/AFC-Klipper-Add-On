@@ -847,7 +847,7 @@ class afcAMS(afcUnit):
         if FollowerController is not None and self.oams is not None:
             try:
                 self._follower = FollowerController(
-                    self.oams, self.printer, self.logger)
+                    {self.oams_name: self.oams}, self.afc.reactor, self.logger)
             except Exception as e:
                 self.logger.error(f"Failed to init follower: {e}")
 
@@ -2477,6 +2477,7 @@ class afcAMS(afcUnit):
                 self._wait_for_idle()
                 success, msg = self.oams.unload_spool()
             except Exception as e:
+                self.logger.debug(f"TD-1 unload attempt {attempt+1} failed: {e}")
                 success = False
             if success:
                 self.logger.info(f"TD-1 unload completed for {cur_lane.name}")
@@ -2596,7 +2597,6 @@ class afcAMS(afcUnit):
         self.logger.raw(f"TD-1 calibration: continuous load for {cur_lane.name}")
 
         FPS_STOP_THRESHOLD = 0.45
-        TD1_POLL_INTERVAL = 2.0
 
         self.oams.action_status = OAMSStatus.LOADING
         try:
@@ -2752,7 +2752,7 @@ class afcAMS(afcUnit):
             self.oams.oams_load_spool_cmd.send([spool_index])
         except Exception as e:
             self.oams.action_status = None
-            return False, "Failed to start spool load"
+            return False, f"Failed to start spool load: {e}"
 
         hub_timeout = self.afc.reactor.monotonic() + 10.0
         hub_detected = False
@@ -3081,7 +3081,6 @@ class FollowerController:
                 return False
             if hasattr(mcu, 'is_shutdown'):
                 return not mcu.is_shutdown()
-            reactor = getattr(mcu, '_reactor', None) or self.reactor
             if hasattr(mcu, 'get_last_clock'):
                 last_clock = mcu.get_last_clock()
                 return last_clock is not None and last_clock > 0
@@ -3551,7 +3550,6 @@ class OAMSMonitor:
         try:
             encoder = self._oams.encoder_clicks
             pressure = float(getattr(self.fps, 'fps_value', 0.5))
-            hub_values = getattr(self._oams, 'hub_hes_value', None)
 
             # Calculate encoder delta
             encoder_delta = 0
