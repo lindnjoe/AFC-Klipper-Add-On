@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2026-07-03]
+### Added
+- Defaulting `tool_max_unload_attempts` to zero in Snapmaker U1 AFC config file.
+- Defaulting `restore_extruder_temp_on_load_or_unload` to True in Snapmaker U1 AFC config file.
+- Defaulting print_current for EMU lanes to 0.4 since having print current at 0.8 can risk melting PLA filament.
+- Ability to disable purging after first toolswap for standalone toolheads. This is enabled by default, to disable add `enable_standalone_purge: False` to AFC.cfg or per toolhead in AFC_extruder config sections.
+
+## [2026-06-27]
+### Added
+- The ability to purge on next toolchange for standalone toolheads
+- When running bowden calibration on Snapmaker printers, the toolhead is now moved to Y120 so filament can reach the gears during calibration. Without this move, filament can catch on the inside lip of the toolhead and produce an inaccurate bowden length.
+
+### Fixed
+- Improved extruder stepper enable/disable handling to avoid redundant updates and gracefully handle missing enable lines.
+- Fixed extruder sync/unsync so repeated calls don’t re-trigger the same actions.
+- Improved TMC current switching to reliably alternate between load and print modes.
+
+## [2026-06-21]
+### Added
+- Ability to have AFC_extruder config section a custom name thats not `extruder(x)`, if `extruder(x)` is not being used then `extruder_name` variable needs to have the correct toolhead extruder name.
+### Fixed
+- Issue where adding `enable_tool_runout: False` would cause klipper to crash with message `Internal error during connect: cannot unpack non-iterable SwitchSensor object`
+
+## [2026-06-20]
+### Fixed
+- Setting toolhead leds correctly during PREP for toolchangers
+### Added
+- Support for updating Snapmaker U1 print_task_config object with proper filament color, material, name, etc.
+
+## [2026-06-19]
+### Added
+- Added support for HTLF2-Claymore Unit type.
+### Fixed
+- Fixed lane and unit ordering so that units and lanes show correctly in Fluidd/Mainsail panels
+
 ## [2026-06-07]
 ### Added
 - Added support for toolhead sensor runout for standalone toolheads for toolchangers
@@ -67,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2026-04-04]
 ### Fixed
 - Fixed issue where lane was trying to be looked up by keyname with `self.current` when the property returned `None`. Switched to using `self.lanes.get` since this is a safer operation.
+
+## [2026-04-01]
+### Added
+- Added support in the `install-afc.sh` script for the HTLF Claymore.
 
 ## [2026-03-30]
 ### Fixed

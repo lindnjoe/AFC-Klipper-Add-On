@@ -56,6 +56,7 @@ template_unit_files() {
 
   case "${installation_type}" in
     "HTLF") MCU="${htlf_board_type}" ;;
+    "Claymore") MCU="${htlf2_board_type}" ;;
     "BoxTurtle (4-Lane)") MCU="AFC" ;;
     "NightOwl") MCU="ERB" ;;
     *) MCU="UNKNOWN" ;;  # Optional: fallback
@@ -100,6 +101,14 @@ copy_unit_files() {
     safe_copy "${afc_path}/templates/AFC_Hardware-HTLF.cfg" "${afc_config_dir}/AFC_Hardware.cfg"
     ;;
 
+  "Claymore")
+    local board_type="$htlf2_board_type"
+    boxturtle_name="Claymore_1"
+    safe_copy "${afc_path}/config/mcu/AFC_Lite_Claymore.cfg" "${afc_config_dir}/mcu/"
+    safe_copy "${afc_path}/templates/AFC_Claymore_1-${board_type}.cfg" "${afc_config_dir}/AFC_${boxturtle_name}.cfg"
+    safe_copy "${afc_path}/templates/AFC_Hardware-HTLF.cfg" "${afc_config_dir}/AFC_Hardware.cfg"
+    ;;
+
   "QuattroBox")
     safe_copy "${afc_path}/templates/AFC_Hardware-QuattroBox.cfg" "${afc_config_dir}/AFC_Hardware.cfg"
     safe_copy "${afc_path}/templates/qb_macros/Eject_buttons.cfg" "${afc_config_dir}/macros/Eject_buttons.cfg"
@@ -135,8 +144,16 @@ copy_unit_files() {
     safe_copy "${afc_path}/templates/AFC_AMS_1.cfg" "${afc_config_dir}/AFC_AMS_1.cfg"
     ;;
 
+  "EMU")
+    export boxturtle_name="EMU_1"
+    safe_copy "${afc_path}/templates/AFC_Hardware-AFC.cfg" "${afc_config_dir}/AFC_Hardware.cfg"
+    generate_emu_config "$boxturtle_name" "$emu_num_lanes"
+    ;;
+
 esac
 }
+
+
 
 install_afc() {
   # Link the python extensions
@@ -236,6 +253,12 @@ elif [ "$installation_type" == "HTLF" ]; then
 
 - Ensure you update any necessary buffer information in the ${afc_config_dir}/AFC_Hardware.cfg file
   """
+elif [ "$installation_type" == "Claymore" ]; then
+  message+="""
+- Ensure you enter either your CAN bus or serial information in the ${afc_config_dir}/AFC_${boxturtle_name}.cfg file.
+
+- Ensure you update any necessary buffer information in the ${afc_config_dir}/AFC_Hardware.cfg file
+  """
 elif [ "$installation_type" == "QuattroBox" ]; then
   message+="""
 - You must update the ${afc_config_dir}/AFC_Hardware.cfg file to reference the proper buffer configuration and pins.
@@ -253,6 +276,12 @@ elif [ "$installation_type" == "ViViD" ]; then
 - Ensure you enter your serial information in the ${afc_config_dir}/AFC_Vivid_1.cfg file
 
 - Review the ${afc_config_dir}/AFC_Hardware.cfg file to reference the proper buffer configuration and pins.
+  """
+elif [ "$installation_type" == "EMU" ]; then
+  message+="""
+- Ensure you enter either your CAN bus or serial information for each lane in the ${afc_config_dir}/AFC_${boxturtle_name}.cfg file
+
+- The MCU board_pins configuration is at ${afc_config_dir}/mcu/EMU_${boxturtle_name}.cfg
   """
 fi
 

@@ -134,6 +134,7 @@ class AFCLane:
         self.td1_data           = {}
         self.runout_lane        = None
         self.status             = AFCLaneState.NONE
+        self.need_purge         = False
         # END TODO
 
         self.multi_hubs_found   = False
@@ -281,8 +282,8 @@ class AFCLane:
             show_sensor = True
             if not self.enable_sensors_in_gui or (self.sensor_to_show is not None and 'selector' not in self.sensor_to_show):
                 show_sensor = False
-            self.fila_selector = add_filament_switch(f"{self.name}_selector", self.selector,
-                                                     self.printer, show_sensor)
+            self.fila_selector, _ = add_filament_switch(f"{self.name}_selector", self.selector,
+                                                        self.printer, show_sensor)
             self._set_homing_endstop(query_endstops, ppins,
                                      self.selector, AFCHomingPoints.SELECTOR)
             buttons.register_buttons([self.selector], self.selector_callback)
@@ -2162,6 +2163,7 @@ class AFCLane:
             response["density"]=self.filament_density
             response["diameter"]=self.filament_diameter
             response["empty_spool_weight"]=self.empty_spool_weight
+            response["need_purge"] = self.need_purge
 
         response["remember_spool"]= bool(self.remember_spool)
         response["spool_id"]= int(self.spool_id) if self.spool_id else None
