@@ -1059,6 +1059,13 @@ class AFCLane:
         this by setting `capture_td1_when_loaded: True` and if hub is clear and toolhead is not loaded.
         """
         if self.td1_when_loaded:
+            # Stepperless units (ACE/OpenAMS) capture TD-1 via their own feed
+            # path (in prep_post_load), not the AFC stepper path below. Let the
+            # unit intercept: a non-None return means it handled it. Units without
+            # this hook (e.g. BoxTurtle) fall through unchanged.
+            hook = getattr(self.unit_obj, 'prep_capture_td1', None)
+            if hook is not None and hook(self) is not None:
+                return
             if not self.hub_obj.state and self.afc.function.get_current_lane_obj() is None:
                 self.get_td1_data()
             else:
@@ -1773,6 +1780,17 @@ class AFCLane:
         Captures TD-1 data for lane. Has error checking to verify that lane is loaded, hub is not blocked
         and that TD-1 device is still detected before trying to capture data.
         """
+        # Stepperless units (ACE/OpenAMS) can't use the AFC stepper moves below.
+        # They capture TD-1 via their own feed path (load to the TD-1 device,
+        # read, then unload/retract back). Delegate when the unit provides
+        # capture_td1_data; a non-None (success, msg) return means it handled it.
+        # Units without this hook (e.g. BoxTurtle) fall through unchanged.
+        hook = getattr(self.unit_obj, 'capture_td1_data', None)
+        if hook is not None:
+            result = hook(self)
+            if result is not None:
+                return result
+
         max_move_tries = 0
         status = True
         msg = ""

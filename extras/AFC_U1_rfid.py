@@ -13,10 +13,12 @@ import re
 from typing import TYPE_CHECKING, Optional, Dict
 
 if TYPE_CHECKING:
+    from extras.AFC import afc
     from extras.AFC_lane import AFCLane
 
 from extras.AFC_RFID import (
-    color_name, color_label,
+    color_name, color_label, color_distance, density_for_material,
+    log_new_filament, log_new_spool,
     get_auto_spoolman_create, apply_filament_defaults,
     sync_rfid_to_spoolman,
 )
@@ -104,6 +106,15 @@ class AFC_U1_RFID:
         # off so creating Spoolman entries is an explicit choice.
         self._scanner_auto_create = config.getboolean(
             'scanner_auto_create', False)
+        # Stable-read gate for scanner channels: require the same UID on N
+        # consecutive reads before acting. RFID antennas can return a corrupt or
+        # partial UID on a single read, and since a spool's identity IS its UID,
+        # one bad read spawns a junk Spoolman spool. Raise this (e.g. 2-3) when a
+        # scanner antenna gives flaky reads. Default 1 = act on the first read
+        # (unchanged behaviour). Lane channels are unaffected.
+        self._scanner_confirm_reads = config.getint(
+            'scanner_confirm_reads', 1, minval=1)
+        self._pending_confirm: Dict[int, tuple] = {}  # channel -> (uid, count)
         # Default auto-create for LANE reads via this reader (extruder1/2/3 etc.
         # whose unit/extruder are upstream-frozen and can't take the option). A
         # lane's unit/extruder auto_spoolman_create still overrides this.
@@ -153,7 +164,21 @@ class AFC_U1_RFID:
             return
         self.logger = self.afc.logger
         for lane_name, channel in self._cfg_channels.items():
-            lane = self._resolve_lane(lane_name)
+            lane, extruder = self._resolve_lane(lane_name)
+            if lane is None and extruder is not None:
+                # Combined unit on one toolhead (e.g. an ACE feeding e0): more
+                # than one lane shares the extruder, and the U1 cabinet antenna
+                # can only read a spool being presented (a loaded spool can't
+                # physically reach it). So there's no single lane to attribute
+                # to — act as a standalone scanner that stages next_spool_id for
+                # whichever lane loads next. The scanner-channel registration
+                # loop below wires it up.
+                self._cfg_scanner_channels.add(channel)
+                n = len(getattr(extruder, 'lanes', {}))
+                self.logger.info(
+                    f"U1 RFID: '{lane_name}' is a combined extruder ({n} lanes) "
+                    f"— ch{channel} acts as a spool scanner (stages next spool)")
+                continue
             if lane is None:
                 self.logger.warning(
                     f"U1 RFID: configured lane '{lane_name}' not found in AFC "
@@ -228,23 +253,29 @@ class AFC_U1_RFID:
             "U1 RFID: could not locate print_task_config RFID callback to patch")
 
     def _resolve_lane(self, name):
-        """Resolve a configured name to a lane object.
+        """Resolve a configured name to a lane or a combined extruder.
 
         Tries the AFC lane registry first (lane name). For individual-extruder
         tool setups the name is often the *extruder* name, so fall back to the
-        single lane driving that extruder — matching either the AFC_extruder
-        section name (extruder_obj.name) or the toolhead extruder name
-        (extruder_obj.th_extruder_name, added upstream in v1.1.22). Returns None
-        if it can't be resolved unambiguously, logging what IS available so a
-        config mismatch is obvious.
+        lane(s) driving that extruder — matching either the AFC_extruder section
+        name (extruder_obj.name) or the toolhead extruder name
+        (extruder_obj.th_extruder_name, added upstream in v1.1.22).
+
+        Returns a ``(lane, extruder)`` pair:
+          * ``(lane, None)``  — resolved to a single AFC lane.
+          * ``(None, ext)``   — the name is an extruder fed by *multiple* lanes
+            (e.g. a combined ACE unit on one U1 toolhead). There's no single
+            lane to attribute to, so the caller treats the channel as a spool
+            scanner (stages next_spool_id) rather than failing.
+          * ``(None, None)``  — couldn't resolve; logs what IS available so a
+            config mismatch is obvious.
 
         :param name: configured name — an AFC lane name or an extruder name.
-        :return: the resolved AFCLane, or None if it can't be resolved
-            unambiguously.
+        :return tuple: ``(lane, extruder)`` per the cases above.
         """
         lane = self.afc.lanes.get(name)
         if lane is not None:
-            return lane
+            return lane, None
 
         def _ext_names(l):
             """Return the set of extruder names associated with a lane.
@@ -258,6 +289,7 @@ class AFC_U1_RFID:
                     getattr(e, 'th_extruder_name', None)}
 
         matches = [l for l in self.afc.lanes.values() if name in _ext_names(l)]
+        ext_obj = getattr(matches[0], 'extruder_obj', None) if matches else None
         # Also consult the extruder registry directly, in case a lane's
         # extruder_obj linkage isn't reflected in the scan above.
         if not matches:
@@ -270,15 +302,16 @@ class AFC_U1_RFID:
                         ext = e
                         break
             if ext is not None:
+                ext_obj = ext
                 matches = list(getattr(ext, 'lanes', {}).values())
 
         if len(matches) == 1:
-            return matches[0]
+            return matches[0], None
         if len(matches) > 1:
-            self.logger.warning(
-                f"U1 RFID: '{name}' matches {len(matches)} lanes on that "
-                f"extruder — use the specific lane name instead")
-            return None
+            # Combined unit: several lanes share one extruder/antenna. Signal the
+            # caller (non-None extruder) to treat the channel as a spool scanner
+            # rather than failing on the ambiguity.
+            return None, ext_obj
 
         # Nothing matched — surface what's registered so the user can correct
         # the config. (Upstream v1.1.22 made standalone lanes opt-in via
@@ -292,7 +325,7 @@ class AFC_U1_RFID:
             f"{avail_lanes}; extruders={avail_ext}. If '{name}' is a standalone "
             f"toolhead, ensure its [AFC_stepper] has 'standalone: True' and the "
             f"[AFC_extruder {name}] section exists.")
-        return None
+        return None, None
 
     def register_lane(self, lane: AFCLane, channel: int):
         """Register a lane to monitor a specific filament_detect channel.
@@ -638,6 +671,7 @@ class AFC_U1_RFID:
 
         card_uid = info.get("CARD_UID")
         if not card_uid or card_uid == 0:
+            self._pending_confirm.pop(channel, None)
             if self._last_uid.get(channel) not in (None, 0):
                 if not is_scanner:
                     self._last_uid[channel] = 0
@@ -658,6 +692,25 @@ class AFC_U1_RFID:
 
         if card_uid == self._last_uid.get(channel):
             return
+
+        # Scanner stable-read gate: discard intermittent corrupt/partial UID
+        # reads by requiring the same UID on N consecutive reads before acting.
+        # A different UID mid-confirmation resets the count, so a stable clean
+        # read wins over transient misreads. Only applies to scanner reads from
+        # the noisy filament_detect path — a webhook is an authoritative
+        # full-data push and acts immediately.
+        if (is_scanner and self._scanner_confirm_reads > 1
+                and source != 'webhook'):
+            pending, count = self._pending_confirm.get(channel, (None, 0))
+            count = count + 1 if card_uid == pending else 1
+            self._pending_confirm[channel] = (card_uid, count)
+            if count < self._scanner_confirm_reads:
+                self.logger.debug(
+                    f"U1 RFID: ch{channel} UID {self._fmt_uid(card_uid)} seen "
+                    f"{count}/{self._scanner_confirm_reads} — waiting for a "
+                    f"stable read")
+                return
+            self._pending_confirm.pop(channel, None)
 
         if not scanner_only and lane is None:
             return

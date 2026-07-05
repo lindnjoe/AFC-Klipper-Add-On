@@ -143,8 +143,7 @@ class LaneInfo:
     custom load/unload commands) used by ``LaneRegistry`` for lookups.
     """
     def __init__(self, lane_name, unit_name, spool_index, extruder,
-                 fps_name=None, hub_name=None, led_index=None,
-                 custom_load_cmd=None, custom_unload_cmd=None):
+                 fps_name=None, hub_name=None, led_index=None):
         """Store the lane's identifiers and optional hardware associations.
 
         :param lane_name: AFC lane name.
@@ -154,8 +153,6 @@ class LaneInfo:
         :param fps_name: optional FPS buffer name.
         :param hub_name: optional hub name.
         :param led_index: optional LED index for the lane.
-        :param custom_load_cmd: optional gcode command used to load this lane.
-        :param custom_unload_cmd: optional gcode command used to unload this lane.
         """
         self.lane_name = lane_name
         self.unit_name = unit_name
@@ -164,9 +161,6 @@ class LaneInfo:
         self.fps_name = fps_name
         self.hub_name = hub_name
         self.led_index = led_index
-        # self.custom_load_cmd = custom_load_cmd
-        # self.custom_unload_cmd = custom_unload_cmd
-
 
 class LaneRegistry:
     """Per-printer registry mapping OpenAMS lanes to spools and extruders.
@@ -210,8 +204,7 @@ class LaneRegistry:
             return cls._instances[key]
 
     def register_lane(self, lane_name, unit_name, spool_index, extruder, *,
-                      fps_name=None, hub_name=None, led_index=None,
-                      custom_load_cmd=None, custom_unload_cmd=None):
+                      fps_name=None, hub_name=None, led_index=None):
         """Register (or re-register) a lane and index it for fast lookup.
 
         Any existing registration for ``lane_name`` is removed first.
@@ -223,8 +216,6 @@ class LaneRegistry:
         :param fps_name: optional FPS buffer name.
         :param hub_name: optional hub name.
         :param led_index: optional LED index.
-        :param custom_load_cmd: optional load gcode command.
-        :param custom_unload_cmd: optional unload gcode command.
         :return LaneInfo: the newly created lane record.
         """
         with self._lock:
@@ -234,8 +225,7 @@ class LaneRegistry:
             info = LaneInfo(
                 lane_name=lane_name, unit_name=unit_name,
                 spool_index=spool_index, extruder=extruder,
-                fps_name=fps_name, hub_name=hub_name, led_index=led_index,
-                custom_load_cmd=custom_load_cmd, custom_unload_cmd=custom_unload_cmd,
+                fps_name=fps_name, hub_name=hub_name, led_index=led_index
             )
             self._lanes.append(info)
             self._by_lane_name[lane_name] = info
@@ -281,15 +271,6 @@ class LaneRegistry:
         with self._lock:
             return self._by_spool.get((unit_name, spool_index))
 
-    def resolve_lane_token(self, token):
-        """Resolve a lane name case-insensitively.
-
-        :param token: lane name token (any case).
-        :return LaneInfo: matching record or None.
-        """
-        with self._lock:
-            return self._by_lane_name_lower.get(token.lower())
-
     def resolve_lane_name(self, unit_name, spool_index):
         """Return the lane name for a (unit, spool) pair, or None.
 
@@ -299,15 +280,6 @@ class LaneRegistry:
         """
         info = self.get_by_spool(unit_name, spool_index)
         return info.lane_name if info else None
-
-    def resolve_extruder(self, lane_name):
-        """Return the extruder name a lane feeds, or None.
-
-        :param lane_name: AFC lane name.
-        :return str: extruder name or None.
-        """
-        info = self.get_by_lane(lane_name)
-        return info.extruder if info else None
 
 
 class AMSHardwareService:
@@ -414,25 +386,6 @@ class AMSHardwareService:
             self._reactor = self.printer.get_reactor()
         return self._reactor.monotonic()
 
-    def start_polling(self):
-        """Register the periodic sensor-poll timer (idempotent)."""
-        if self._polling_timer is not None:
-            return
-        if self._reactor is None:
-            self._monotonic()
-        if self._reactor is None:
-            return
-        self._polling_enabled = True
-        self._polling_timer = self._reactor.register_timer(
-            self._polling_callback, self._reactor.NOW + 1.0)
-
-    def stop_polling(self):
-        """Disable polling and unregister the poll timer if running."""
-        self._polling_enabled = False
-        if self._polling_timer is not None and self._reactor is not None:
-            self._reactor.unregister_timer(self._polling_timer)
-            self._polling_timer = None
-
     def _polling_callback(self, eventtime):
         """Reactor timer callback: poll status and publish sensor-change events.
 
@@ -510,14 +463,6 @@ class AMSHardwareService:
         with self._lock:
             self._status = dict(status)
 
-    def latest_status(self):
-        """Return a copy of the most recently cached controller status.
-
-        :return dict: copy of the cached status mapping.
-        """
-        with self._lock:
-            return dict(self._status)
-
     def update_lane_snapshot(self, unit_name, lane_name, lane_state,
                              hub_state, eventtime, *,
                              spool_index=None, tool_state=None,
@@ -568,18 +513,6 @@ class AMSHardwareService:
             self.event_bus.publish(event_type, unit_name=unit_name,
                                   lane_name=lane_name, spool_index=event_spool_index,
                                   eventtime=eventtime)
-
-    def latest_lane_snapshot(self, unit_name, lane_name):
-        """Return a copy of the cached snapshot for a lane, or None.
-
-        :param unit_name: owning OpenAMS unit name.
-        :param lane_name: AFC lane name.
-        :return dict: copy of the lane snapshot or None.
-        """
-        key = f"{unit_name}:{lane_name}"
-        with self._lock:
-            snapshot = self._lane_snapshots.get(key)
-        return dict(snapshot) if snapshot else None
 
     def resolve_lane_for_spool(self, unit_name, spool_index):
         """Resolve a lane name for a (unit, spool) pair via the registry.
@@ -731,12 +664,6 @@ class afcAMS(afcUnit):
         self.stuck_spool_pressure_threshold = config.getfloat(
             "stuck_spool_pressure_threshold", 0.08, minval=0.0)
 
-        # Engagement verification
-        self._engagement_pressure_max = config.getfloat(
-            "engagement_pressure_threshold", 0.6, minval=0.0)
-        self._engagement_pressure_min = config.getfloat(
-            "engagement_min_pressure", 0.25, minval=0.0)
-
         # Clog detection
         self.clog_sensitivity = config.get("clog_sensitivity", "medium").lower()
 
@@ -767,6 +694,15 @@ class afcAMS(afcUnit):
         self.gcode.register_mux_command(
             'AFC_OAMS_CLEAR_ERRORS', "UNIT", self.name, self.cmd_AFC_OAMS_CLEAR_ERRORS,
             desc="Clear OpenAMS errors and resync state")
+        # Internal global command for stuck-spool auto-recovery. Multiple afcAMS
+        # units share the printer gcode namespace, so ignore AlreadyRegistered.
+        try:
+            self.gcode.register_command(
+                '_AFC_OAMS_STUCK_RECOVERY',
+                self._cmd_stuck_spool_recovery,
+                desc="Internal: auto-recover from a stuck spool via unload+reload")
+        except Exception:
+            pass
 
         # Sensor polling state
         self._last_f1s = [None] * 4
@@ -811,9 +747,8 @@ class afcAMS(afcUnit):
                 slot = 0
             self._spool_map[lane_name] = slot
             # Load and unload both go through the unit_load_lane / unit_unload_lane
-            # hooks (below), not custom_load_cmd / custom_unload_cmd, so the shared
-            # toolhead phase lives in the unit driver and AFC.py needs no fork.
-            # Leave both custom_*_cmd unset so those upstream branches are taken.
+            # hooks (below), so the shared toolhead phase lives in the unit driver
+            # and AFC.py needs no fork.
             eng_len = getattr(lane, 'engagement_length', None)
             if eng_len is not None:
                 eng_speed = getattr(lane, 'engagement_speed', None) or self._engagement_speed
@@ -1109,6 +1044,30 @@ class afcAMS(afcUnit):
         self.afc.gcode.run_script_from_command(
             f"G92 E0\nG1 E{length:.3f} F{speed:.0f}\nM400")
 
+    def _advance_tool_stn_to_nozzle(self, cur_lane, already_advanced=0.0):
+        """Push filament from the toolhead sensor to the nozzle tip via tool_stn.
+
+        AFC's native load does a tool_stn (sensor->nozzle) extruder move, but the
+        unit_load_lane branch skips it, so a no-poop load would leave the tip at
+        the sensor. Extrude the sensor->nozzle distance minus whatever a prior
+        move (engagement verification) already advanced past the sensor.
+
+        :param cur_lane: the lane just loaded.
+        :param already_advanced: mm already extruded past the sensor (e.g. the
+            engagement length), subtracted from tool_stn.
+        """
+        ext = cur_lane.extruder_obj
+        tool_stn = getattr(ext, 'tool_stn', 0) or 0
+        remaining = tool_stn - (already_advanced or 0.0)
+        if remaining <= 0:
+            return
+        speed = getattr(ext, 'tool_load_speed', 25.0) * 60.0
+        self.logger.info(
+            f"OAMS load: advancing {remaining:.1f}mm to nozzle "
+            f"(tool_stn {tool_stn:.0f} - {already_advanced:.0f} already fed) for {cur_lane.name}")
+        self._oams_extrude(remaining, speed, "tool_stn_to_nozzle")
+        self.afc.afcDeltaTime.log_with_time("OAMS load: tool_stn to nozzle")
+
     # ── Stuck spool / clog detection callbacks ──────────────────────
 
     def _on_stuck_spool_detected(self, fps_name: str = None, message: str = None):
@@ -1123,9 +1082,22 @@ class afcAMS(afcUnit):
         if fps_name and fps_name not in msg:
             msg = f"{msg} (FPS: {fps_name})"
 
-        if self.stuck_spool_auto_recovery:
-            self.logger.info(f"{msg} — attempting auto recovery")
-            # TODO: implement auto-recovery (unload + reload + resume)
+        st = self._get_monitor_state()
+        lane_name = st.current_lane if st else None
+
+        # Error LED on the stuck bay.
+        if st and self._follower and st.current_spool_idx is not None:
+            try:
+                self._follower.set_led_error_if_changed(
+                    self.oams, self.oams_name, st.current_spool_idx, 1,
+                    "stuck spool detected")
+            except Exception as e:
+                self.logger.debug(f"stuck LED set failed: {e}")
+
+        # Auto-recover (unload + reload + resume) when enabled and the lane is
+        # known; otherwise pause for the user.
+        if self.stuck_spool_auto_recovery and lane_name:
+            self._on_stuck_spool_recovery_needed(fps_name, lane_name)
         else:
             if "paused" not in msg.lower():
                 msg += ". Print paused — check spool and resume."
@@ -1152,6 +1124,152 @@ class afcAMS(afcUnit):
         :param fps_name: FPS channel name whose stuck condition cleared.
         """
         self.logger.info(f"Stuck spool cleared{' on ' + fps_name if fps_name else ''}")
+
+    def _on_stuck_spool_recovery_needed(self, fps_name, lane_name):
+        """Trigger stuck spool recovery (unload + reload + resume).
+
+        Called from reactor timer context (non-blocking): schedules the recovery
+        gcode command, which runs in the gcode thread where blocking is safe.
+
+        :param fps_name: FPS buffer name that reported the stuck spool.
+        :param lane_name: lane currently loaded on that FPS.
+        """
+        self.logger.info(
+            f"Stuck spool recovery scheduled: fps={fps_name}, lane={lane_name}")
+        try:
+            self.gcode.run_script_from_command(
+                f"_AFC_OAMS_STUCK_RECOVERY LANE={lane_name} FPS={fps_name or ''}")
+        except Exception as e:
+            self.logger.error(
+                f"Failed to schedule stuck spool recovery for {lane_name}: {e}")
+            try:
+                self.gcode.run_script_from_command("PAUSE")
+            except Exception as pe:
+                self.logger.error(
+                    f"Failed to pause after recovery-schedule failure: {pe}")
+
+    def _cmd_stuck_spool_recovery(self, gcmd):
+        """Internal gcode command: full unload + reload + resume for a stuck spool.
+
+        Runs in the gcode thread so the blocking TOOL_UNLOAD/TOOL_LOAD are safe.
+
+        :param gcmd: gcode command supplying LANE and FPS.
+        """
+        lane_name = gcmd.get('LANE', None)
+        fps_name = gcmd.get('FPS', None)
+        lane = self.afc.lanes.get(lane_name) if lane_name else None
+        if lane is None:
+            self.logger.error(
+                f"Stuck spool recovery: lane '{lane_name}' not found, pausing")
+            self._stuck_spool_recovery_fallback(fps_name, lane_name, "lane not found")
+            return
+
+        self.logger.info(
+            f"Stuck spool auto-recovery starting: unload then reload for {lane_name}")
+
+        # Save toolhead position so AFC_RESUME can restore it afterwards.
+        self.afc.save_pos()
+
+        # Pause the print queue so no more gcode feeds from the sdcard.
+        pause_resume = self.printer.lookup_object("pause_resume", None)
+        if pause_resume is not None and not self.afc.function.is_paused():
+            pause_resume.send_pause_command()
+
+        # Z-hop to clear the part.
+        try:
+            pos = self.afc.gcode_move.last_position
+            self.afc.move_z_pos(pos[2] + self.afc.z_hop, "stuck_spool_recovery_zhop")
+        except Exception as e:
+            self.logger.warning(f"Stuck spool recovery: Z-hop failed: {e}")
+
+        try:
+            self.logger.info(f"Stuck spool recovery: unloading {lane_name}")
+            if not self.afc.TOOL_UNLOAD(lane, set_start_time=True):
+                raise RuntimeError(f"TOOL_UNLOAD returned False for {lane_name}")
+
+            # The unload retracts past the hub sensor, but filament inertia can
+            # briefly re-trigger it; TOOL_LOAD reads hub.state at the start and
+            # bails "Hub not clear" if set. Poll until it settles.
+            HUB_CLEAR_TIMEOUT = 5.0
+            HUB_POLL_INTERVAL = 0.1
+            hub = getattr(lane, 'hub_obj', None)
+            if hub is not None and hub.state:
+                reactor = self.printer.get_reactor()
+                waited = 0.0
+                while hub.state and waited < HUB_CLEAR_TIMEOUT:
+                    reactor.pause(reactor.monotonic() + HUB_POLL_INTERVAL)
+                    waited += HUB_POLL_INTERVAL
+                if hub.state:
+                    self.logger.warning(
+                        f"Stuck spool recovery: hub still active {waited:.1f}s after "
+                        f"unload of {lane_name} - proceeding with TOOL_LOAD anyway")
+
+            self.logger.info(f"Stuck spool recovery: reloading {lane_name}")
+            if not self.afc.TOOL_LOAD(lane, set_start_time=True):
+                raise RuntimeError(f"TOOL_LOAD returned False for {lane_name}")
+        except Exception as e:
+            self.logger.error(f"Stuck spool auto-recovery FAILED for {lane_name}: {e}")
+            self._stuck_spool_recovery_fallback(fps_name, lane_name, str(e))
+            return
+
+        self.logger.info(
+            f"Stuck spool auto-recovery SUCCEEDED for {lane_name}, resuming print")
+        self._stuck_spool_recovery_clear_oams_state(fps_name, lane_name)
+        try:
+            self.afc.error.reset_failure()
+            # AFC_RESUME guards on is_paused()==True before restoring the toolhead
+            # and restarting the SD card; a stray resume during recovery can clear
+            # the flag, so force it back so AFC_RESUME takes the full path.
+            if not self.afc.function.is_paused():
+                pr = self.printer.lookup_object("pause_resume", None)
+                if pr is not None:
+                    pr.is_paused = True
+            self.gcode.run_script_from_command("AFC_RESUME")
+        except Exception as e:
+            self.logger.error(f"Stuck spool recovery: AFC_RESUME failed: {e}")
+
+    def _stuck_spool_recovery_fallback(self, fps_name, lane_name, reason):
+        """Fall back to pausing when auto-recovery is not possible or fails.
+
+        :param fps_name: FPS buffer name.
+        :param lane_name: lane that was being recovered.
+        :param reason: human-readable failure reason.
+        """
+        msg = (
+            f"Stuck spool auto-recovery failed for {lane_name or fps_name}: {reason}.\n"
+            f"Please manually correct the issue, then run:\n"
+            f"  SET_LANE_LOADED LANE={lane_name}\n"
+            f"followed by AFC_OAMS_CLEAR_ERRORS")
+        self.logger.error(msg)
+        try:
+            self.afc.error.AFC_error(msg, pause=True)
+        except Exception as e:
+            self.logger.error(f"Failed to raise AFC error for stuck fallback: {e}")
+            try:
+                self.gcode.run_script_from_command("PAUSE")
+            except Exception:
+                pass
+
+    def _stuck_spool_recovery_clear_oams_state(self, fps_name, lane_name):
+        """Clear stuck-spool error state (LED + monitor) after a successful recovery.
+
+        :param fps_name: FPS buffer name (unused; kept for symmetry).
+        :param lane_name: lane that recovered (unused; kept for symmetry).
+        """
+        try:
+            st = self._get_monitor_state()
+            if st and st.current_spool_idx is not None and self._follower:
+                try:
+                    self._follower.clear_error_led(
+                        self.oams, self.oams_name, st.current_spool_idx,
+                        "stuck spool auto-recovery succeeded")
+                except Exception as e:
+                    self.logger.debug(f"clear_error_led failed: {e}")
+            if st:
+                st.stuck_active = False
+                st.stuck_start_time = None
+        except Exception as e:
+            self.logger.warning(f"Failed to clear stuck spool state: {e}")
 
     # ── Unit interface overrides ────────────────────────────────────
 
@@ -1209,17 +1327,6 @@ class afcAMS(afcUnit):
             self.logger.error(f"OpenAMS lane_unload failed: {e}")
         return True
 
-    def abort_load(self, cur_lane):
-        """Cancel in-progress OpenAMS load.
-
-        :param cur_lane: the lane whose load is being aborted.
-        """
-        if self.oams is not None:
-            try:
-                self.oams.abort_current_action(wait=True)
-            except Exception:
-                pass
-
     def get_lane_reset_command(self, lane, dis):
         """OpenAMS lanes don't support distance-based reset.
 
@@ -1228,32 +1335,6 @@ class afcAMS(afcUnit):
         :return: always None (no reset command available).
         """
         return None
-
-    def get_current_lane_fallback(self, tool_obj):
-        """Return the loaded lane name for this unit's extruder when on_shuttle is False.
-
-        :param tool_obj: the toolhead/extruder object (unused; scans own lanes).
-        :return str: name of the tool-loaded lane, or None.
-        """
-        for lane_name, lane in self.lanes.items():
-            if getattr(lane, 'tool_loaded', False):
-                return lane_name
-        return None
-
-    def on_lane_unset_loaded(self, lane, extruder_name):
-        """Cleanup after lane is unset — stop follower, clear runout state.
-
-        :param lane: the lane being unset.
-        :param extruder_name: name of the extruder it was loaded to.
-        """
-        lane._oams_runout_detected = False
-        if self._follower is not None and self.oams:
-            try:
-                self._follower.set_follower_state(
-                    self._get_monitor_state(), self.oams, 0, 0,
-                    "lane unset", force=True)
-            except Exception:
-                pass
 
     def system_Test(self, cur_lane, delay, assignTcmd, enable_movement):
         """OpenAMS system test — query hardware sensors for lane state.
@@ -1394,36 +1475,29 @@ class afcAMS(afcUnit):
         :param cur_lane: the lane whose extruder sensor is checked.
         :return bool: True if the toolhead sensor sees filament.
         """
-        sensor_obj = getattr(cur_lane.extruder_obj, 'filament_sensor_obj', None)
+        # The U1 toolhead motion sensor is stored by AFC_extruder as
+        # 'fila_tool_start' (when u1_filament_sensor_name is configured);
+        # 'filament_sensor_obj' is never assigned, so fall back to it.
+        sensor_obj = (getattr(cur_lane.extruder_obj, 'filament_sensor_obj', None)
+                      or getattr(cur_lane.extruder_obj, 'fila_tool_start', None))
         if sensor_obj is not None and hasattr(sensor_obj, 'runout_buttun_state'):
             return bool(sensor_obj.runout_buttun_state)
         return cur_lane.get_toolhead_pre_sensor_state()
 
     # ── Custom load/unload gcode handlers ───────────────────────────
     def unit_load_lane(self, cur_lane, cur_extruder) -> bool:
-        # TODO: do the same thing for ACE
-        # TODO: remove setting custom unload per lane, line 154/155
-        # TODO: add error handling
-        return self._oams_load_sequence(cur_lane, cur_extruder)
-
-    def _cmd_oams_custom_load(self, gcmd):
-        """Handle _OAMS_CUSTOM_LOAD — filament transport to toolhead area.
-
-        :param gcmd: gcode command; reads ``LANE``.
-        """
-        lane_name = gcmd.get('LANE')
-        cur_lane = self.afc.lanes.get(lane_name)
-        if cur_lane is None:
-            raise gcmd.error(f"Unknown lane: {lane_name}")
-        cur_extruder = cur_lane.extruder_obj
-        result = self._oams_load_sequence(cur_lane, cur_extruder)
-        if not result:
-            raise gcmd.error(f"OAMS load failed for {lane_name}")
+        if not self._oams_load_sequence(cur_lane, cur_extruder):
+            # Mirror the ACE: on total load failure (after _oams_load's retries)
+            # pause the print when printing, so a failed toolchange doesn't
+            # continue with no filament loaded. Returning False alone only resets
+            # toolchange stats in the core and never pauses.
+            self.afc.error.handle_lane_failure(
+                cur_lane, f"OpenAMS load failed for {cur_lane.name}",
+                pause=self.afc.function.in_print())
+            return False
+        return True
 
     def unit_unload_lane(self, cur_lane, cur_extruder) -> bool:
-        # TODO: do the same thing for ACE
-        # TODO: remove setting custom unload per lane, line 154/155
-        # TODO: add error handling
         self.afc.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
                         wait_tool=False)
         cur_lane.status = AFCLaneState.TOOL_UNLOADING
@@ -1442,20 +1516,6 @@ class afcAMS(afcUnit):
         cur_lane.status = AFCLaneState.NONE
         self.afc.save_vars()
         return True
-
-    def _cmd_oams_custom_unload(self, gcmd):
-        """Handle _OAMS_CUSTOM_UNLOAD — filament transport from toolhead.
-
-        :param gcmd: gcode command; reads ``LANE``.
-        """
-        lane_name = gcmd.get('LANE')
-        cur_lane = self.afc.lanes.get(lane_name)
-        if cur_lane is None:
-            raise gcmd.error(f"Unknown lane: {lane_name}")
-        cur_extruder = cur_lane.extruder_obj
-        result = self._oams_unload_sequence(cur_lane, cur_extruder)
-        if not result:
-            raise gcmd.error(f"OAMS unload failed for {lane_name}")
 
     def _oams_load_sequence(self, cur_lane, cur_extruder) -> bool:
         """OAMS load transport: push filament to toolhead area.
@@ -1478,7 +1538,7 @@ class afcAMS(afcUnit):
 
         AFC's load_sequence handles the shared toolhead engagement
         (sync_to_extruder, tool_end, tool_stn, sensor verification,
-        buffer ram) after this returns via custom_load_cmd.
+        buffer ram).
 
         :param cur_lane: the lane being loaded.
         :param cur_extruder: the lane's extruder object.
@@ -1556,7 +1616,7 @@ class afcAMS(afcUnit):
 
         AFC's unload_sequence handles the shared toolhead operations
         (LED, heat, quick pull, buffer disable, sync, cut/park/tip)
-        and unsync_to_extruder before calling this via custom_unload_cmd.
+        and unsync_to_extruder.
 
         :param cur_lane: the lane being unloaded.
         :param cur_extruder: the lane's extruder object.
@@ -1567,7 +1627,8 @@ class afcAMS(afcUnit):
         # OAMS hardware unload
         if not self._oams_unload(cur_lane):
             afc.error.handle_lane_failure(
-                cur_lane, f"OAMS unload failed for {cur_lane.name}")
+                cur_lane, f"OAMS unload failed for {cur_lane.name}",
+                pause=afc.function.in_print())
             return False
 
         # Finalize state. _oams_unload() already latched loaded_to_hub from the
@@ -1694,6 +1755,15 @@ class afcAMS(afcUnit):
                 # Verify engagement (skip if deferred to AFC's Phase 2)
                 engaged = True if self._defer_engagement else self._verify_engagement(cur_lane)
                 if engaged:
+                    # Advance filament to the nozzle via tool_stn so a no-poop
+                    # load ends at the nozzle (poop, if any, purges from there).
+                    # When engagement ran it already extruded engagement_length
+                    # past the sensor, so push only the remainder; when deferred
+                    # it extruded nothing, so push the full tool_stn.
+                    already = (0.0 if self._defer_engagement
+                               else self.get_engagement_params(cur_lane.name)[0])
+                    self._advance_tool_stn_to_nozzle(cur_lane, already_advanced=already)
+
                     # Enable follower and start monitor
                     if self._follower:
                         self._follower.enable_follower(
@@ -2477,8 +2547,8 @@ class afcAMS(afcUnit):
                 self._wait_for_idle()
                 success, msg = self.oams.unload_spool()
             except Exception as e:
-                self.logger.debug(f"TD-1 unload attempt {attempt+1} failed: {e}")
                 success = False
+                self.logger.debug(f"TD-1 unload attempt {attempt+1} failed: {e}")
             if success:
                 self.logger.info(f"TD-1 unload completed for {cur_lane.name}")
                 break
@@ -3058,14 +3128,6 @@ class FollowerController:
         if oams_name not in self.follower_state:
             self.follower_state[oams_name] = FollowerState()
         return self.follower_state[oams_name]
-
-    def get_oams(self, oams_name):
-        """Look up OAMS hardware object by name.
-
-        :param oams_name: OAMS hardware name.
-        :return: the OAMS hardware object, or None.
-        """
-        return self.oams.get(oams_name)
 
     def is_mcu_ready(self, oams):
         """Check if OAMS MCU is ready for commands.

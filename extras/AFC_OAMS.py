@@ -52,6 +52,18 @@ class OAMSOpCode:
     CANCEL = 6
 
 
+def _oams_enum_name(cls, value, kind):
+    """Human-readable name for an OAMSStatus/OAMSOpCode value, derived from the
+    matching class attribute (e.g. STOPPED -> 'stopped', NO_SPOOL_IN_BAY ->
+    'no spool in bay'). Falls back to '<kind> <value>' for unknown values.
+    """
+    return next(
+        (k.replace('_', ' ').lower()
+         for k, v in vars(cls).items()
+         if isinstance(v, int) and v == value),
+        f"{kind} {value}")
+
+
 class RetryState:
     """Per-spool bookkeeping for load-retry attempts.
 
@@ -176,9 +188,13 @@ class AFC_OAMS:
         self.auto_unload_on_failed_load = config.getboolean(
             "auto_unload_on_failed_load", True
         )
-        self.dock_load       = config.getboolean("dock_load", False)
-        self.post_load_purge = config.getfloat("post_load_purge", 0.0)
-        self.extra_retract   = config.getfloat("extra_retract", -10.0)
+
+        # Early stall detection during load: if the encoder stops advancing for
+        # load_stall_dwell seconds after an initial load_stall_grace spin-up, the
+        # spool is stuck -- bail out early instead of blocking the full 45s MCU
+        # timeout. Set load_stall_dwell to 0 to disable and keep old behaviour.
+        self.load_stall_grace = config.getfloat("load_stall_grace", 3.0, minval=0.0)
+        self.load_stall_dwell = config.getfloat("load_stall_dwell", 5.0, minval=0.0)
 
         # Retry state tracking
         self._load_retry_state       = {}
@@ -912,11 +928,52 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         """
         self.action_status = OAMSStatus.LOADING
         self.oams_load_spool_cmd.send([spool_idx])
-        timeout = self.reactor.monotonic() + 45.0
+        start          = self.reactor.monotonic()
+        timeout        = start + 45.0
+        stall_enabled  = self.load_stall_dwell > 0.0
+        last_clicks    = self.encoder_clicks
+        last_move_time = start
 
         while self.action_status is not None:
-            if self.reactor.monotonic() > timeout:
+            now = self.reactor.monotonic()
+
+            # Early stall detection: during a load the encoder ticks continuously
+            # as filament feeds. If it goes flat past the spin-up grace window the
+            # spool is stuck -- cancel and bail out rather than sitting the full
+            # 45s MCU timeout, which is a poor experience and delays recovery.
+            if stall_enabled and self.encoder_clicks != last_clicks:
+                last_clicks    = self.encoder_clicks
+                last_move_time = now
+            if (stall_enabled
+                    and now - start > self.load_stall_grace
+                    and now - last_move_time > self.load_stall_dwell):
+                self.logger.error(
+                    f"OAMS[{self.oams_idx}]: Load stalled - encoder stopped advancing "
+                    f"for {self.load_stall_dwell:.0f}s (spool stuck)"
+                )
+                try:
+                    self.load_spool_cancel()
+                except Exception as e:
+                    self.logger.warning(
+                        f"OAMS[{self.oams_idx}]: Failed to cancel stalled load: {e}"
+                    )
+                self.action_status      = None
+                self.action_status_code = OAMSOpCode.ERROR_UNSPECIFIED
+                return OAMSOpCode.ERROR_UNSPECIFIED, "OAMS load stalled (spool stuck, no encoder movement)"
+
+            if now > timeout:
                 self.logger.error(f"OAMS[{self.oams_idx}]: Load operation timed out after 45 seconds")
+                # The firmware is still running its load routine (e.g. a stuck
+                # spool that never trips the hub sensor). Clearing only the
+                # host-side action_status leaves the MCU wedged and it rejects
+                # every subsequent command with ERROR_BUSY until reboot, so send
+                # the firmware cancel to actually release it before we give up.
+                try:
+                    self.load_spool_cancel()
+                except Exception as e:
+                    self.logger.warning(
+                        f"OAMS[{self.oams_idx}]: Failed to cancel stuck load after timeout: {e}"
+                    )
                 self.action_status      = None
                 self.action_status_code = OAMSOpCode.ERROR_UNSPECIFIED
                 return OAMSOpCode.ERROR_UNSPECIFIED, "OAMS load operation timed out (MCU unresponsive)"
@@ -1047,6 +1104,17 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         if self.action_status is None:
             return
 
+        # Tell the firmware to actually stop the in-flight action. Clearing only
+        # the host-side action_status leaves the MCU wedged in its load routine,
+        # which then rejects every subsequent command with ERROR_BUSY until the
+        # unit is power-cycled.
+        try:
+            self.load_spool_cancel()
+        except Exception as e:
+            self.logger.warning(
+                f"OAMS[{self.oams_idx}]: Failed to send firmware cancel during abort: {e}"
+            )
+
         if wait:
             self.logger.debug(
                 f"OAMS[{self.oams_idx}]: Aborting current action {self.action_status} with code {code}"
@@ -1158,11 +1226,15 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             OAMSStatus.STOPPED,
         ):
             self.logger.debug(
-                f"OAMS status update (non-action) code={code} action={action}"
+                f"OAMS status update (non-action): "
+                f"{_oams_enum_name(OAMSStatus, action, 'action')} "
+                f"({_oams_enum_name(OAMSOpCode, code, 'code')})"
             )
         else:
             self.logger.debug(
-                f"OAMS status update (unhandled) code={code} action={action}"
+                f"OAMS status update (unhandled): "
+                f"{_oams_enum_name(OAMSStatus, action, 'action')} "
+                f"({_oams_enum_name(OAMSOpCode, code, 'code')})"
             )
 
     def float_to_u32(self, f):
