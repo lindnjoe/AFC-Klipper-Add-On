@@ -1049,7 +1049,6 @@ class AFCFPSBuffer(AFCBuffer):
                 self.last_state = NEUTRAL_STATE_NAME
                 self.advance_state = False
                 self.trailing_state = False
-
         # Update virtual filament sensors for GUI display
         self._update_virtual_sensors(read_time)
 
@@ -1064,14 +1063,12 @@ class AFCFPSBuffer(AFCBuffer):
         This prevents the indicator from going red during neutral state when
         filament IS loaded but pressure is balanced.
         """
-        # Filament is present if FPS reads above the low threshold
-        filament_present = self.smoothed_fps > self.low_point
         try:
             if hasattr(self, 'fila_adv') and self.fila_adv is not None:
                 self.fila_adv.runout_helper.note_filament_present(
-                    eventtime, filament_present)
+                    eventtime, self.advance_state)
         except TypeError:
-            self.fila_adv.runout_helper.note_filament_present(filament_present)
+            self.fila_adv.runout_helper.note_filament_present(self.advance_state)
         except Exception:
             pass
         try:
