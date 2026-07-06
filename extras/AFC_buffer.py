@@ -905,28 +905,19 @@ class AFCFPSBuffer(AFCBuffer):
 
         # Validate that low_point < set_point < high_point
         if self.low_point >= self.set_point:
-            raise error(
-                "AFC_FPS {}: low_point ({}) must be less than set_point ({})".format(
-                    self.name, self.low_point, self.set_point))
+            error_msg = (f"AFC_FPS {self.name}: low_point ({self.low_point}) "
+                f"must be less than set_point ({self.set_point})")
+            raise error(error_msg)
+
         if self.high_point <= self.set_point:
-            raise error(
-                "AFC_FPS {}: high_point ({}) must be greater than set_point ({})".format(
-                    self.name, self.high_point, self.set_point))
+            error_msg = (f"AFC_FPS {self.name}: high_point ({self.high_point}) "
+                f"must be greater than set_point ({self.set_point})")
+            raise error(error_msg)
 
         # Validate deadband doesn't exceed the available range
-        half_db = self.deadband / 2.0
-        if self.set_point - half_db <= self.low_point:
-            raise error(
-                "AFC_FPS {}: deadband ({}) too wide — neutral_low ({:.3f}) "
-                "must be above low_point ({})".format(
-                    self.name, self.deadband,
-                    self.set_point - half_db, self.low_point))
-        if self.set_point + half_db >= self.high_point:
-            raise error(
-                "AFC_FPS {}: deadband ({}) too wide — neutral_high ({:.3f}) "
-                "must be below high_point ({})".format(
-                    self.name, self.deadband,
-                    self.set_point + half_db, self.high_point))
+        error_msg = self._check_deadband(self.set_point, self.deadband)
+        if error_msg:
+            raise error(error_msg)
 
         # Smoothing factor for exponential moving average (0 = no smoothing, 1 = max)
         self.smoothing: float = config.getfloat('smoothing', 0.3, minval=0.0, maxval=0.95)
@@ -977,13 +968,40 @@ class AFCFPSBuffer(AFCBuffer):
                                         self.cmd_AFC_SET_FPS_SET_POINT,
                                         desc=self.cmd_AFC_SET_FPS_SET_POINT_help)
 
+    def _check_deadband(self, set_point: float, deadband: float)-> str:
+        """
+        Helper method for checking deadband to verify that its not greater/lower than high/low
+        set points.
+
+        :param set_point: Set point to calculate deadband from
+        :param deadband: Deadband value to calculate range with
+        :return str: If deadband is high/lower than high/low set points an error message is returned.
+        """
+        half_db = deadband / 2.0
+        deadband_low = set_point - half_db
+        deadband_high = set_point + half_db
+        error_msg = ""
+
+        if deadband_low <= self.low_point:
+            error_msg = (f"AFC_FPS {self.name}: deadband ({deadband}) too wide - "
+                f"neutral_low ({deadband_low:.3f}) must be above low_point ({self.low_point})")
+
+        if deadband_high >= self.high_point:
+            if error_msg: error_msg += "\n"
+            error_msg += (f"AFC_FPS {self.name}: deadband ({deadband}) too wide - "
+                f"neutral_high ({deadband_high:.3f}) must be below high_point ({self.high_point})")
+        return error_msg
+
     def get_fps_value(self) -> float:
-        """Get current FPS pressure value (0.0-1.0)."""
+        """
+        Get current FPS pressure value (0.0-1.0).
+        """
         return self.fps_value
 
     @property
     def buffer_triggered(self) -> bool:
-        """True when FPS reading indicates the buffer is compressed (at high_point).
+        """
+        True when FPS reading indicates the buffer is compressed (at high_point).
 
         This is the FPS equivalent of the turtleneck advance switch being
         triggered — used by tool_loaded_check to verify filament is loaded
@@ -993,7 +1011,8 @@ class AFCFPSBuffer(AFCBuffer):
 
     @property
     def buffer_trailing_triggered(self) -> bool:
-        """True when FPS reading indicates the buffer is stretched (at low_point).
+        """
+        True when FPS reading indicates the buffer is stretched (at low_point).
 
         This is the FPS equivalent of the turtleneck trailing switch being
         triggered — indicates the spool is not feeding fast enough or is stuck.
@@ -1004,7 +1023,9 @@ class AFCFPSBuffer(AFCBuffer):
     # ADC callback — runs at report_time intervals
     # ------------------------------------------------------------------
     def _adc_callback(self, read_time, read_value=None):
-        """Process ADC reading from FPS sensor."""
+        """
+        Process ADC reading from FPS sensor.
+        """
         if isinstance(read_time, list):
             if not read_time:
                 return
@@ -1036,7 +1057,7 @@ class AFCFPSBuffer(AFCBuffer):
         # If buffer was enabled before lane stepper wiring was ready,
         # lazily start correction once the lane exposes rotation control.
         if (self.enable and has_stepper
-                and not getattr(self, "_correction_running", False)):
+            and not getattr(self, "_correction_running", False)):
             self.reactor.update_timer(self.correction_timer, self.reactor.NOW)
             self._correction_running = True
         if not has_stepper:
@@ -1066,7 +1087,8 @@ class AFCFPSBuffer(AFCBuffer):
     # Correction timer — proportional adjustment loop
     # ------------------------------------------------------------------
     def _update_virtual_sensors(self, eventtime):
-        """Push buffer state into virtual filament sensors for GUI display.
+        """
+        Push buffer state into virtual filament sensors for GUI display.
 
         The advance sensor reports filament present whenever the FPS reads
         above low_point (any meaningful pressure = filament exists in buffer).
@@ -1074,7 +1096,8 @@ class AFCFPSBuffer(AFCBuffer):
         filament IS loaded but pressure is balanced.
         """
         try:
-            if hasattr(self, 'fila_adv') and self.fila_adv is not None:
+            if (hasattr(self, 'fila_adv')
+                and self.fila_adv is not None):
                 self.fila_adv.runout_helper.note_filament_present(
                     eventtime, self.advance_state)
         except TypeError:
@@ -1082,7 +1105,8 @@ class AFCFPSBuffer(AFCBuffer):
         except Exception:
             pass
         try:
-            if hasattr(self, 'fila_trail') and self.fila_trail is not None:
+            if (hasattr(self, 'fila_trail')
+                and self.fila_trail is not None):
                 self.fila_trail.runout_helper.note_filament_present(
                     eventtime, self.trailing_state)
         except TypeError:
@@ -1091,7 +1115,8 @@ class AFCFPSBuffer(AFCBuffer):
             pass
 
     def _correction_event(self, eventtime):
-        """Periodically adjust rotation distance based on FPS reading.
+        """
+        Periodically adjust rotation distance based on FPS reading.
 
         Uses continuous proportional correction across the full range.
         The further from set_point, the stronger the correction — no dead
@@ -1136,7 +1161,7 @@ class AFCFPSBuffer(AFCBuffer):
 
         # Flip cooldown — suppress rapid direction changes
         if (self._last_correction_direction in (ADVANCING_STATE_NAME, TRAILING_STATE_NAME)
-                and target_direction not in (NEUTRAL_STATE_NAME, self._last_correction_direction)):
+            and target_direction not in (NEUTRAL_STATE_NAME, self._last_correction_direction)):
             self._flip_suppress_until = eventtime + self.flip_cooldown
             self._last_correction_direction = NEUTRAL_STATE_NAME
 
@@ -1184,7 +1209,8 @@ class AFCFPSBuffer(AFCBuffer):
         # the reading is stuck at an extreme despite correction — that
         # indicates a real clog or feed failure.
         if self.fault_detection_enabled():
-            if reading <= self.high_point and reading >= self.low_point:
+            if (reading <= self.high_point
+                and reading >= self.low_point):
                 self.update_filament_error_pos()
 
         self._update_virtual_sensors(eventtime)
@@ -1194,7 +1220,8 @@ class AFCFPSBuffer(AFCBuffer):
     # Buffer enable / disable  (interface expected by AFCLane)
     # ------------------------------------------------------------------
     def enable_advance_latch(self):
-        """Enable latching so advance_state stays True once triggered.
+        """
+        Enable latching so advance_state stays True once triggered.
 
         Call before a load sequence. The latch prevents brief pressure
         drops between ACE motor pulses from clearing the sensor state.
@@ -1203,12 +1230,15 @@ class AFCFPSBuffer(AFCBuffer):
         self._advance_latched = False
 
     def clear_advance_latch(self):
-        """Disable latching and reset advance_state to real-time pressure."""
+        """
+        Disable latching and reset advance_state to real-time pressure.
+        """
         self._latch_enabled = False
         self._advance_latched = False
 
     def enable_buffer(self, lane):
-        """Enable the FPS buffer for the given lane.
+        """
+        Enable the FPS buffer for the given lane.
 
         For stepper-based units (BoxTurtle, etc.) this also starts the
         proportional correction timer that adjusts rotation distance.
@@ -1262,7 +1292,9 @@ class AFCFPSBuffer(AFCBuffer):
         self.logger.debug(f"{self.name} FPS buffer enabled for {self.current_lane.name} (correction={'active' if has_stepper else 'off/adc-only'})")
 
     def disable_buffer(self):
-        """Disable the FPS buffer, reset multiplier, stop timers."""
+        """
+        Disable the FPS buffer, reset multiplier, stop timers.
+        """
         self.enable = False
         self._latch_enabled = False
         self._advance_latched = False
@@ -1305,7 +1337,9 @@ class AFCFPSBuffer(AFCBuffer):
     # Multiplier control  (same interface as AFCBuffer)
     # ------------------------------------------------------------------
     def set_multiplier(self, multiplier):
-        """Apply rotation distance multiplier to current lane's stepper."""
+        """
+        Apply rotation distance multiplier to current lane's stepper.
+        """
         if not self.enable: return
         if self.current_lane is None: return
         if not self._lane_has_rotation_control(self.current_lane): return
@@ -1314,7 +1348,9 @@ class AFCFPSBuffer(AFCBuffer):
         self.current_lane.update_rotation_distance(multiplier)
 
     def reset_multiplier(self):
-        """Reset rotation distance back to base value."""
+        """
+        Reset rotation distance back to base value.
+        """
         if self.current_lane is None: return
         if not self._lane_has_rotation_control(self.current_lane): return
 
@@ -1323,7 +1359,9 @@ class AFCFPSBuffer(AFCBuffer):
         self.logger.debug("FPS buffer multiplier reset for {}".format(self.current_lane.name))
 
     def _lane_has_rotation_control(self, lane) -> bool:
-        """Return True when lane supports AFC stepper rotation adjustments."""
+        """
+        Return True when lane supports AFC stepper rotation adjustments.
+        """
         if lane is None: return False
 
         drive_stepper = getattr(lane, 'drive_stepper', None)
@@ -1352,8 +1390,8 @@ class AFCFPSBuffer(AFCBuffer):
             lane_extruder_name = getattr(getattr(cur_lane, 'extruder_obj', None),
                                          'th_extruder_name', None)
             if (lane_extruder_name
-                    and hasattr(active_extruder, 'name')
-                    and active_extruder.name != lane_extruder_name):
+                and hasattr(active_extruder, 'name')
+                and active_extruder.name != lane_extruder_name):
                 return eventtime + CHECK_RUNOUT_TIMEOUT
 
         extruder_pos = self.get_extruder_pos()
@@ -1378,13 +1416,18 @@ class AFCFPSBuffer(AFCBuffer):
     # ------------------------------------------------------------------
     cmd_QUERY_BUFFER_help = "Report FPS buffer sensor state"
     cmd_QUERY_BUFFER_options = {"BUFFER": {"type": "string", "default": ""}}
-
     def cmd_QUERY_BUFFER(self, gcmd):
         """
         Reports the current state of the FPS buffer sensor including the
         current FPS reading, smoothed value, and rotation distance.
 
-        Usage: ``QUERY_BUFFER BUFFER=<buffer_name>``
+        Usage
+        -----
+        `QUERY_BUFFER BUFFER=<buffer_name>`
+
+        Example
+        -----
+        `QUERY_BUFFER BUFFER=FPS_Buffer1`
         """
         state_mapping = {
             ADVANCING_STATE_NAME: ' (buffer compressed - filament loaded)',
@@ -1418,21 +1461,25 @@ class AFCFPSBuffer(AFCBuffer):
         """
         Adjust the FPS target set point and deadband while running.
 
-        Usage: ``SET_FPS_SET_POINT BUFFER=<name> SET_POINT=<0.1-0.9> [DEADBAND=<0.0-0.6>]``
+        Usage
+        -----
+        `SET_FPS_SET_POINT BUFFER=<name> SET_POINT=<0.1-0.9> [DEADBAND=<0.0-0.6>]`
+
+        Example
+        -----
+        `SET_FPS_SET_POINT BUFFER=FPS_Buffer1 SET_POINT=0.1 DEADBAND=0.5`
         """
-        # TODO: turn this into a common method to validate and put validating in __INIT__
-        # into the common method as well
         new_set_point = gcmd.get_float('SET_POINT', self.set_point, minval=0.1, maxval=0.9)
         new_deadband = gcmd.get_float('DEADBAND', self.deadband, minval=0.0, maxval=0.6)
         half_db = new_deadband / 2.0
+
         if new_set_point <= self.low_point or new_set_point >= self.high_point:
             error_msg = (f"SET_POINT must be between low_point({self.low_point}) "
                          f"and high_point({self.high_point})")
             raise gcmd.error(error_msg)
-        deadband_low = new_set_point - half_db
-        deadband_high = new_set_point + half_db
-        if deadband_low <= self.low_point or deadband_high >= self.high_point:
-            error_msg = "DEADBAND is too wide for the configured FPS thresholds"
+
+        error_msg = self._check_deadband(new_set_point, new_deadband)
+        if error_msg:
             raise gcmd.error(error_msg)
 
         self.set_point = new_set_point
