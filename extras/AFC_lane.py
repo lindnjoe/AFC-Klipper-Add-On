@@ -951,6 +951,17 @@ class AFCLane:
         speed_mode (Enum SpeedMode): Identifies which speed to use.
         assist_active (Enum AssistActive): Determines to force assist or to dynamically determine.
         """
+        # Stepperless units (ACE/OpenAMS) have no drive stepper, so the stepper
+        # move below is a silent no-op for their lanes. Delegate to the unit's
+        # lane_move (serial/firmware-driven) when it provides one — this is what
+        # makes LANE_MOVE work for those lanes.
+        unit_obj = getattr(self, 'unit_obj', None)
+        if (unit_obj is not None
+                and getattr(unit_obj, 'stepperless_drive', False)
+                and hasattr(unit_obj, 'lane_move')):
+            unit_obj.lane_move(self, distance, speed_mode)
+            return
+
         speed, accel = self.get_speed_accel(speed_mode)
 
         assist = self.get_active_assist(distance, assist_active)

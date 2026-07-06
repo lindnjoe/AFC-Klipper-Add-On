@@ -2478,8 +2478,15 @@ class afcACE(afcUnit):
         for lane in self.lanes.values():
             ext_obj = getattr(lane, 'extruder_obj', None)
             if (ext_obj is None
-                    or getattr(ext_obj, 'name', None) != active_ext
-                    or not getattr(lane, 'tool_loaded', False)):
+                or not getattr(lane, 'tool_loaded', False)):
+                continue
+            # toolhead.get_extruder() reports the PHYSICAL Klipper extruder
+            # name, which can differ from the [AFC_extruder] section name
+            # (extruder_name:/th_extruder_name override). Match either, or
+            # SET_LANE_LOADED-recovered lanes never get assist re-enabled.
+            ext_names = {getattr(ext_obj, 'name', None),
+                         getattr(ext_obj, 'th_extruder_name', None)}
+            if active_ext not in ext_names:
                 continue
             if getattr(ext_obj, 'lane_loaded', None) == lane.name:
                 return lane.name
@@ -2505,8 +2512,8 @@ class afcACE(afcUnit):
         slot = self._slot_map.get(name)
         lane = self.afc.lanes.get(name)
         if (slot is not None and lane is not None
-                and self._use_feed_assist(lane)
-                and self._feed_assist_active != {slot}):
+            and self._use_feed_assist(lane)
+            and self._feed_assist_active != {slot}):
             self.logger.info(
                 "ACE assist watchdog: enabling feed assist for %s (slot %d)"
                 % (name, slot))

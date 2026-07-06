@@ -252,15 +252,6 @@ class LaneRegistry:
             if not extruder_lanes:
                 self._by_extruder.pop(info.extruder, None)
 
-    def get_by_lane(self, lane_name):
-        """Return the LaneInfo for a lane name, or None.
-
-        :param lane_name: AFC lane name to look up.
-        :return LaneInfo: matching record or None.
-        """
-        with self._lock:
-            return self._by_lane_name.get(lane_name)
-
     def get_by_spool(self, unit_name, spool_index):
         """Return the LaneInfo for a (unit, spool) pair, or None.
 
@@ -2088,87 +2079,6 @@ class afcAMS(afcUnit):
 
         gcmd.respond_info("OpenAMS errors cleared and state resynced")
 
-    # ── Hardware event handler ──────────────────────────────────────
-
-    def handle_openams_lane_tool_state(
-        self, lane_name: str, loaded: bool, *,
-        spool_index: Optional[int] = None,
-        eventtime: Optional[float] = None
-    ) -> bool:
-        """Update lane/tool state from OpenAMS hardware events.
-
-        Scopes lookups to the event lane's own extruder to avoid
-        cross-extruder interference in multi-extruder setups.
-
-        :param lane_name: name of the lane the event concerns.
-        :param loaded: True when the spool became tool-loaded, False when unloaded.
-        :param spool_index: optional spool index reported with the event.
-        :param eventtime: optional reactor time; defaults to now.
-        :return bool: True if the event was applied (lane resolved).
-        """
-        lane = self._resolve_lane_reference(lane_name)
-        if lane is None:
-            self.logger.warning(
-                f"OpenAMS reported lane {lane_name} but cannot resolve it")
-            return False
-
-        if eventtime is None:
-            eventtime = self.afc.reactor.monotonic()
-
-        if loaded:
-            lane.loaded_to_hub = True
-
-            # Check if a different lane is loaded on THIS lane's extruder
-            lane_extruder_obj = getattr(lane, "extruder_obj", None)
-            prev_name = getattr(lane_extruder_obj, "lane_loaded", None) if lane_extruder_obj else None
-            if prev_name and prev_name != lane.name and prev_name in self.afc.lanes:
-                prev_lane = self.afc.lanes[prev_name]
-                try:
-                    prev_lane.unsync_to_extruder()
-                    prev_lane.set_tool_unloaded()
-                except Exception as e:
-                    self.logger.error(f"Failed to unset previous lane {prev_name}: {e}")
-
-            try:
-                lane.set_tool_loaded()
-            except Exception as e:
-                self.logger.error(f"Failed to mark lane {lane.name} as loaded: {e}")
-
-            try:
-                lane.sync_to_extruder()
-            except Exception as e:
-                self.logger.error(f"Failed to sync lane {lane.name}: {e}")
-
-            try:
-                self.afc.save_vars()
-            except Exception:
-                pass
-            return True
-
-        # Unload path — scope to lane's own extruder
-        lane_extruder_obj = getattr(lane, "extruder_obj", None)
-        ext_lane_loaded = getattr(lane_extruder_obj, "lane_loaded", None) if lane_extruder_obj else None
-
-        if (ext_lane_loaded == lane.name) or getattr(lane, "tool_loaded", False):
-            try:
-                lane.unsync_to_extruder()
-            except Exception as e:
-                self.logger.error(f"Failed to unsync lane {lane.name}: {e}")
-            try:
-                lane.set_tool_unloaded()
-            except Exception as e:
-                self.logger.error(f"Failed to unload lane {lane.name}: {e}")
-            try:
-                self.afc.save_vars()
-            except Exception:
-                pass
-
-        # Clear extruder tracking if it still points to this lane
-        if lane_extruder_obj and getattr(lane_extruder_obj, "lane_loaded", None) == lane.name:
-            lane_extruder_obj.lane_loaded = None
-
-        return True
-
     # ── Same-FPS runout handling ───────────────────────────────────
 
     def _should_block_sensor_for_runout(self, lane, new_val):
@@ -2272,52 +2182,6 @@ class afcAMS(afcUnit):
         self.logger.info(
             f"Same-FPS reload complete: {target_name} now active")
         return True
-
-    def handle_runout_detected(self, spool_index, monitor=None, lane_name=None):
-        """Handle runout from OpenAMS hardware.
-
-        Classifies the runout as same-extruder (seamless reload) or
-        other (defers to AFC's normal infinite spool / pause logic).
-
-        :param spool_index: spool index reported by the hardware.
-        :param monitor: optional originating monitor (unused).
-        :param lane_name: optional lane name fallback when the index doesn't resolve.
-        """
-        lane = self._lane_for_spool_index(spool_index)
-        if lane is None and lane_name:
-            lane = self._resolve_lane_reference(lane_name)
-        if lane is None:
-            self.logger.warning(
-                f"Cannot resolve lane for runout spool {spool_index}")
-            return
-
-        runout_lane_name = getattr(lane, 'runout_lane', None)
-        if not runout_lane_name:
-            self.logger.info(
-                f"Runout on {lane.name} — no runout_lane configured, pausing")
-            self.afc.error.AFC_error(
-                f"Runout detected on {lane.name}", pause=True)
-            return
-
-        target_lane = self._resolve_lane_reference(runout_lane_name)
-        if target_lane is None:
-            self.logger.warning(
-                f"Runout lane '{runout_lane_name}' not found for {lane.name}")
-            self.afc.error.AFC_error(
-                f"Runout detected on {lane.name}", pause=True)
-            return
-
-        if self._is_same_extruder(lane, target_lane):
-            lane._oams_runout_detected = True
-            self.logger.info(
-                f"Same-extruder runout on {lane.name}, "
-                f"seamless reload to {target_lane.name}")
-            self.handle_same_fps_reload(lane, target_lane)
-        else:
-            lane._oams_runout_detected = False
-            self.logger.info(
-                f"Cross-extruder runout on {lane.name} -> {target_lane.name}, "
-                "deferring to AFC infinite spool handling")
 
     def check_runout(self, lane=None):
         """OAMS runout: only trigger when printing AND this lane is loaded to its extruder.
@@ -2977,19 +2841,6 @@ class afcAMS(afcUnit):
         for name, lane in self.afc.lanes.items():
             if name.lower() == lower:
                 return lane
-        return None
-
-    def _lane_for_spool_index(self, spool_index: Optional[int]):
-        """Find lane by spool index.
-
-        :param spool_index: the spool/bay index to look up.
-        :return: the matching AFCLane object, or None.
-        """
-        if spool_index is None:
-            return None
-        for name, idx in self._spool_map.items():
-            if idx == spool_index and name in self.afc.lanes:
-                return self.afc.lanes[name]
         return None
 
     def _wait_for_idle(self, timeout: float = 30.0) -> bool:
