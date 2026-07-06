@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import traceback
+import inspect
 
 from configparser import Error as error
 
@@ -858,16 +859,23 @@ class AFCFPSBuffer(AFCBuffer):
         self.reversed: bool = config.getboolean('reversed', False)
 
         # Setup ADC sampling — handle both Klipper and Kalico APIs
-        # TODO: verify this
-        try:
-            self.adc.setup_adc_sample(self.sample_time, self.sample_count)
-        except Exception:
+        if hasattr(self.adc, "setup_minmax"): # Kalico has this
+            self.logger.info("Kalico setup ADC")
             self.adc.setup_minmax(self.sample_time, self.sample_count)
+        else:
+            adc_sig = inspect.signature(self.adc.setup_adc_sample)
+            sig_keys = list(adc_sig.parameters.keys())
+            if "report_time" in sig_keys: # Newer Klipper has report_time key
+                self.adc.setup_adc_sample(self.report_time, self.sample_time, self.sample_count)
+            else:
+                self.adc.setup_adc_sample(self.sample_time, self.sample_count)
 
         # Register ADC callback
-        try:
+        adc_callback_sig = inspect.signature(self.adc.setup_adc_callback)
+        sig_keys = list(adc_callback_sig.parameters.keys())
+        if "report_time" in sig_keys: # Newer Klipper has report time key
             self.adc.setup_adc_callback(self.report_time, self._adc_callback)
-        except TypeError:
+        else: # Kalico/Older Klipper versions
             self.adc.setup_adc_callback(self._adc_callback)
 
         # ---- Buffer tuning parameters ----
