@@ -151,10 +151,10 @@ class AFCExtruderStepper(AFCLane):
 
         # Get and save base rotation dist
         self.base_rotation_dist = self.extruder_stepper.stepper.get_rotation_distance()[0]
-    
+
     def _handle_ready(self):
         super()._handle_ready()
-        
+
         if (self.buffer_obj
             and self.buffer_obj.type == "FPS_PFS"):
             self._add_endstop('tool_start', None, f'{self.name}_tool_start',

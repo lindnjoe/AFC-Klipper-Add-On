@@ -889,6 +889,8 @@ class AFCFPSBuffer(AFCBuffer):
         self.low_point: float = config.getfloat('low_point', _lp_default, minval=0.0, maxval=0.5)
         _hp_default = config.getfloat('max_compression', 0.9, minval=0.5, maxval=1.0)
         self.high_point: float = config.getfloat('high_point', _hp_default, minval=0.5, maxval=1.0)
+        self._homing_high_point: float = config.getfloat("homing_high_point", 0.7,
+                                                         minval=0.6, maxval=1.0)
 
         # Multiplier range — how aggressively the buffer corrects
         self.multiplier_high: float = config.getfloat('multiplier_high', 1.15, minval=1.0)
@@ -987,7 +989,7 @@ class AFCFPSBuffer(AFCBuffer):
         triggered — used by tool_loaded_check to verify filament is loaded
         into the toolhead without requiring a hardware endstop.
         """
-        return self.smoothed_fps >= self.high_point
+        return self.smoothed_fps >= self._homing_high_point
 
     @property
     def buffer_trailing_triggered(self) -> bool:
