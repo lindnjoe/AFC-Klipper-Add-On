@@ -261,6 +261,10 @@ class afcACE(afcUnit):
         self._ace: Optional[ACEConnection] = None
         self._slot_map: dict[str, int] = {}
         self._feed_assist_active: set[int] = set()
+        # Slots manually stopped via ACE_FEED_ASSIST ENABLE=0. The watchdog and
+        # event reconcile won't restart these; any explicit start (the command
+        # with ENABLE=1 or a load/toolchange path) clears the suppression.
+        self._assist_suppressed: set[int] = set()
         # One-shot latch so a sustained jam pauses once, not every heartbeat.
         self._stuck_tripped = False
         self._slot_inventory: list[dict] = [{} for _ in range(self.SLOTS_PER_UNIT)]
@@ -284,6 +288,7 @@ class afcACE(afcUnit):
             ('ACE_DRY', self.cmd_ACE_DRY, "Start ACE filament dryer"),
             ('ACE_DRY_STOP', self.cmd_ACE_DRY_STOP, "Stop ACE filament dryer"),
             ('ACE_LANE_RESET', self.cmd_ACE_LANE_RESET, "Retract ACE lane filament back into unit"),
+            ('ACE_FEED_ASSIST', self.cmd_ACE_FEED_ASSIST, "Start/stop feed assist for a lane/slot (stop overrides watchdog until started again)"),
             ('ACE_CMD', self.cmd_ACE_CMD, "Send a raw ACE protocol command and print the reply"),
             ('ACE_FEED_TEST', self.cmd_ACE_FEED_TEST, "Sweep feed speed to test whether it changes feed rate"),
             ('ACE_STUCK_SPOOL_DETECTION', self.cmd_ACE_STUCK_SPOOL_DETECTION, "Enable/disable ACE stuck spool detection"),
@@ -412,6 +417,7 @@ class afcACE(afcUnit):
                 at_toolhead = False
             if (active_lane is not None and self._use_feed_assist(active_lane)
                     and active_slot not in self._feed_assist_active
+                    and active_slot not in self._assist_suppressed
                     and at_toolhead):
                 self._start_feed_assist(active_slot)
         elif name is not None and name in self.afc.lanes:
@@ -2369,6 +2375,52 @@ class afcACE(afcUnit):
         self.eject_lane(cur_lane)
         gcmd.respond_info(f"Lane {lane_name} reset")
 
+    def cmd_ACE_FEED_ASSIST(self, gcmd):
+        """Manually start/stop feed assist for a lane or slot.
+
+        ENABLE=0 stops assist and suppresses the assist watchdog for that slot
+        so it stays off; ENABLE=1 (or any load/toolchange) starts assist and
+        clears the suppression.
+
+        :param gcmd: Gcode command; ENABLE=0/1 required, plus LANE=<lane> or
+            SLOT=<0-based slot>.
+        """
+        enable = gcmd.get_int('ENABLE', None)
+        if enable is None:
+            raise gcmd.error("ENABLE is required (0 or 1)")
+        lane_name = gcmd.get('LANE', None)
+        slot = gcmd.get_int('SLOT', None)
+        if lane_name is not None:
+            slot = self._slot_map.get(lane_name)
+            if slot is None:
+                raise gcmd.error(f"Unknown lane for this unit: {lane_name}")
+        if slot is None:
+            raise gcmd.error("LANE or SLOT is required")
+        if enable:
+            # Match the reconcile protocol: stop other assisting slot(s) and
+            # wait for the ack before starting — the ACE (V1 and ACE2) can only
+            # feed-assist one slot at a time and refuses further starts with
+            # error_2.
+            for other in list(self._feed_assist_active):
+                if other != slot:
+                    self._stop_feed_assist(other)
+            self._start_feed_assist(slot)
+            gcmd.respond_info(f"Feed assist started on slot {slot}")
+        else:
+            self._assist_suppressed.add(slot)
+            if slot in self._feed_assist_active:
+                self._stop_feed_assist(slot)
+            elif self._ace and self._ace.connected:
+                # Not tracked as assisting, but send the stop anyway in case
+                # firmware state drifted from our tracking.
+                try:
+                    self._ace.stop_feed_assist(slot)
+                except Exception:
+                    pass
+            gcmd.respond_info(
+                f"Feed assist stopped on slot {slot} — watchdog suppressed "
+                f"until assist is started again")
+
     # ── Hardware interaction helpers ────────────────────────────────
 
     def _start_feed_assist(self, slot: int):
@@ -2380,6 +2432,8 @@ class afcACE(afcUnit):
 
         :param slot: 0-based ACE slot index.
         """
+        # An explicit start ends any manual ACE_FEED_ASSIST suppression.
+        self._assist_suppressed.discard(slot)
         if slot in self._feed_assist_active:
             return
         if not (self._ace and self._ace.connected):
@@ -2511,6 +2565,8 @@ class afcACE(afcUnit):
             return
         slot = self._slot_map.get(name)
         lane = self.afc.lanes.get(name)
+        if slot is not None and slot in self._assist_suppressed:
+            return  # manually stopped via ACE_FEED_ASSIST — leave it off
         if (slot is not None and lane is not None
             and self._use_feed_assist(lane)
             and self._feed_assist_active != {slot}):
