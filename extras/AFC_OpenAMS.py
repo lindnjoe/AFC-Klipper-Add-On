@@ -3253,6 +3253,7 @@ class FPSState:
         self.clog_active = False
         self.clog_start_time = None
         self.clog_start_extruder = None
+        self.clog_start_extruder_obj = None
         self.clog_start_encoder = None
 
         # Engagement tracking (suppress detection during engagement)
@@ -3275,6 +3276,7 @@ class FPSState:
         self.clog_active = False
         self.clog_start_time = None
         self.clog_start_extruder = None
+        self.clog_start_extruder_obj = None
         self.clog_start_encoder = None
         self.engagement_in_progress = False
 
@@ -3550,11 +3552,22 @@ class OAMSMonitor:
 
         # Need extruder position to detect clog
         try:
-            extruder_pos = self.fps.extruder.last_position if hasattr(self.fps, 'extruder') else None
+            extruder_obj = self.fps.extruder if hasattr(self.fps, 'extruder') else None
+            extruder_pos = extruder_obj.last_position if extruder_obj is not None else None
         except Exception:
+            extruder_obj = None
             extruder_pos = None
         if extruder_pos is None:
             return
+
+        # fps.extruder is the ACTIVE toolhead extruder, and each extruder keeps
+        # its own position counter. A toolchange mid-window swaps the object, so
+        # comparing last_position across two extruders yields a phantom advance
+        # (e.g. a manual T-command while paused fired a false clog with the
+        # buffer parked at neutral). Restart the window on the new extruder.
+        if (st.clog_start_time is not None
+                and extruder_obj is not st.clog_start_extruder_obj):
+            st.clog_start_time = None
 
         # Pressure near target (extruder is pushing normally)
         pressure_near_target = abs(pressure - CLOG_PRESSURE_TARGET) <= CLOG_PRESSURE_BAND
@@ -3566,6 +3579,7 @@ class OAMSMonitor:
             if st.clog_start_time is None:
                 st.clog_start_time = eventtime
                 st.clog_start_extruder = extruder_pos
+                st.clog_start_extruder_obj = extruder_obj
                 st.clog_start_encoder = st.last_encoder
             else:
                 elapsed = eventtime - st.clog_start_time
@@ -3582,6 +3596,7 @@ class OAMSMonitor:
                 if encoder_total > CLOG_ENCODER_SLACK:
                     st.clog_start_time = eventtime
                     st.clog_start_extruder = extruder_pos
+                    st.clog_start_extruder_obj = extruder_obj
                     st.clog_start_encoder = st.last_encoder
                 elif elapsed >= self.clog_dwell and extrusion_delta >= self.clog_extrusion_window:
                     # Clog confirmed: extruder advanced past the window while the
