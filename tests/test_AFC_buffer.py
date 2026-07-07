@@ -396,6 +396,122 @@ class TestBufferToggle:
         buf.enable_buffer(lane)
         buf.start_fault_detection.assert_called_once_with(0, multiplier)
 
+class TestSetMultiplier:
+    def test_set_multi_not_enabled(self):
+        buf = _make_buffer()
+
+        buf.set_multiplier(1)
+        assert 0 == len(buf.logger.messages) # Verifying that return happened and logger.debug was not called
+    
+    def test_set_multi_current_lane_none(self):
+        buf = _make_buffer()
+        buf.enable = True
+
+        buf.set_multiplier(1)
+        assert 0 == len(buf.logger.messages) # Verifying that return happened and logger.debug was not called
+
+    def test_set_multi_current_lane_extruder_none(self):
+        buf = _make_buffer()
+        lane = _make_lane(buf)
+        lane.extruder_stepper = None
+        buf.enable = True
+        buf.current_lane = lane
+
+        buf.set_multiplier(10)
+        assert 0 == len(buf.logger.messages) # Verifying that return happened and logger.debug was not called 
+
+    def test_set_multi_multiplier_greater_than_1(self):
+        rotation_return_value = 23.12345
+        multiplier = 1.15
+        buf = _make_buffer()
+        lane = _make_lane(buf)
+        lane.update_rotation_distance = MagicMock()
+        lane.extruder_stepper = MagicMock()
+        lane.extruder_stepper.stepper.get_rotation_distance = MagicMock(return_value=[rotation_return_value])
+        buf.enable = True
+        buf.current_lane = lane
+        buf.afc.function.afc_led = MagicMock()
+
+        buf.set_multiplier(multiplier)
+        lane.update_rotation_distance.assert_called_once_with(multiplier)
+        buf.afc.function.afc_led.assert_not_called()
+        assert ADVANCING_STATE_NAME == buf.last_state
+        debug_msgs = [m for lvl, m in buf.logger.messages if lvl == "debug"]
+        assert any(f"New rotation distance for {lane.name} after applying factor: {rotation_return_value:.4f}" in m for m in debug_msgs)
+
+    def test_set_multi_multiplier_greater_than_1_has_led(self):
+        rotation_return_value = 23.12345
+        multiplier = 1.15
+        buf = _make_buffer()
+        lane = _make_lane(buf)
+        lane.update_rotation_distance = MagicMock()
+        lane.extruder_stepper = MagicMock()
+        lane.extruder_stepper.stepper.get_rotation_distance = MagicMock(return_value=[rotation_return_value])
+        buf.enable = True
+        buf.current_lane = lane
+        buf.led = "Valid"
+        buf.led_index = 1
+        buf.afc.function.afc_led = MagicMock()
+
+        buf.set_multiplier(multiplier)
+        buf.afc.function.afc_led.assert_called_once_with(buf.led_trailing, buf.led_index)
+    
+    def test_set_multi_multiplier_less_than_1(self):
+        rotation_return_value = 23.12345
+        multiplier = .9
+        buf = _make_buffer()
+        lane = _make_lane(buf)
+        lane.update_rotation_distance = MagicMock()
+        lane.extruder_stepper = MagicMock()
+        lane.extruder_stepper.stepper.get_rotation_distance = MagicMock(return_value=[rotation_return_value])
+        buf.enable = True
+        buf.current_lane = lane
+        buf.afc.function.afc_led = MagicMock()
+
+        buf.set_multiplier(multiplier)
+        lane.update_rotation_distance.assert_called_once_with(multiplier)
+        buf.afc.function.afc_led.assert_not_called()
+        assert TRAILING_STATE_NAME == buf.last_state
+        debug_msgs = [m for lvl, m in buf.logger.messages if lvl == "debug"]
+        assert any(f"New rotation distance for {lane.name} after applying factor: {rotation_return_value:.4f}" in m for m in debug_msgs)
+
+    def test_set_multi_multiplier_less_than_1_has_led(self):
+        rotation_return_value = 23.12345
+        multiplier = .9
+        buf = _make_buffer()
+        lane = _make_lane(buf)
+        lane.update_rotation_distance = MagicMock()
+        lane.extruder_stepper = MagicMock()
+        lane.extruder_stepper.stepper.get_rotation_distance = MagicMock(return_value=[rotation_return_value])
+        buf.enable = True
+        buf.current_lane = lane
+        buf.led = "Valid"
+        buf.led_index = 1
+        buf.afc.function.afc_led = MagicMock()
+
+        buf.set_multiplier(multiplier)
+        buf.afc.function.afc_led.assert_called_once_with(buf.led_advancing, buf.led_index)
+    
+    def test_set_multi_multiplier_is_one(self):
+        rotation_return_value = 23.12345
+        multiplier = 1
+        buf = _make_buffer()
+        lane = _make_lane(buf)
+        lane.update_rotation_distance = MagicMock()
+        lane.extruder_stepper = MagicMock()
+        lane.extruder_stepper.stepper.get_rotation_distance = MagicMock(return_value=[rotation_return_value])
+        buf.enable = True
+        buf.current_lane = lane
+        buf.led = "Valid"
+        buf.led_index = 1
+        buf.afc.function.afc_led = MagicMock()
+        buf.last_state = "test_state"
+
+        buf.set_multiplier(multiplier)
+        buf.afc.function.afc_led.assert_not_called()
+        # Verify that last state did not change
+        assert "test_state" == buf.last_state
+
 
 # ── advance_callback / trailing_callback ─────────────────────────────────────
 
