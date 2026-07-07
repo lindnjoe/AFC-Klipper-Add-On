@@ -219,8 +219,8 @@ def _make_afc_lane(fullname="AFC_stepper lane1"):
     lane._load_state = False
     lane.runout_lane = None
     lane.map = "T0"
-    lane.gcode = MagicMock()
     lane.need_purge = False
+    lane.gcode = MagicMock()
     return lane
 
 

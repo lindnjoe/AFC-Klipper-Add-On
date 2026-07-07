@@ -178,7 +178,7 @@ class TestCurrentHelpers:
         s.set_load_current()
         s._set_current.assert_called_once_with(1.2)
         assert not s._print_current_set
-    
+
     def test_set_load_current_print_current_not_set(self):
         s = _make_stepper()
         s.tmc_print_current = 0.8
@@ -377,7 +377,7 @@ class TestSyncUnsync:
         s.set_print_current.assert_called_once()
 
     def test_sync_skips_set_print_current_when_update_current_false(self):
-        s = _make_stepper(extruder_name="extruder")
+        s = _make_stepper()
         s.set_print_current = MagicMock()
         s.sync_to_extruder(update_current=False)
         s.set_print_current.assert_not_called()
@@ -517,6 +517,7 @@ class TestTrapqAppend:
         obj.trapq_append(fn, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
         assert fn.call_count == 1
 
+
 class TestDoEnable:
     def test_do_enable_enable_lines_is_none(self):
         s = _make_stepper()
@@ -542,7 +543,7 @@ class TestDoEnable:
 
         s.stepper_enable.set_motors_enable.assert_not_called()
         s.stepper_enable.motor_debug_enable.assert_not_called()
-    
+
     def test_do_enable_motor_is_disabled_noop_klipper(self):
         s = _make_stepper()
         stepper_name = f"AFC_stepper {s.name}"

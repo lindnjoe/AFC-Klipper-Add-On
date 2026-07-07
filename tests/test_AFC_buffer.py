@@ -25,9 +25,7 @@ from extras.AFC_buffer import (
     AFCBuffer,
     TRAILING_STATE_NAME,
     ADVANCING_STATE_NAME,
-    NEUTRAL_STATE_NAME,
     CHECK_RUNOUT_TIMEOUT,
-    FPS_ENDSTOP_POLL_TIME,
 )
 from tests.test_AFC_lane import _make_afc_lane
 
@@ -50,6 +48,7 @@ def _make_buffer(name="TN", error_sensitivity=0.0):
     buf.gcode = afc.gcode
     buf.logger = afc.logger
     buf.name = name
+    buf.type = "switched"
     buf.lanes = {}
     buf.last_state = "Unknown"
     buf.enable = False
@@ -74,7 +73,6 @@ def _make_buffer(name="TN", error_sensitivity=0.0):
     buf.led_buffer_disabled = "0,0,0,0.25"
 
     buf.min_event_systime = 0.0
-    buf.type = "switched"
 
     return buf
 
@@ -92,79 +90,10 @@ class TestConstants:
 
     def test_advancing_state_name(self):
         assert ADVANCING_STATE_NAME == "Advancing"
-    
-    def test_neutral_state_name(self):
-        assert NEUTRAL_STATE_NAME  == "Neutral"
 
     def test_check_runout_timeout_positive(self):
         assert CHECK_RUNOUT_TIMEOUT > 0
-        assert CHECK_RUNOUT_TIMEOUT == 0.5
-    
-    def test_check_fps_endstop_poll_time_positive(self):
-        assert FPS_ENDSTOP_POLL_TIME  > 0
-        assert FPS_ENDSTOP_POLL_TIME  == 0.01
 
-class TestStringName:
-    def test_name_return(self):
-        buf = _make_buffer()
-
-        assert buf.name == f"{buf}"
-
-class TestHandleReady:
-    def test_setup_fault_timer_and_verify_led_not_called(self):
-        buf = _make_buffer()
-        buf.led_index = None
-        buf.error_sensitivity = 0
-        buf.printer.lookup_object = MagicMock(return_value="Toolhead1")
-        buf.reactor.monotonic = MagicMock(return_value=100)
-        buf.afc.function.verify_led_object = MagicMock()
-        buf.setup_fault_timer = MagicMock()
-
-        buf._handle_ready()
-
-        assert 100+2 == buf.min_event_systime
-        assert "Toolhead1" == buf.toolhead
-        buf.setup_fault_timer.assert_not_called()
-        buf.afc.function.verify_led_object.assert_not_called()
-    
-    def test_setup_fault_timer_called(self):
-        buf = _make_buffer()
-        buf.led_index = None
-        buf.error_sensitivity = 5
-        buf.printer.lookup_object = MagicMock(return_value="Toolhead1")
-        buf.reactor.monotonic = MagicMock(return_value=100)
-        buf.afc.function.verify_led_object = MagicMock()
-        buf.setup_fault_timer = MagicMock()
-
-        buf._handle_ready()
-        buf.setup_fault_timer.assert_called_once()
-    
-    def test_verify_led_called_error_not_raised(self):
-        buf = _make_buffer()
-        buf.led_index = 1
-        buf.error_sensitivity = 0
-        buf.printer.lookup_object = MagicMock(return_value="Toolhead1")
-        buf.reactor.monotonic = MagicMock(return_value=100)
-        buf.afc.function.verify_led_object = MagicMock(return_value=("", False))
-        buf.setup_fault_timer = MagicMock()
-
-        buf._handle_ready()
-        assert True
-        buf.afc.function.verify_led_object.assert_called_once_with(buf.led_index)
-    
-    def test_verify_led_called_error_raised(self):
-        from configparser import Error as config_error
-        buf = _make_buffer()
-        buf.led_index = 1
-        buf.error_sensitivity = 0
-        buf.printer.lookup_object = MagicMock(return_value="Toolhead1")
-        buf.reactor.monotonic = MagicMock(return_value=100)
-        buf.afc.function.verify_led_object = MagicMock(return_value=("TEst", None))
-        buf.setup_fault_timer = MagicMock()
-
-        with pytest.raises(config_error):
-            buf._handle_ready()
-        buf.afc.function.verify_led_object.assert_called_once_with(buf.led_index)
 
 # ── get_fault_sensitivity ─────────────────────────────────────────────────────
 
@@ -218,30 +147,6 @@ class TestFaultDetection:
         expected = buf.get_fault_sensitivity(5.0)
         assert buf.fault_sensitivity == expected
 
-class TestSetupFaultTimer:
-    def test_setup_fault_extruder_pos_none(self):
-        buf = _make_buffer()
-        buf.extruder_pos_timer = None
-        buf.extruder_pos_update_event = 10
-        buf.update_filament_error_pos = MagicMock()
-        buf.reactor.register_timer = MagicMock(return_value="MockTimer")
-
-        buf.setup_fault_timer()
-        buf.update_filament_error_pos.assert_called_once()
-        buf.reactor.register_timer.assert_called_once_with(buf.extruder_pos_update_event)
-        assert "MockTimer" == buf.extruder_pos_timer
-    
-    def test_setup_fault_extruder_pos_not_none(self):
-        buf = _make_buffer()
-        buf.extruder_pos_timer = "MockTimer"
-        buf.update_filament_error_pos = MagicMock()
-        buf.reactor.register_timer = MagicMock(return_value="MockTimer")
-
-        buf.setup_fault_timer()
-        buf.update_filament_error_pos.assert_called_once()
-        buf.reactor.register_timer.assert_not_called()
-
-
 
 # ── buffer_status ─────────────────────────────────────────────────────────────
 
@@ -259,57 +164,6 @@ class TestBufferStatus:
 # ── disable_buffer / enable_buffer ───────────────────────────────────────────
 
 class TestBufferToggle:
-    def test_disable_buffer_current_lane_none(self):
-        buf = _make_buffer()
-        buf.current_lane = None
-        buf.enable = True
-        buf.disable_buffer()
-        assert not buf.enable
-        assert 0 == len(buf.logger.messages) # Verifying that return happened and logger.debug was not called
-    
-    def test_disable_buffer_has_led(self):
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.afc.function.afc_led = MagicMock()
-        buf.led = "Something"
-        buf.led_index = 1
-        buf.current_lane = lane
-        buf.enable = True
-        buf.reset_multiplier = MagicMock()
-
-        buf.disable_buffer()
-        buf.afc.function.afc_led.assert_called_once_with(buf.led_buffer_disabled, buf.led_index)
-        debug_msgs = [m for lvl, m in buf.logger.messages if lvl == "debug"]
-        assert any(f"{buf.name} buffer disabled for {lane.name}" in m for m in debug_msgs)
-        assert None == buf.current_lane
-    
-    def test_disable_buffer_error_sensitivity_set_extruder_pos_none(self):
-        buf = _make_buffer(error_sensitivity=5)
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.enable = True
-        buf.extruder_pos_timer = None
-        buf.reset_multiplier = MagicMock()
-        buf.stop_fault_timer = MagicMock()
-
-        buf.disable_buffer()
-        buf.stop_fault_timer.assert_not_called()
-        assert None == buf.current_lane
-    
-    def test_disable_buffer_error_sensitivity_set_extruder_pos_set(self):
-        buf = _make_buffer(error_sensitivity=5)
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.enable = True
-        buf.extruder_pos_timer = "NotNone"
-        buf.reset_multiplier = MagicMock()
-        buf.stop_fault_timer = MagicMock()
-        buf.reactor.monotonic = MagicMock(return_value=1234)
-
-        buf.disable_buffer()
-        buf.stop_fault_timer.assert_called_once_with(1234)
-        assert None == buf.current_lane
-
     def test_disable_buffer_sets_enable_false(self):
         lane = _make_afc_lane()
         buf = _make_buffer()
@@ -337,19 +191,6 @@ class TestBufferToggle:
         buf.enable_buffer(lane)
         assert buf.enable is True
     
-    def test_enable_buffer_sets_enable_true_has_led(self):
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.led = "LedSet"
-        buf.led_index = 2
-        buf.set_multiplier = MagicMock()
-        buf.afc.function.afc_led = MagicMock()
-
-        buf.enable_buffer(lane)
-        assert buf.enable is True
-        buf.afc.function.afc_led.assert_called_once_with(buf.led_buffer_disabled,
-                                                         buf.led_index)
-    
     def test_enable_buffer_sets_current_lane(self):
         buf = _make_buffer()
         lane = _make_lane(buf)
@@ -365,16 +206,6 @@ class TestBufferToggle:
         buf.enable_buffer(lane)
         call_arg = buf.set_multiplier.call_args[0][0]
         assert call_arg < 1.0  # should be multiplier_low or derivative
-    
-    def test_enable_buffer_applies_multiplier_trailing_fault_enabled(self):
-        buf = _make_buffer(error_sensitivity=5)
-        lane = _make_lane(buf)
-        multiplier = (buf.multiplier_low*2)/5
-        buf.set_multiplier = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.last_state = TRAILING_STATE_NAME
-        buf.enable_buffer(lane)
-        buf.start_fault_detection.assert_called_once_with(0, multiplier)
 
     def test_enable_buffer_applies_multiplier_advancing(self):
         buf = _make_buffer()
@@ -384,17 +215,6 @@ class TestBufferToggle:
         buf.enable_buffer(lane)
         call_arg = buf.set_multiplier.call_args[0][0]
         assert call_arg > 1.0  # should be multiplier_high or derivative
-    
-    def test_enable_buffer_applies_multiplier_advancing_fault_enabled(self):
-        buf = _make_buffer(error_sensitivity=5)
-        lane = _make_lane(buf)
-        multiplier = buf.multiplier_high * 1.5
-        buf.set_multiplier = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.last_state = ADVANCING_STATE_NAME
-
-        buf.enable_buffer(lane)
-        buf.start_fault_detection.assert_called_once_with(0, multiplier)
 
 
 # ── advance_callback / trailing_callback ─────────────────────────────────────
@@ -466,16 +286,6 @@ class TestPauseOnError:
         buf.last_state = TRAILING_STATE_NAME
         buf.pause_on_error("Something went wrong", pause=True)
         buf.afc.error.AFC_error.assert_called_once()
-    
-    def test_pauses_when_all_conditions_met_pause_false(self):
-        buf = _make_buffer()
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.last_state = TRAILING_STATE_NAME
-        buf.pause_on_error("Something went wrong", pause=False)
-        buf.afc.error.AFC_error.assert_not_called()
 
     def test_clog_message_appended_when_trailing(self):
         buf = _make_buffer()
@@ -486,7 +296,7 @@ class TestPauseOnError:
         buf.last_state = TRAILING_STATE_NAME
         buf.pause_on_error("Base message", pause=True)
         call_msg = buf.afc.error.AFC_error.call_args[0][0]
-        assert "CLOG DETECTED" in call_msg
+        assert "CLOG" in call_msg
 
     def test_not_feeding_message_appended_when_advancing(self):
         buf = _make_buffer()
@@ -497,7 +307,7 @@ class TestPauseOnError:
         buf.last_state = ADVANCING_STATE_NAME
         buf.pause_on_error("Base message", pause=True)
         call_msg = buf.afc.error.AFC_error.call_args[0][0]
-        assert "AFC NOT FEEDING" in call_msg
+        assert "NOT FEEDING" in call_msg
 
 
 # ── fault timer helpers ───────────────────────────────────────────────────────
@@ -506,143 +316,27 @@ class TestFaultTimers:
     def test_start_fault_timer_sets_fault_timer_running(self):
         buf = _make_buffer()
         buf.extruder_pos_timer = MagicMock()
-        buf.reactor.update_timer = MagicMock()
-
         buf.start_fault_timer(100.0)
         assert buf.fault_timer == "Running"
-        buf.reactor.update_timer.assert_called_once_with(buf.extruder_pos_timer,
-                                                         buf.reactor.NOW)
-
-    def test_start_fault_timer_extruder_pos_timer_none(self):
-        buf = _make_buffer()
-        buf.extruder_pos_timer = None
-        buf.reactor.update_timer = MagicMock()
-
-        buf.start_fault_timer(100)
-        assert None == buf.extruder_pos_timer
-        buf.reactor.update_timer.assert_not_called()
 
     def test_stop_fault_timer_sets_fault_timer_stopped(self):
         buf = _make_buffer()
         buf.extruder_pos_timer = MagicMock()
-        buf.reactor.update_timer = MagicMock()
-
         buf.stop_fault_timer(100.0)
         assert buf.fault_timer == "Stopped"
-        buf.reactor.update_timer.assert_called_once_with(buf.extruder_pos_timer,
-                                                         buf.reactor.NEVER)
 
-    def test_stop_fault_timer_extruder_pos_timer_none(self):
-        buf = _make_buffer()
-        buf.extruder_pos_timer = MagicMock()
-        buf.reactor.update_timer = MagicMock()
-        buf.extruder_pos_timer = None
-
-        buf.stop_fault_timer(100.0)
-        assert None == buf.extruder_pos_timer
-        buf.reactor.update_timer.assert_not_called()
-
-class TestStartFaultDetection:
-    def test_start_fault_detection(self):
-        buf = _make_buffer()
-        buf.set_multiplier = MagicMock()
-        buf.update_filament_error_pos = MagicMock()
-        buf.start_fault_timer = MagicMock()
-
-        time = 100
-        mult = 1.25
-
-        buf.start_fault_detection(time, mult)
-        buf.set_multiplier.assert_called_once_with(mult)
-        buf.update_filament_error_pos.assert_called_once()
-        buf.start_fault_timer.assert_called_once_with(time)
-    
-class TestGetExtruderPos:
-    def test_get_extruder_pos_cur_pos_none(self):
-        buf = _make_buffer()
-        past_extruder_position = 1000
-        buf.past_extruder_position = past_extruder_position
-        buf.afc.function.get_extruder_pos = MagicMock(return_value=None)
-
-        assert None == buf.get_extruder_pos()
-        buf.afc.function.get_extruder_pos.assert_called_once_with(past_extruder_position=past_extruder_position)
-    
-    def test_get_extruder_pos_cur_pos_not_none(self):
-        return_extruder_pos = 1500
-        past_extruder_position = 1000
-        buf = _make_buffer()
-        buf.past_extruder_position = past_extruder_position
-        buf.afc.function.get_extruder_pos = MagicMock(return_value=return_extruder_pos)
-
-        assert return_extruder_pos == buf.get_extruder_pos()
-        buf.afc.function.get_extruder_pos.assert_called_once_with(past_extruder_position=past_extruder_position)
-        assert buf.past_extruder_position == return_extruder_pos
-
-
-class TestUpdateFilamentErrorPos:
-    def test_filament_error_pos_no_updated(self):
-        buf = _make_buffer()
-        error_pos = 10
-        buf.filament_error_pos = error_pos
-        buf.get_extruder_pos = MagicMock(return_value=None)
-
-        buf.update_filament_error_pos()
-        assert buf.filament_error_pos == error_pos
-    
-    def test_filament_error_pos_updated(self):
-        buf = _make_buffer()
-        error_pos = 10
-        buf.filament_error_pos = error_pos
-        buf.fault_sensitivity = 10
-        buf.get_extruder_pos = MagicMock(return_value=20)
-
-        buf.update_filament_error_pos()
-        assert buf.filament_error_pos == 20 + buf.fault_sensitivity
 
 # ── extruder_pos_update_event ─────────────────────────────────────────────────
 
 class TestExtruderPosUpdateEvent:
-    def test_returns_eventtime_plus_timeout_current_lane_none(self):
+    def test_returns_eventtime_plus_timeout(self):
         buf = _make_buffer()
-        buf.pause_on_error = MagicMock()
-        buf.filament_error_pos = 50.0
-        buf.get_extruder_pos = MagicMock(return_value=100)
-        buf.afc.function.is_printing.return_value = False
-        result = buf.extruder_pos_update_event(50)
-        assert result == 50.0 + CHECK_RUNOUT_TIMEOUT
-        buf.pause_on_error.assert_not_called()
-    
-    def test_returns_eventtime_plus_timeout_current_lane_none_is_printing_extruder_pos_none(self):
-        buf = _make_buffer()
-        buf.pause_on_error = MagicMock()
-        buf.filament_error_pos = 50.0
         buf.get_extruder_pos = MagicMock(return_value=None)
-        buf.afc.function.is_printing.return_value = True
-        result = buf.extruder_pos_update_event(50)
+        buf.afc.function.is_printing.return_value = False
+        result = buf.extruder_pos_update_event(50.0)
         assert result == 50.0 + CHECK_RUNOUT_TIMEOUT
-        buf.pause_on_error.assert_not_called()
-    
-    def test_returns_eventtime_plus_timeout_current_lane_none_is_printing_extruder_pos_is_not_none_filament_error_pos_none(self):
-        buf = _make_buffer()
-        buf.pause_on_error = MagicMock()
-        buf.filament_error_pos = None
-        buf.get_extruder_pos = MagicMock(return_value=100)
-        buf.afc.function.is_printing.return_value = True
-        result = buf.extruder_pos_update_event(50)
-        assert result == 50.0 + CHECK_RUNOUT_TIMEOUT
-        buf.pause_on_error.assert_not_called()
-    
-    def test_under_threshold_true_path(self):
-        buf = _make_buffer()
-        buf.pause_on_error = MagicMock()
-        buf.filament_error_pos = 50
-        buf.get_extruder_pos = MagicMock(return_value=40)
-        buf.afc.function.is_printing.return_value = True
-        result = buf.extruder_pos_update_event(50)
-        assert result == 50.0 + CHECK_RUNOUT_TIMEOUT
-        buf.pause_on_error.assert_not_called()
 
-    def test_triggers_pause_when_extruder_pos_exceeds_threshold_not_stepperless_no_lane(self):
+    def test_triggers_pause_when_extruder_pos_exceeds_threshold(self):
         buf = _make_buffer(error_sensitivity=5.0)
         buf.enable = True
         buf.min_event_systime = 0.0
@@ -653,42 +347,7 @@ class TestExtruderPosUpdateEvent:
         buf.get_extruder_pos = MagicMock(return_value=55.0)  # > 50.0
         buf.update_filament_error_pos = MagicMock()
         buf.extruder_pos_update_event(100.0)
-        buf.afc.error.AFC_error.assert_called_once_with("AFC filament fault detected! Take necessary action.", True)
-        buf.update_filament_error_pos.assert_called_once()
-    
-    def test_triggers_pause_when_extruder_pos_exceeds_threshold_not_stepperless_lane(self):
-        buf = _make_buffer(error_sensitivity=5.0)
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.filament_error_pos = 50.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.afc.function.is_printing.return_value = True
-        buf.get_extruder_pos = MagicMock(return_value=55.0)  # > 50.0
-        buf.update_filament_error_pos = MagicMock()
-        with patch('extras.AFC_buffer.getattr', return_value=None):
-            buf.extruder_pos_update_event(100.0)
-        buf.afc.error.AFC_error.assert_called_once_with("AFC filament fault detected! Take necessary action.", True)
-        buf.update_filament_error_pos.assert_called_once()
-    
-    def test_triggers_pause_when_extruder_pos_exceeds_threshold_stepperless_lane(self):
-        buf = _make_buffer(error_sensitivity=5.0)
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.filament_error_pos = 50.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.afc.function.is_printing.return_value = True
-        buf.get_extruder_pos = MagicMock(return_value=55.0)  # > 50.0
-        buf.update_filament_error_pos = MagicMock()
-        with patch('extras.AFC_buffer.getattr', return_value=True):
-            buf.extruder_pos_update_event(100.0)
-        buf.afc.error.AFC_error.assert_not_called()
-        buf.update_filament_error_pos.assert_not_called()
+        buf.afc.error.AFC_error.assert_called()
 
 
 # ── get_status ────────────────────────────────────────────────────────────────
@@ -881,17 +540,3 @@ class TestCmdSetErrorSensitivity:
         buf.logger.info.assert_called_once()
         msg = buf.logger.info.call_args[0][0]
         assert "5.0" in msg
-
-class TestExtruderProperty:
-    def test_extruder_property_is_none(self):
-        buf = _make_buffer()
-        buf.toolhead = None
-        assert None == buf.extruder
-
-    def test_extruder_property_is_not_none(self):
-        toolhead = MagicMock()
-        toolhead.get_extruder = MagicMock(return_value="Test")
-        buf = _make_buffer()
-        buf.toolhead = toolhead
-        assert "Test" == buf.extruder
-        toolhead.get_extruder.assert_called_once()

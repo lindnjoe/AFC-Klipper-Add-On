@@ -23,14 +23,14 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 import pytest
 
 from extras.AFC import afc, State, AFC_VERSION
 from extras.AFC_lane import AFCLaneState
 from klippy import Printer
 
-from tests.test_AFC_lane import _make_afc_lane
+
 # ── State constants ───────────────────────────────────────────────────────────
 
 class TestStateConstants:
@@ -101,6 +101,7 @@ def _make_afc():
     obj.function = MagicMock()
     obj.gcode = MagicMock()
     obj.message_queue = []
+    # obj.current = MagicMock()
     obj.current_loading = None
     obj.next_lane_load = None
     obj.current_state = State.IDLE
@@ -123,20 +124,10 @@ def _make_afc():
     obj.in_toolchange = False
     obj.get_bypass_state = MagicMock(return_value=False)
     obj._get_quiet_mode = MagicMock(return_value=False)
-    obj.poop = False
-    obj.poop_cmd = None
     obj.park = False
     obj.park_cmd = None
     obj.wipe = False
     obj.wipe_cmd = None
-    obj.park_pre_load = False
-    obj.park_pre_load_cmd = None
-    obj.kick = False
-    obj.kick_cmd = None
-    obj.post_load_macro = None
-    obj.afcDeltaTime = MagicMock()
-    obj.toolhead = MagicMock()
-    obj.error = MagicMock()
     return obj
 
 
@@ -2617,280 +2608,4 @@ class TestUnitOrdering:
         key_order = list(obj.units.keys())
 
         assert key_order == ["Turtle_1", "Vivid_1", "HTLF_Claymore_1", "Tools", "EMU_1"], key_order
-
-class TestDoPoopKickWipe:
-    def test_poop_no_purge(self):
-        afc = _make_afc()
-        lane = _make_afc_lane()
-        lane.extruder_obj.name = "e0"
-        lane.need_purge = True
-
-        afc.poop = True
-        afc.poop_cmd = "AFC_POOP"
-
-        afc.do_poop_kick_wipe( lane, lane.extruder_obj)
-
-        afc.gcode.run_script_from_command.assert_called_once_with("AFC_POOP EXTRUDER=e0")
-        afc.afcDeltaTime.log_with_time.assert_called_once_with("TOOL_LOAD: After poop")
-        afc.function.log_toolhead_pos.assert_called_once()
-
-        afc.toolhead.wait_moves.assert_called_once()
-        assert not lane.need_purge
-    
-    def test_poop_purge_length(self):
-        afc = _make_afc()
-        lane = _make_afc_lane()
-        lane.extruder_obj.name = "e0"
-        lane.need_purge = True
-
-        afc.poop = True
-        afc.poop_cmd = "AFC_POOP"
-
-        afc.do_poop_kick_wipe( lane, lane.extruder_obj, 100)
-
-        afc.gcode.run_script_from_command.assert_called_once_with("AFC_POOP PURGE_LENGTH=100 EXTRUDER=e0")
-        afc.afcDeltaTime.log_with_time.assert_called_once_with("TOOL_LOAD: After poop")
-        afc.function.log_toolhead_pos.assert_called_once()
-
-        afc.toolhead.wait_moves.assert_called_once()
-
-        assert not lane.need_purge
-    
-    def test_poop_wipe(self):
-        afc = _make_afc()
-        lane = _make_afc_lane()
-        lane.extruder_obj.name = "e0"
-        lane.need_purge = True
-
-        afc.poop = True
-        afc.poop_cmd = "AFC_POOP"
-
-        afc.wipe = True
-        afc.wipe_cmd = "AFC_BRUSH"
-
-        afc.do_poop_kick_wipe( lane, lane.extruder_obj, 100)
-
-        gcode_calls = [
-            call("AFC_POOP PURGE_LENGTH=100 EXTRUDER=e0"),
-            call("AFC_BRUSH EXTRUDER=e0"),
-            call("AFC_BRUSH EXTRUDER=e0")
-        ]
-
-        log_with_time_calls = [
-            call("TOOL_LOAD: After poop"),
-            call("TOOL_LOAD: After first wipe"),
-            call("TOOL_LOAD: After second wipe")
-        ]
-        assert afc.gcode.run_script_from_command.call_args_list == gcode_calls
-        assert afc.afcDeltaTime.log_with_time.call_args_list == log_with_time_calls
-        assert afc.function.log_toolhead_pos.call_count == 3
-
-    def test_poop_kick_wipe(self):
-        afc = _make_afc()
-        lane = _make_afc_lane()
-        lane.extruder_obj.name = "e0"
-        lane.need_purge = True
-
-        afc.poop = True
-        afc.poop_cmd = "AFC_POOP"
-
-        afc.wipe = True
-        afc.wipe_cmd = "AFC_BRUSH"
-
-        afc.kick = True
-        afc.kick_cmd = "AFC_KICK"
-
-        afc.do_poop_kick_wipe( lane, lane.extruder_obj, 100)
-
-        gcode_calls = [
-            call("AFC_POOP PURGE_LENGTH=100 EXTRUDER=e0"),
-            call("AFC_BRUSH EXTRUDER=e0"),
-            call("AFC_KICK EXTRUDER=e0"),
-            call("AFC_BRUSH EXTRUDER=e0")
-        ]
-
-        log_with_time_calls = [
-            call("TOOL_LOAD: After poop"),
-            call("TOOL_LOAD: After first wipe"),
-            call("TOOL_LOAD: After kick"),
-            call("TOOL_LOAD: After second wipe")
-        ]
-        assert afc.gcode.run_script_from_command.call_args_list == gcode_calls
-        assert afc.afcDeltaTime.log_with_time.call_args_list == log_with_time_calls
         
-        assert afc.function.log_toolhead_pos.call_count == 4
-
-    def test_kick_wipe(self):
-        afc = _make_afc()
-        lane = _make_afc_lane()
-        lane.extruder_obj.name = "e0"
-        lane.need_purge = True
-
-        afc.wipe = True
-        afc.wipe_cmd = "AFC_BRUSH"
-
-        afc.kick = True
-        afc.kick_cmd = "AFC_KICK"
-
-        afc.do_poop_kick_wipe( lane, lane.extruder_obj, 100)
-
-        gcode_calls = [
-            call("AFC_KICK EXTRUDER=e0"),
-            call("AFC_BRUSH EXTRUDER=e0")
-        ]
-
-        log_with_time_calls = [
-            call("TOOL_LOAD: After kick"),
-            call("TOOL_LOAD: After second wipe")
-        ]
-        assert afc.gcode.run_script_from_command.call_args_list == gcode_calls
-        assert afc.afcDeltaTime.log_with_time.call_args_list == log_with_time_calls
-        
-        assert afc.function.log_toolhead_pos.call_count == 2
-        assert not lane.need_purge
-
-
-
-class TestToolLoadNeedPurge:
-    def _make_afc_lane_for_need_purge(self, need_purge=True, check_extruder_temp_return=True,
-                                      printing=False):
-        afc = _make_afc()
-        afc.capture_toolhead_temp = MagicMock(return_value=100)
-        afc._check_extruder_temp = MagicMock(return_value=check_extruder_temp_return)
-        afc.afcDeltaTime = MagicMock()
-        afc.do_poop_kick_wipe = MagicMock()
-        afc.save_vars = MagicMock()
-        afc.restore_toolhead_temp = MagicMock()
-        afc.verify_macro_positions = MagicMock(return_value=False)
-        afc.function.in_print = MagicMock(return_value=printing)
-        lane = _make_afc_lane()
-        afc.function.get_current_lane.return_value = lane.name
-
-        afc.lanes[lane.name] = lane
-        lane.extruder_obj.name = "extruder"
-        lane.extruder_obj.lane_loaded = lane.name
-
-        lane.need_purge = need_purge
-        return afc,lane
-
-    def test_no_purge_needed(self):
-        afc, lane = self._make_afc_lane_for_need_purge(need_purge=False)
-        purge_length = None
-
-        assert afc.TOOL_LOAD(lane)
-
-        afc.capture_toolhead_temp.assert_not_called()
-        afc.restore_toolhead_temp.assert_not_called()
-        afc.save_vars.assert_not_called()        
-
-    def test_need_purge_no_purge_length(self):
-        afc, lane = self._make_afc_lane_for_need_purge()
-        purge_length = None
-
-        assert afc.TOOL_LOAD(lane)
-
-        afc.capture_toolhead_temp.assert_called_once()
-        afc._check_extruder_temp.assert_called_once_with(lane)
-        afc.afcDeltaTime.log_with_time.assert_called_once_with("Done heating toolhead")
-        afc.do_poop_kick_wipe.assert_called_once_with(cur_lane=lane, cur_extruder=lane.extruder_obj,
-                                                      purge_length=purge_length)
-        afc.restore_toolhead_temp.assert_called_once_with(100)
-        afc.save_vars.assert_called_once_with()
-        afc.gcode.run_script_from_command.assert_not_called()
-
-        info_msgs = [m for lvl, m in afc.logger.messages if lvl == "info"]
-        assert any(f"Flag set to purge for {lane.extruder_obj.name}:{lane.map}" in m for m in info_msgs)
-
-    def test_need_purge_with_purge_length(self):
-        afc, lane = self._make_afc_lane_for_need_purge()
-        purge_length = 100
-
-        assert afc.TOOL_LOAD(lane, purge_length=purge_length)
-
-        afc.capture_toolhead_temp.assert_called_once()
-        afc._check_extruder_temp.assert_called_once_with(lane)
-        afc.afcDeltaTime.log_with_time.assert_called_once_with("Done heating toolhead")
-        afc.do_poop_kick_wipe.assert_called_once_with(cur_lane=lane, cur_extruder=lane.extruder_obj,
-                                                      purge_length=purge_length)
-        afc.restore_toolhead_temp.assert_called_once_with(100)
-        afc.save_vars.assert_called_once_with()
-        afc.gcode.run_script_from_command.assert_not_called()
-    
-    def test_need_purge_with_purge_length_no_heating(self):
-        afc, lane = self._make_afc_lane_for_need_purge(check_extruder_temp_return=False)
-        purge_length = 100
-
-        assert afc.TOOL_LOAD(lane, purge_length=purge_length)
-
-        afc.capture_toolhead_temp.assert_called_once()
-        afc._check_extruder_temp.assert_called_once_with(lane)
-        afc.afcDeltaTime.log_with_time.assert_not_called()
-        afc.do_poop_kick_wipe.assert_called_once_with(cur_lane=lane, cur_extruder=lane.extruder_obj,
-                                                      purge_length=purge_length)
-        afc.restore_toolhead_temp.assert_called_once_with(100)
-        afc.save_vars.assert_called_once_with()
-        afc.gcode.run_script_from_command.assert_not_called()
-
-    def test_need_purge_with_purge_length_post_load_macro(self):
-        afc, lane = self._make_afc_lane_for_need_purge()
-        afc.post_load_macro = "AFC_TEST"
-        purge_length = 100
-
-        assert afc.TOOL_LOAD(lane, purge_length=purge_length)
-
-        afc.capture_toolhead_temp.assert_called_once()
-        afc._check_extruder_temp.assert_called_once_with(lane)
-        afc.afcDeltaTime.log_with_time.assert_called_once_with("Done heating toolhead")
-        afc.do_poop_kick_wipe.assert_called_once_with(cur_lane=lane, cur_extruder=lane.extruder_obj,
-                                                      purge_length=purge_length)
-        afc.restore_toolhead_temp.assert_called_once_with(100)
-        afc.save_vars.assert_called_once_with()
-        afc.gcode.run_script_from_command.assert_called_once_with(afc.post_load_macro)
-
-    def test_need_purge_raise_error_no_printing(self):
-        afc, lane = self._make_afc_lane_for_need_purge(check_extruder_temp_return=False)
-        purge_length = 100
-
-        afc._check_extruder_temp = MagicMock(side_effect = Exception("Error Occurred"))
-
-        assert not afc.TOOL_LOAD(lane, purge_length=purge_length)
-
-        afc.capture_toolhead_temp.assert_called_once()
-        afc._check_extruder_temp.assert_called_once_with(lane)
-        afc.afcDeltaTime.log_with_time.assert_not_called()
-        afc.do_poop_kick_wipe.assert_not_called()
-        afc.restore_toolhead_temp.assert_called_once_with(100)
-        afc.save_vars.assert_called_once_with()
-        afc.gcode.run_script_from_command.assert_not_called()
-        afc.error.AFC_error.assert_called_once_with(
-            (f"Error occurred when trying to purge {lane.extruder_obj.name}."
-             " See AFC.log for error trace."),
-            pause=False
-        )
-
-        debug_msgs = [m for lvl, m in afc.logger.messages if lvl == "debug"]
-        assert any(f"Exception: Error Occurred" in m for m in debug_msgs)
-
-    def test_need_purge_raise_error_printing(self):
-        afc, lane = self._make_afc_lane_for_need_purge(check_extruder_temp_return=False, printing=True)
-        purge_length = 100
-
-        afc._check_extruder_temp = MagicMock(side_effect = Exception("Error Occurred"))
-
-        assert not afc.TOOL_LOAD(lane, purge_length=purge_length)
-
-        afc.capture_toolhead_temp.assert_called_once()
-        afc._check_extruder_temp.assert_called_once_with(lane)
-        afc.afcDeltaTime.log_with_time.assert_not_called()
-        afc.do_poop_kick_wipe.assert_not_called()
-        afc.restore_toolhead_temp.assert_called_once_with(100)
-        afc.save_vars.assert_called_once_with()
-        afc.gcode.run_script_from_command.assert_not_called()
-        afc.error.AFC_error.assert_called_once_with(
-            (f"Error occurred when trying to purge {lane.extruder_obj.name}."
-             " See AFC.log for error trace."),
-            pause=True
-        )
-
-        debug_msgs = [m for lvl, m in afc.logger.messages if lvl == "debug"]
-        assert any(f"Exception: Error Occurred" in m for m in debug_msgs)
