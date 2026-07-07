@@ -291,7 +291,9 @@ class AFCBuffer:
         :param pause: Boolean, if True triggers pause with error message
         """
         eventtime = self.reactor.monotonic()
-        if eventtime < self.min_event_systime or not self.enable or self.afc.function.is_paused():
+        if (eventtime < self.min_event_systime
+            or not self.enable
+            or self.afc.function.is_paused()):
             return
         if pause:
             if self.last_state == TRAILING_STATE_NAME:
@@ -334,7 +336,8 @@ class AFCBuffer:
         if self.led:
             self.afc.function.afc_led(self.led_buffer_disabled, self.led_index)
         self.reset_multiplier()
-        if self.error_sensitivity > 0 and self.extruder_pos_timer is not None:
+        if (self.error_sensitivity > 0
+            and self.extruder_pos_timer is not None):
             eventtime = self.reactor.monotonic()
             self.stop_fault_timer(eventtime)
         self.current_lane = None
@@ -694,7 +697,8 @@ class AFCBuffer:
         return self.response
 
 class FPSEndstopWrapper:
-    """Software endstop that triggers based on FPS reading threshold.
+    """
+    Software endstop that triggers based on FPS reading threshold.
 
     Implements the MCU endstop interface so klipper's homing/drip_move system
     can use the FPS analog reading as a buffer endstop — just like a turtleneck
