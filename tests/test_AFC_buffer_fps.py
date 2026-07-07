@@ -20,7 +20,6 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -38,14 +37,17 @@ from tests.conftest import MockConfig, MockPrinter, MockAFC
 
 # ── Fake ADC objects with real firmware signatures ────────────────────────────
 
+class _AdcMcu:
+    def estimated_print_time(self, eventtime):
+        return 42.0
+
+
 class _AdcBase:
     def __init__(self):
         self.calls = []
 
     def get_mcu(self):
-        mcu = MagicMock()
-        mcu.estimated_print_time.return_value = 42.0
-        return mcu
+        return _AdcMcu()
 
 
 class KalicoAdc(_AdcBase):
@@ -252,14 +254,59 @@ def test_virtual_advance_sensor_mirrors_advance_state():
 
 # ── FPSEndstopWrapper ─────────────────────────────────────────────────────────
 
+class _WrapperReactor:
+    """Typed reactor stand-in: records timer/completion interactions."""
+    NOW = 0.0
+    NEVER = 9_999_999_999.0
+
+    class _Completion:
+        def __init__(self):
+            self.completed = []
+
+        def complete(self, value):
+            self.completed.append(value)
+
+    def __init__(self):
+        self.completions = []
+        self.registered_timers = []
+        self.unregistered_timers = []
+
+    def monotonic(self):
+        return 10.0
+
+    def completion(self):
+        comp = self._Completion()
+        self.completions.append(comp)
+        return comp
+
+    def register_timer(self, callback, waketime=None):
+        self.registered_timers.append(callback)
+        return callback
+
+    def unregister_timer(self, timer):
+        self.unregistered_timers.append(timer)
+
+
+class _WrapperFps:
+    """fps stand-in providing the reactor and the ADC's MCU clock."""
+
+    class _Adc:
+        class _Mcu:
+            def estimated_print_time(self, eventtime):
+                return 42.0
+
+        def get_mcu(self):
+            return self._Mcu()
+
+    def __init__(self, reactor):
+        self.reactor = reactor
+        self.adc = self._Adc()
+
+
 def _make_wrapper(triggered_values):
     """Wrapper around a stub fps whose trigger function pops values."""
-    fps = MagicMock()
-    reactor = MagicMock()
-    completion = MagicMock()
-    reactor.completion.return_value = completion
-    fps.reactor = reactor
-    fps.adc.get_mcu.return_value.estimated_print_time.return_value = 42.0
+    reactor = _WrapperReactor()
+    fps = _WrapperFps(reactor)
 
     state = {"vals": list(triggered_values)}
 
@@ -267,44 +314,46 @@ def _make_wrapper(triggered_values):
         return state["vals"].pop(0) if state["vals"] else state.setdefault("last", False)
 
     wrapper = FPSEndstopWrapper(fps, trigger)
-    return wrapper, reactor, completion
+    return wrapper, reactor
 
 
 def test_endstop_already_triggered_completes_immediately():
-    wrapper, reactor, completion = _make_wrapper([True])
+    wrapper, reactor = _make_wrapper([True])
 
     wrapper.home_start(0.0, 0.0, 0, 0.0)
 
-    completion.complete.assert_called_once_with(True)
-    reactor.register_timer.assert_not_called()
+    assert reactor.completions[0].completed == [True]
+    assert reactor.registered_timers == []      # no polling needed
+    assert wrapper._trigger_time == 42.0
     assert wrapper.home_wait(99.0) == 42.0
 
 
 def test_endstop_polls_until_triggered():
-    wrapper, reactor, completion = _make_wrapper([False, False, True])
+    wrapper, reactor = _make_wrapper([False, False, True])
 
     wrapper.home_start(0.0, 0.0, 0, 0.0)
-    reactor.register_timer.assert_called_once()
-    completion.complete.assert_not_called()
+    assert len(reactor.registered_timers) == 1
+    assert reactor.completions[0].completed == []
 
     # Drive the poll callback like the reactor would
     assert wrapper._poll_fps(1.0) == 1.0 + FPS_ENDSTOP_POLL_TIME
     assert wrapper._poll_fps(2.0) == reactor.NEVER
-    completion.complete.assert_called_once_with(True)
+    assert reactor.completions[0].completed == [True]
     assert wrapper._trigger_time == 42.0
 
 
 def test_endstop_home_wait_unregisters_poll_timer():
-    wrapper, reactor, _ = _make_wrapper([False])
+    wrapper, reactor = _make_wrapper([False])
     wrapper.home_start(0.0, 0.0, 0, 0.0)
 
     result = wrapper.home_wait(99.0)
 
-    reactor.unregister_timer.assert_called_once()
+    assert len(reactor.unregistered_timers) == 1
+    assert wrapper._poll_timer is None
     assert result == 0.0  # never triggered
 
 
 def test_endstop_query():
-    wrapper, _, _ = _make_wrapper([True, False])
+    wrapper, _ = _make_wrapper([True, False])
     assert wrapper.query_endstop(0.0) == 1
     assert wrapper.query_endstop(0.0) == 0
