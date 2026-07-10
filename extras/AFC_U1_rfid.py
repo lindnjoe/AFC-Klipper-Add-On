@@ -509,6 +509,18 @@ class AFC_U1_RFID:
         if not self._try_attach_filament_detect():
             return eventtime + _BACKOFF_INTERVAL
 
+        # _trigger_channel_update runs FILAMENT_DT_UPDATE, whose internal M400
+        # (wait_moves) faults with "internal error on M400" and shuts Klipper
+        # down if issued from this reactor callback while the toolhead is
+        # mid-move. It is harmless at idle (no moves to flush) — which is why it
+        # normally works — but a standalone load feeds/extrudes filament past the
+        # scanner, so a poll tick could land during motion. Defer the read while
+        # the machine is busy; the spool tag is read on the next idle poll.
+        idle = self.printer.lookup_object('idle_timeout', None)
+        if (idle is not None
+                and idle.get_status(eventtime).get('state') == 'Printing'):
+            return eventtime + POLL_INTERVAL
+
         for ch in self._scanner_channels:
             if not self._trigger_channel_update(ch):
                 self._consecutive_failures[ch] = \
