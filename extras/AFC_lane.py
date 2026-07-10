@@ -229,6 +229,24 @@ class AFCLane:
             buttons.register_buttons([self.load], self.load_callback)
         else: self._load_state = True
 
+        # ── External-feeder prep/load source (standalone lanes, e.g. U1) ──────
+        # A standalone/direct lane has no AFC prep or load switch; an external
+        # feeder module (the U1 `[filament_feed left|right]`) reports filament
+        # presence per channel via get_status. Point feed_module + feed_channel
+        # at that module's status channel and this lane mirrors the feeder's
+        # "staged" state (present AND preload_finish) into prep_state/_load_state
+        # so AFC sees the lane as loaded-and-ready — TOOL_LOAD then proceeds and
+        # runs custom_load_cmd to drive the final leg to the toolhead sensor,
+        # instead of bailing out as an empty lane.
+        self.feed_module  = config.get('feed_module', None)    # 'left' or 'right'
+        self.feed_channel = config.get('feed_channel', None)   # e.g. 'extruder1'
+        self._feed_obj = None
+        self._feed_staged_last = None
+        self._feed_timer = None
+        if self.feed_module and self.feed_channel:
+            # State is driven by the feeder poll, not the (absent) load switch.
+            self._load_state = False
+
         self.selector: str = config.get("selector", None)
 
         self.espooler = AFC_assist.Espooler(self.name, config)
@@ -473,6 +491,41 @@ class AFCLane:
             self.prep_debounce_button.debounce_delay = self.debounce_delay
         if hasattr(self, "load_debounce_button"):
             self.load_debounce_button.debounce_delay = self.debounce_delay
+
+        # Start the external-feeder prep/load poll for standalone lanes.
+        if self.feed_module and self.feed_channel:
+            self._feed_obj = self.printer.lookup_object(
+                "filament_feed {}".format(self.feed_module), None)
+            if self._feed_obj is None:
+                raise error("Lane {}: [filament_feed {}] not found for "
+                            "feed_module".format(self.name, self.feed_module))
+            self._feed_timer = self.reactor.register_timer(
+                self._feed_channel_poll, self.reactor.monotonic() + 1.0)
+
+    def _feed_channel_staged(self):
+        """Return True when the external feeder has staged filament for this
+        lane's channel — present AND preloaded to the toolhead entry."""
+        try:
+            ch = self._feed_obj.get_status(
+                self.reactor.monotonic()).get(self.feed_channel, {})
+        except Exception:
+            return False
+        return (ch.get('filament_detected') is True
+                and ch.get('channel_state') == 'preload_finish')
+
+    def _feed_channel_poll(self, eventtime):
+        """Mirror the external feeder's staged state into this lane's prep/load
+        state so AFC treats the standalone lane as loaded-and-ready. On the
+        rising edge TOOL_LOAD becomes valid (custom_load_cmd then drives the
+        final leg to the toolhead sensor); on the falling edge the lane reads
+        empty again."""
+        staged = self._feed_channel_staged()
+        if staged != self._feed_staged_last:
+            self._feed_staged_last = staged
+            self.prep_state = staged
+            self._load_state = staged
+            self.afc.save_vars()
+        return eventtime + 0.5
 
     def _get_hub_object(self):
         """
