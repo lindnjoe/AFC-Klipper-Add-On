@@ -550,7 +550,17 @@ class AFCExtruder:
                     if (self.tc_lane._afc_prep_done
                         and not actively_printing):
                         if state:
-                            if not self.load_active:
+                            # A lane with a custom_load_cmd drives the entire
+                            # load — including the tool_stn advance to the nozzle
+                            # — through that command, which also owns the extruder
+                            # temp. Skip the built-in extruder-only move here: the
+                            # sensor trips mid-load while the custom command is
+                            # still feeding, and this move's completion restores
+                            # the toolhead temp to idle, cold-faulting the still-
+                            # running load. Let the custom command finish first.
+                            if (not self.load_active
+                                    and not getattr(self.tc_lane,
+                                                    'custom_load_cmd', None)):
                                 self.load_unload_sequence(self.tool_stn)
                         else:
                             self.tc_lane.set_tool_unloaded()
