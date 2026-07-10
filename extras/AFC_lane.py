@@ -239,7 +239,7 @@ class AFCLane:
         # runs custom_load_cmd to drive the final leg to the toolhead sensor,
         # instead of bailing out as an empty lane.
         self.feed_module  = config.get('feed_module', None)    # 'left' or 'right'
-        self.feed_channel = config.get('feed_channel', None)   # e.g. 'extruder1'
+        self.feed_channel = config.get('feed_channel', None)   # AFC extruder name ('e1') or raw feeder key ('extruder1')
         self._feed_obj = None
         self._feed_staged_last = None
         self._feed_timer = None
@@ -499,6 +499,22 @@ class AFCLane:
             if self._feed_obj is None:
                 raise error("Lane {}: [filament_feed {}] not found for "
                             "feed_module".format(self.name, self.feed_module))
+            # feed_channel may be given as an AFC extruder name (e.g. 'e2') or as
+            # the raw feeder channel key ('extruder2'). If it names an
+            # AFC_extruder, resolve to that extruder's physical channel key —
+            # 'extruder<index>', which is how filament_feed keys its channels
+            # (note e0 -> 'extruder0' even though its klipper extruder is
+            # 'extruder'). A raw key that isn't an AFC_extruder is used as-is.
+            ext_obj = self.printer.lookup_object(
+                "AFC_extruder {}".format(self.feed_channel), None)
+            if ext_obj is not None:
+                kext = getattr(ext_obj, 'toolhead_extruder', None)
+                idx = getattr(kext, 'extruder_index', None)
+                if idx is None:
+                    suffix = getattr(ext_obj, 'th_extruder_name',
+                                     'extruder')[len('extruder'):]
+                    idx = int(suffix) if suffix.isdigit() else 0
+                self.feed_channel = "extruder{}".format(idx)
             self._feed_timer = self.reactor.register_timer(
                 self._feed_channel_poll, self.reactor.monotonic() + 1.0)
 
