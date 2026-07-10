@@ -503,15 +503,20 @@ class AFCLane:
                 self._feed_channel_poll, self.reactor.monotonic() + 1.0)
 
     def _feed_channel_staged(self):
-        """Return True when the external feeder has staged filament for this
-        lane's channel — present AND preloaded to the toolhead entry."""
+        """Return True when the external feeder holds filament for this lane —
+        present AND at least staged to the toolhead entry. This covers both
+        'preload_finish' (staged, ready to load) and 'load_finish' (loaded to
+        the toolhead): in both the filament is physically present, so the lane
+        must read prep/load True. Treating only 'preload_finish' as present made
+        a loaded lane (load_finish) look empty to AFC and broke unload/state
+        reconciliation."""
         try:
             ch = self._feed_obj.get_status(
                 self.reactor.monotonic()).get(self.feed_channel, {})
         except Exception:
             return False
         return (ch.get('filament_detected') is True
-                and ch.get('channel_state') == 'preload_finish')
+                and ch.get('channel_state') in ('preload_finish', 'load_finish'))
 
     def _feed_channel_poll(self, eventtime):
         """Mirror the external feeder's staged state into this lane's prep/load
