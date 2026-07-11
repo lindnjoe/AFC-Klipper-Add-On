@@ -66,6 +66,7 @@ def _make_buffer(name="TN", error_sensitivity=0.0):
 
     buf.multiplier_high = 1.1
     buf.multiplier_low = 0.9
+    buf._last_multiplier = 1
 
     buf.led = False
     buf.led_index = None
@@ -816,7 +817,7 @@ class TestGetStatus:
         result = buf.get_status()
         for key in ("state", "lanes", "enabled", "rotation_distance",
                     "fault_detection_enabled", "error_sensitivity",
-                    "fault_timer", "distance_to_fault"):
+                    "fault_timer", "distance_to_fault", "multiplier"):
             assert key in result, f"Missing key: {key}"
 
     def test_enabled_false_by_default(self):

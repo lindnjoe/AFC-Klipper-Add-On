@@ -45,6 +45,8 @@ import threading
 import time
 import types
 import itertools
+import importlib.util
+import configparser
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -88,6 +90,70 @@ from extras.AFC_OpenAMS import (  # noqa: E402
 from extras.AFC_lane import AFCLaneState  # noqa: E402
 from extras.AFC_unit import afcUnit  # noqa: E402
 from tests.conftest import MockAFC, MockPrinter, MockReactor, MockLogger, MockConfig
+
+
+def _exec_afc_openams_with_blocked_dependency(blocked_module_name):
+    """Execute a throw-away copy of extras/AFC_OpenAMS.py's module-level code
+    with `blocked_module_name` forced to fail import, to exercise the file's
+    top-level ``try: from X import Y / except: raise error(...)`` guards.
+
+    This never touches the real, already-imported ``extras.AFC_OpenAMS``
+    module that the rest of this test suite (and extras.AFC_OAMS, which
+    imports AMSHardwareService from it) depends on: the copy is loaded under
+    a throwaway module name and discarded afterward, whether or not it
+    raises. Blocking an import via ``sys.modules[name] = None`` is a standard
+    Python mechanism -- it makes any ``import``/``from ... import`` of that
+    name raise ImportError immediately, without touching the module itself.
+
+    Critically, cleanup restores the *exact same* pre-existing module object
+    in sys.modules (not just removes the block) -- simply deleting the entry
+    would let it get re-imported fresh the next time anything touches it,
+    producing new, distinct class objects that no longer match what other
+    test files already imported and bound references to (this broke
+    test_AFC_utils.py's own AFC_moonraker tests when first tried).
+    """
+    import extras.AFC_OpenAMS as real_module
+    fresh_name = "extras.AFC_OpenAMS_import_guard_probe"
+    original_blocked_module = sys.modules.get(blocked_module_name)
+    sys.modules[blocked_module_name] = None
+    try:
+        spec = importlib.util.spec_from_file_location(fresh_name, real_module.__file__)
+        fresh = importlib.util.module_from_spec(spec)
+        sys.modules[fresh_name] = fresh
+        try:
+            spec.loader.exec_module(fresh)
+        finally:
+            sys.modules.pop(fresh_name, None)
+    finally:
+        if original_blocked_module is not None:
+            sys.modules[blocked_module_name] = original_blocked_module
+        else:
+            sys.modules.pop(blocked_module_name, None)
+
+
+class TestModuleImportGuards:
+    """Covers the three module-level `try/except: raise error(...)` guards
+    around AFC_OpenAMS.py's imports of AFC_utils, AFC_lane, and AFC_unit."""
+
+    def test_afc_utils_import_failure_raises_configparser_error(self):
+        with pytest.raises(configparser.Error) as exc_info:
+            _exec_afc_openams_with_blocked_dependency("extras.AFC_utils")
+        assert str(exc_info.value).startswith(
+            "Error when trying to import AFC_utils.ERROR_STR")
+
+    def test_afc_lane_import_failure_raises_configparser_error(self):
+        with pytest.raises(configparser.Error) as exc_info:
+            _exec_afc_openams_with_blocked_dependency("extras.AFC_lane")
+        assert str(exc_info.value).startswith(
+            "Error trying to import AFC_lane, please rerun install-afc.sh "
+            "script in your AFC-Klipper-Add-On directory then restart klipper")
+
+    def test_afc_unit_import_failure_raises_configparser_error(self):
+        with pytest.raises(configparser.Error) as exc_info:
+            _exec_afc_openams_with_blocked_dependency("extras.AFC_unit")
+        assert str(exc_info.value).startswith(
+            "Error trying to import AFC_unit, please rerun install-afc.sh "
+            "script in your AFC-Klipper-Add-On directory then restart klipper")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -930,7 +996,9 @@ class TestSetFollowerIfChanged:
         oams = MagicMock()
         oams.set_oams_follower.side_effect = Exception("mcu error")
         fc._set_follower_if_changed("ams1", oams, 1, 0, "ctx")
-        assert any(lvl == "error" for lvl, _ in logger.messages)
+        assert (
+            "error", "Failed to set follower on ams1: mcu error"
+        ) in logger.messages
         # last_state not updated on failure
         assert fc.get_follower_state("ams1").last_state is None
 
@@ -984,7 +1052,9 @@ class TestLedErrorControl:
 
         fc.set_led_error_if_changed(oams, "ams1", 0, 1, "ctx")
 
-        assert any(lvl == "error" for lvl, _ in logger.messages)
+        assert (
+            "error", "MCU command failed for ams1: mcu offline"
+        ) in logger.messages
 
     def test_set_led_error_if_changed_dispatch_failure_logged(self):
         """Covers the outer try/except in set_led_error_if_changed itself
@@ -996,7 +1066,9 @@ class TestLedErrorControl:
 
         fc.set_led_error_if_changed(oams, "ams1", 0, 1, "ctx")
 
-        assert any(lvl == "error" for lvl, _ in logger.messages)
+        assert (
+            "error", "Failed to set LED error on ams1: dispatch failed"
+        ) in logger.messages
 
 
 class TestRateLimitedMcuCommandQueue:
@@ -1031,7 +1103,7 @@ class TestRateLimitedMcuCommandQueue:
         fc, reactor, logger = _make_follower_controller({"ams1": oams})
         cmd = MagicMock(side_effect=Exception("boom"))
         fc.rate_limited_mcu_command("ams1", cmd)  # must not raise
-        assert any(lvl == "error" for lvl, _ in logger.messages)
+        assert ("error", "MCU command failed for ams1: boom") in logger.messages
 
     def test_busy_oams_defers_via_timer(self):
         oams = MagicMock()
@@ -1458,7 +1530,9 @@ class TestOAMSMonitorTick:
 
         result = monitor._monitor_tick(100.0)
 
-        assert any(lvl == "error" for lvl, _ in monitor.logger.messages)
+        assert (
+            "error", "Monitor error on FPS_buffer1: boom"
+        ) in monitor.logger.messages
         from extras.AFC_OpenAMS import MONITOR_INTERVAL
         assert result == 100.0 + MONITOR_INTERVAL
 
@@ -1938,7 +2012,9 @@ class TestVerifyEngagement:
         result = ams._verify_engagement(lane)
 
         assert result is False
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert (
+            "error", "Engagement verification failed: encoder moved only 0 clicks"
+        ) in ams.logger.messages
 
     def test_no_oams_returns_false_without_reading_encoder(self):
         ams, afc, printer, reactor = _make_ams(oams=None)
@@ -2207,7 +2283,9 @@ class TestCalibrateHubHesSpool:
         ams._get_oams_index = MagicMock(return_value=1)
         afc.gcode.run_script_from_command.side_effect = Exception("boom")
         assert ams._calibrate_hub_hes_spool(0) is False
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert (
+            "error", "Hub HES calibration failed for spool 0: boom"
+        ) in ams.logger.messages
 
 
 class TestToolheadSensorTriggered:
@@ -2380,7 +2458,10 @@ class TestWaitForHubSettle:
         result = ams._wait_for_hub_settle(0, timeout=4.0)
 
         assert result is False
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning",
+            "OAMS hub HES did not settle clear within 4.0s (spool 0); proceeding",
+        ) in ams.logger.messages
 
     def test_reading_exception_treated_as_not_present(self):
         class _RaisingOams:
@@ -2605,13 +2686,21 @@ class TestSimpleOverrides:
         ams, afc, printer, reactor = _make_ams()
         lane = _make_lane("lane1")
         ams.eject_lane(lane)
-        assert any(lvl == "info" for lvl, _ in ams.logger.messages)
+        assert (
+            "info",
+            "Eject not supported for OpenAMS lane lane1. "
+            "Remove spool physically or use TOOL_UNLOAD.",
+        ) in ams.logger.messages
 
     def test_lane_move_logs_info(self):
         ams, afc, printer, reactor = _make_ams()
         lane = _make_lane("lane1")
         ams.lane_move(lane, 10, "short")
-        assert any(lvl == "info" for lvl, _ in ams.logger.messages)
+        assert (
+            "info",
+            "Lane move not supported for OpenAMS lane lane1. "
+            "OpenAMS firmware controls filament movement.",
+        ) in ams.logger.messages
 
     def test_get_lane_reset_command_returns_none(self):
         ams, afc, printer, reactor = _make_ams()
@@ -2635,7 +2724,9 @@ class TestSimpleOverrides:
         oams.unload_spool_with_retry.side_effect = Exception("boom")
         ams, afc, printer, reactor = _make_ams(oams=oams)
         assert ams.lane_unload(_make_lane("lane1")) is True
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert (
+            "error", "OpenAMS lane_unload failed: boom"
+        ) in ams.logger.messages
 
 
 # ── calibrate_lane / calibrate_bowden ─────────────────────────────────────
@@ -2799,7 +2890,9 @@ class TestLaneUnloadingAndPrepareUnload:
         lane = _make_lane("lane1")
         with patch.object(afcUnit, "lane_unloading", MagicMock()):
             ams.lane_unloading(lane)  # must not raise
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "OAMS: lane_unloading follower-stop error for lane1: boom"
+        ) in ams.logger.messages
 
 
 class TestOamsLoadSequence:
@@ -3047,7 +3140,7 @@ class TestInitFollowerAndMonitor:
         with patch("extras.AFC_OpenAMS.FollowerController", side_effect=Exception("boom")):
             ams._init_follower_and_monitor()
         assert ams._follower is None
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert ("error", "Failed to init follower: boom") in ams.logger.messages
 
     def test_follower_controller_class_unavailable_skips_creation(self):
         oams = MagicMock()
@@ -3066,7 +3159,7 @@ class TestInitFollowerAndMonitor:
         with patch("extras.AFC_OpenAMS.OAMSMonitor", side_effect=Exception("boom")):
             ams._init_follower_and_monitor()
         assert ams._monitor is None
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert ("error", "Failed to init monitor: boom") in ams.logger.messages
 
 
 class TestHandleReady:
@@ -3075,14 +3168,18 @@ class TestHandleReady:
         printer._objects[f"AFC_OAMS {ams.oams_name}"] = None
         with patch.object(afcUnit, "handle_ready", MagicMock(side_effect=Exception("x"))):
             ams.handle_ready()  # must not raise
-        assert any(lvl == "debug" for lvl, _ in ams.logger.messages)
+        assert ("debug", "afcUnit.handle_ready: x") in ams.logger.messages
 
     def test_oams_not_found_logs_warning_and_returns(self):
         ams, afc, printer, reactor = _make_ams()
         with patch.object(afcUnit, "handle_ready", MagicMock()):
             ams.handle_ready()
         assert ams.oams is None
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning",
+            "OpenAMS hardware '[AFC_OAMS oams1]' not found for 'ams1'. "
+            "Sensor state will not update.",
+        ) in ams.logger.messages
         assert ams._poll_timer is None
 
     def test_oams_found_initializes_and_starts_polling(self):
@@ -3387,7 +3484,7 @@ class TestOnStuckSpoolDetected:
 
         ams._on_stuck_spool_detected(fps_name="fps1")  # must not raise
 
-        assert any(lvl == "debug" for lvl, _ in ams.logger.messages)
+        assert ("debug", "stuck LED set failed: mcu offline") in ams.logger.messages
 
 
 class TestOnClogDetected:
@@ -3416,12 +3513,12 @@ class TestOnStuckSpoolCleared:
     def test_logs_info_with_fps_name(self):
         ams, afc, printer, reactor = _make_ams()
         ams._on_stuck_spool_cleared(fps_name="fps1")
-        assert any(lvl == "info" and "fps1" in m for lvl, m in ams.logger.messages)
+        assert ("info", "Stuck spool cleared on fps1") in ams.logger.messages
 
     def test_logs_info_without_fps_name(self):
         ams, afc, printer, reactor = _make_ams()
         ams._on_stuck_spool_cleared()
-        assert any(lvl == "info" for lvl, _ in ams.logger.messages)
+        assert ("info", "Stuck spool cleared") in ams.logger.messages
 
 
 class TestOnStuckSpoolRecoveryNeeded:
@@ -3445,7 +3542,9 @@ class TestOnStuckSpoolRecoveryNeeded:
         ams.gcode.run_script_from_command.side_effect = [Exception("boom"), None]
         ams._on_stuck_spool_recovery_needed("fps1", "lane1")
         assert ams.gcode.run_script_from_command.call_args_list[1][0][0] == "PAUSE"
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert (
+            "error", "Failed to schedule stuck spool recovery for lane1: boom"
+        ) in ams.logger.messages
 
     def test_pause_fallback_also_failing_is_logged(self):
         ams, afc, printer, reactor = _make_ams()
@@ -3540,13 +3639,15 @@ class TestStuckSpoolRecoveryClearOamsState:
 
         ams._stuck_spool_recovery_clear_oams_state("fps1", "lane1")  # must not raise
 
-        assert any(lvl == "debug" for lvl, _ in ams.logger.messages)
+        assert ("debug", "clear_error_led failed: boom") in ams.logger.messages
 
     def test_get_monitor_state_exception_is_logged_as_warning(self):
         ams, afc, printer, reactor = _make_ams()
         ams._get_monitor_state = MagicMock(side_effect=Exception("boom"))
         ams._stuck_spool_recovery_clear_oams_state("fps1", "lane1")  # must not raise
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "Failed to clear stuck spool state: boom"
+        ) in ams.logger.messages
 
 
 class TestCmdStuckSpoolRecovery:
@@ -3635,7 +3736,9 @@ class TestCmdStuckSpoolRecovery:
 
         ams._cmd_stuck_spool_recovery(self._gcmd())
 
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "Stuck spool recovery: Z-hop failed: no position"
+        ) in ams.logger.messages
         afc.TOOL_UNLOAD.assert_called_once()
 
     def test_tool_unload_returns_false_triggers_fallback(self):
@@ -3753,7 +3856,9 @@ class TestCmdStuckSpoolRecovery:
 
         ams._cmd_stuck_spool_recovery(self._gcmd())  # must not raise
 
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert (
+            "error", "Stuck spool recovery: AFC_RESUME failed: resume failed"
+        ) in ams.logger.messages
 
     def test_forces_is_paused_true_before_resume_when_not_paused(self):
         ams, afc, printer, reactor = _make_ams()
@@ -3924,7 +4029,7 @@ class TestCmdClearErrors:
         ams, afc, printer, reactor = _make_ams(oams=oams)
         gcmd = _make_gcmd()
         ams.cmd_AFC_OAMS_CLEAR_ERRORS(gcmd)  # must not raise
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert ("error", "Error clearing OAMS errors: boom") in ams.logger.messages
 
     def test_unsyncs_tool_loaded_lanes(self):
         oams = MagicMock()
@@ -3942,7 +4047,9 @@ class TestCmdClearErrors:
         ams, afc, printer, reactor = _make_ams(oams=oams, lanes={"lane1": lane})
         gcmd = _make_gcmd()
         ams.cmd_AFC_OAMS_CLEAR_ERRORS(gcmd)  # must not raise
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "Failed to clear lane_loaded for lane1: boom"
+        ) in ams.logger.messages
 
     def test_restores_leds_tool_loaded_branch(self):
         oams = MagicMock()
@@ -4230,7 +4337,9 @@ class TestClearLaneInfo:
         afc.spool.set_spoolID.side_effect = Exception("moonraker offline")
         lane = _make_lane("lane1", spool_id=42)
         ams._clear_lane_info(lane)  # must not raise
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "OAMS: failed to clear spool_id on lane1: moonraker offline"
+        ) in ams.logger.messages
 
     def test_calls_send_lane_data(self):
         ams, afc, printer, reactor = _make_ams()
@@ -4281,7 +4390,9 @@ class TestCancelAndMarkLoaded:
         ams._cancel_and_mark_loaded(3, "lane1")
 
         assert oams.action_status is None
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "Cancel response timeout - forcing action_status clear"
+        ) in ams.logger.messages
 
     def test_updates_monitor_state_when_present(self):
         oams = MagicMock()
@@ -4389,7 +4500,9 @@ class TestUnloadAfterTd1:
         ams._unload_after_td1(lane, 0)
 
         assert oams.unload_spool.call_count == 2
-        assert any(lvl == "debug" for lvl, _ in ams.logger.messages)
+        assert (
+            "debug", "TD-1 unload attempt 1 failed: busy"
+        ) in ams.logger.messages
 
     def test_clear_errors_failure_is_swallowed(self):
         ams, afc, printer, reactor = _make_ams()
@@ -4566,7 +4679,7 @@ class TestOamsLoad:
         ams, afc, printer, reactor = _make_ams(oams=None)
         lane = self._lane()
         assert ams._oams_load(lane) is False
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert ("error", "OAMS hardware not available") in ams.logger.messages
 
     def test_determine_current_spool_exception_falls_through_to_real_load(self):
         oams = MagicMock()
@@ -4731,7 +4844,9 @@ class TestOamsLoad:
 
         assert result is True
         assert oams.load_spool_with_retry.call_count == 2
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert (
+            "error", "OAMS load attempt 1 failed: busy"
+        ) in ams.logger.messages
 
     def test_deferred_engagement_skips_verify_engagement(self):
         oams = MagicMock()
@@ -4838,7 +4953,9 @@ class TestOamsLoad:
 
         ams._oams_load(lane, max_retries=1)  # must not raise
 
-        assert any(lvl == "debug" for lvl, _ in ams.logger.messages)
+        assert (
+            "debug", "clear_errors after failed load: boom"
+        ) in ams.logger.messages
 
     def test_retries_reenable_follower_between_attempts(self):
         oams = MagicMock()
@@ -4945,7 +5062,7 @@ class TestOamsUnload:
     def test_no_oams_returns_false(self):
         ams, afc, printer, reactor = _make_ams(oams=None)
         assert ams._oams_unload(self._lane()) is False
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert ("error", "OAMS hardware not available") in ams.logger.messages
 
     def test_stops_monitor(self):
         oams = self._ready_oams()
@@ -4997,7 +5114,10 @@ class TestOamsUnload:
 
         ams._oams_unload(self._lane())  # must not raise
 
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning",
+            "OAMS: follower reverse before unload retract failed: mcu offline",
+        ) in ams.logger.messages
 
     def test_no_follower_is_safe(self):
         oams = self._ready_oams()
@@ -5044,7 +5164,9 @@ class TestOamsUnload:
 
         ams._oams_unload(lane)  # must not raise
 
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "Extruder retract before OAMS unload failed: boom"
+        ) in ams.logger.messages
 
     def test_runout_empty_skips_hardware_unload(self):
         oams = self._ready_oams()
@@ -5127,7 +5249,9 @@ class TestOamsUnload:
 
         ams._oams_unload(self._lane())  # must not raise
 
-        assert any(lvl == "warning" for lvl, _ in ams.logger.messages)
+        assert (
+            "warning", "Concurrent retract failed: gcode busy"
+        ) in ams.logger.messages
 
     def test_f1s_present_updates_prep_and_hub_state(self):
         oams = self._ready_oams(hw_spool=0)
@@ -5927,7 +6051,9 @@ class TestCaptureTd1WithOams:
 
         assert success is False
         assert "not captured" in msg
-        assert any(lvl == "error" for lvl, _ in ams.logger.messages)
+        assert (
+            "error", "TD-1 capture failed for lane1: moonraker down"
+        ) in ams.logger.messages
 
     def test_cancel_and_mark_loaded_failure_is_swallowed(self):
         oams = MagicMock()

@@ -287,11 +287,14 @@ class TestInitDevice:
         first_call = sensor.i2c.i2c_write.call_args_list[0]
         assert first_call[0][0] == [CONF_REG, 1 << 4, 0x00]
 
-    def test_marks_init_sent_true(self):
+    def test_marks_init_sent_true(self, caplog):
+        import logging
         sensor = _make_sensor()
         sensor.i2c.i2c_read.return_value = {"response": bytearray([0x00, 0x00])}
-        sensor._init_device()
+        with caplog.at_level(logging.INFO):
+            sensor._init_device()
         assert sensor.init_sent is True
+        assert "temperature_oams oams1: manufacturer=0x0 device=0x0" in caplog.text
 
     def test_sets_temp_resolution_bits(self):
         sensor = _make_sensor()
@@ -376,12 +379,15 @@ class TestReadTemp:
         assert ok is True
         assert celsius == pytest.approx(42.5)
 
-    def test_i2c_exception_returns_zero_and_false(self):
+    def test_i2c_exception_returns_zero_and_false(self, caplog):
+        import logging
         sensor = _make_sensor()
         sensor.i2c.i2c_write.side_effect = Exception("i2c bus error")
-        celsius, ok = sensor._read_temp()
+        with caplog.at_level(logging.DEBUG):
+            celsius, ok = sensor._read_temp()
         assert ok is False
         assert celsius == 0.0
+        assert "temperature_oams oams1: temp read failed: i2c bus error" in caplog.text
 
     def test_writes_temp_register_first(self):
         sensor = _make_sensor()
@@ -399,12 +405,15 @@ class TestReadHumidity:
         assert ok is True
         assert percent == pytest.approx(50.0)
 
-    def test_i2c_exception_returns_zero_and_false(self):
+    def test_i2c_exception_returns_zero_and_false(self, caplog):
+        import logging
         sensor = _make_sensor()
         sensor.i2c.i2c_write.side_effect = Exception("i2c bus error")
-        percent, ok = sensor._read_humidity()
+        with caplog.at_level(logging.DEBUG):
+            percent, ok = sensor._read_humidity()
         assert ok is False
         assert percent == 0.0
+        assert "temperature_oams oams1: humidity read failed: i2c bus error" in caplog.text
 
     def test_writes_humidity_register_first(self):
         sensor = _make_sensor()
@@ -496,19 +505,25 @@ class TestSample:
         assert result == 105.0
         sensor._callback.assert_not_called()
 
-    def test_both_fail_at_threshold_backs_off(self):
+    def test_both_fail_at_threshold_backs_off(self, caplog):
+        import logging
         sensor = _make_sensor(init_sent=True, report_time=5)
         sensor._max_consecutive_errors = 5
         sensor._consecutive_errors = 4
         sensor._read_temp = MagicMock(return_value=(0.0, False))
         sensor._read_humidity = MagicMock(return_value=(0.0, False))
 
-        result = sensor._sample(100.0)
+        with caplog.at_level(logging.WARNING):
+            result = sensor._sample(100.0)
 
         # 4 -> +1 (temp fail) -> +1 (both fail) = 6 >= 5
         assert sensor._consecutive_errors == 6
         assert result == 100.0 + 5 * 3
         sensor._callback.assert_not_called()
+        assert (
+            "temperature_oams oams1: 6 consecutive I2C errors, backing off"
+            in caplog.text
+        )
 
     def test_applies_temp_and_humidity_offsets(self):
         sensor = _make_sensor(init_sent=True)

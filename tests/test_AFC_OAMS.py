@@ -253,7 +253,10 @@ class TestInit:
             mock_service_cls.for_printer.side_effect = Exception("boom")
             oams = AFC_OAMS(config)  # should not raise
         assert oams.hardware_service is None
-        assert any("Failed to register OAMS controller" in m for _, m in afc.logger.messages)
+        assert (
+            "error",
+            "Failed to register OAMS controller with AMSHardwareService: boom",
+        ) in afc.logger.messages
 
     def test_hardware_service_class_unavailable_skips_registration(self):
         """When AMSHardwareService failed to import (module attr is None,
@@ -394,7 +397,7 @@ class TestBayHelpers:
         oams = _make_oams()
         result = oams.is_bay_ready(10)
         assert result is False
-        assert any(lvl == "error" for lvl, _ in oams.logger.messages)
+        assert ("error", "Invalid bay_index 10, must be 0-3") in oams.logger.messages
 
     def test_is_bay_loaded_true(self):
         oams = _make_oams()
@@ -461,7 +464,7 @@ class TestHandleConnect:
             f"Failed to initialize OAMS load filament cancel command: not supported\n"
                     "Most likely the firmware needs to be updated to support this command."
         )
-        assert any(m in m for m in debug_msgs)
+        assert any(m in m for m in warning_msgs)
         oams.clear_errors.assert_called_once()
 
     def test_general_failure_is_logged_not_raised(self):
@@ -470,7 +473,7 @@ class TestHandleConnect:
 
         oams.handle_connect()  # must not raise
 
-        assert any(lvl == "error" for lvl, _ in oams.logger.messages)
+        assert ("error", "Failed to initialize OAMS commands: mcu offline") in oams.logger.messages
 
 
 # ── handle_ready ──────────────────────────────────────────────────────────────
@@ -511,7 +514,9 @@ class TestClearErrors:
         oams.clear_errors()
 
         assert oams.set_led_error.call_count == 4
-        assert any(lvl == "error" for lvl, _ in oams.logger.messages)
+        assert (
+            "error", "Failed to clear LED error for bay 1 on oams0: fail"
+        ) in oams.logger.messages
 
     def test_sets_current_spool_from_determine(self):
         oams = _make_oams()
@@ -529,7 +534,10 @@ class TestClearErrors:
 
         oams.clear_errors()  # must not raise
 
-        assert any(lvl == "error" for lvl, _ in oams.logger.messages)
+        assert (
+            "error",
+            "Failed to determine current spool during clear_errors on oams0: query failed",
+        ) in oams.logger.messages
 
     def test_clears_action_status_fields(self):
         oams = _make_oams()
@@ -579,7 +587,11 @@ class TestDetermineCurrentSpool:
         oams.oams_spool_query_spool_cmd.send = MagicMock(return_value={"spool": 99})
         result = oams.determine_current_spool()
         assert result is None
-        assert any(lvl == "warning" for lvl, _ in oams.logger.messages)
+        assert (
+            "warning",
+            "OAMS[0]: Unexpected spool index 99 from hardware "
+            "(expected 0-3 or 255); treating as no spool loaded",
+        ) in oams.logger.messages
 
 
 # ── register_commands ─────────────────────────────────────────────────────────
@@ -828,7 +840,10 @@ class TestUnloadSpoolWithRetry:
         success, message = oams.unload_spool_with_retry(max_retries=3)
 
         assert success is True
-        assert any(lvl == "warning" for lvl, _ in oams.logger.messages)
+        assert (
+            "warning",
+            "OAMS[0]: Failed to retract extruder before unload retry: no extruder",
+        ) in oams.logger.messages
 
     def test_all_attempts_fail(self):
         oams = _make_oams()
@@ -1262,7 +1277,9 @@ class TestLoadSpool:
         code, message = oams.load_spool(0)
 
         assert code == OAMSOpCode.ERROR_UNSPECIFIED
-        assert any(lvl == "warning" for lvl, _ in oams.logger.messages)
+        assert (
+            "warning", "OAMS[0]: Failed to cancel stalled load: cancel failed"
+        ) in oams.logger.messages
 
     def test_timeout_cancel_failure_is_logged_as_warning(self):
         oams = _make_oams()
@@ -1278,7 +1295,10 @@ class TestLoadSpool:
 
         assert code == OAMSOpCode.ERROR_UNSPECIFIED
         assert "timed out" in message
-        assert any(lvl == "warning" for lvl, _ in oams.logger.messages)
+        assert (
+            "warning",
+            "OAMS[0]: Failed to cancel stuck load after timeout: cancel failed",
+        ) in oams.logger.messages
 
 
 # ── cmd_OAMS_LOAD_SPOOL ───────────────────────────────────────────────────────
@@ -1535,7 +1555,10 @@ class TestAbortCurrentAction:
         oams.action_status = OAMSStatus.LOADING
         oams.load_spool_cancel = MagicMock(side_effect=Exception("no cancel cmd"))
         oams.abort_current_action(wait=False)  # must not raise
-        assert any(lvl == "warning" for lvl, _ in oams.logger.messages)
+        assert (
+            "warning",
+            "OAMS[0]: Failed to send firmware cancel during abort: no cancel cmd",
+        ) in oams.logger.messages
 
 
 # ── cmd_OAMS_FOLLOWER ──────────────────────────────────────────────────────────
