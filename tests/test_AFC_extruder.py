@@ -903,6 +903,7 @@ def _make_ext_for_tool_start(name="extruder"):
     tc_lane._load_state   = False
     tc_lane.prep_state    = False
     tc_lane._afc_prep_done = False
+    tc_lane.custom_load_cmd = None   # standard lane: built-in load runs
     ext.tc_lane           = tc_lane
 
     return ext
@@ -1054,6 +1055,17 @@ class TestToolStartCallback_StateChanged_WithToolchanger:
     def test_load_sequence_not_called_when_load_already_active(self):
         ext = self._make_tc_ext(printer_ready=True, prep_done=True,
                                 state=True, load_active=True)
+        ext.tool_start_callback(100.0, True)
+        ext.load_unload_sequence.assert_not_called()
+
+    def test_load_sequence_skipped_when_lane_has_custom_load_cmd(self):
+        # A lane with a custom_load_cmd drives the whole load (incl. the tool_stn
+        # advance) itself, so the built-in extruder move must be skipped — else
+        # its completion restores the toolhead temp to idle and cold-faults the
+        # still-running custom load.
+        ext = self._make_tc_ext(printer_ready=True, prep_done=True,
+                                state=True, load_active=False)
+        ext.tc_lane.custom_load_cmd = "AFC_STANDALONE_LOAD_U1"
         ext.tool_start_callback(100.0, True)
         ext.load_unload_sequence.assert_not_called()
 
