@@ -932,8 +932,6 @@ class AFCFPSBuffer(AFCBuffer):
 
         # Timer interval for applying corrections
         self.update_interval: float = config.getfloat('update_interval', 0.25, minval=0.05)
-        self.flip_cooldown: float = config.getfloat('flip_cooldown', 30, minval=0.0)
-        self._flip_suppress_until: float = 0.0
         self._last_correction_direction: str = NEUTRAL_STATE_NAME
 
         # ---- Fault detection ----
@@ -1167,16 +1165,6 @@ class AFCFPSBuffer(AFCBuffer):
         else:
             target_direction = NEUTRAL_STATE_NAME
 
-        # Flip cooldown — suppress rapid direction changes
-        if (self._last_correction_direction in (ADVANCING_STATE_NAME, TRAILING_STATE_NAME)
-            and target_direction not in (NEUTRAL_STATE_NAME, self._last_correction_direction)):
-            self._flip_suppress_until = eventtime + self.flip_cooldown
-            self._last_correction_direction = NEUTRAL_STATE_NAME
-
-        if eventtime < self._flip_suppress_until:
-            multiplier = 1.0
-            target_direction = NEUTRAL_STATE_NAME
-
         log_event = False
         if abs(self._last_multiplier - multiplier) > 0.001:
             log_event = True
@@ -1269,7 +1257,6 @@ class AFCFPSBuffer(AFCBuffer):
         self.enable = True
         self._latch_enabled = False
         self._advance_latched = False
-        self._flip_suppress_until = 0.0
         self._last_correction_direction = NEUTRAL_STATE_NAME
         has_stepper = self._lane_has_rotation_control(lane)
 
