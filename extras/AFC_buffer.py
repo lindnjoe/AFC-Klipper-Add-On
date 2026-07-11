@@ -1178,12 +1178,8 @@ class AFCFPSBuffer(AFCBuffer):
             target_direction = NEUTRAL_STATE_NAME
 
         log_event = False
-        if abs(self._last_multiplier - multiplier) > 0.01:
+        if abs(self._last_multiplier - multiplier) > 0.001:
             log_event = True
-
-        if self._count % 8:
-            log_event = True
-        self._count += 1
 
         # Apply multiplier
         self.set_multiplier(multiplier)
