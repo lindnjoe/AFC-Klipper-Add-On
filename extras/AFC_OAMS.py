@@ -363,8 +363,8 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             except Exception as e:
                 self.oams_load_spool_cancel_cmd = None
                 self.logger.warning(
-                    "Failed to initialize OAMS load filament cancel command: %s\n"
-                    "Most likely the firmware needs to be updated to support this command.", e
+                    f"Failed to initialize OAMS load filament cancel command: {e}\n"
+                    "Most likely the firmware needs to be updated to support this command."
                 )
 
             cmd_queue = self.mcu.alloc_command_queue()
@@ -579,9 +579,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         retry = self._load_retry_state.setdefault(spool_idx, RetryState())
         retry_count     = retry.count
         attempt_history = []
-        retry_limit     = max_retries if max_retries is not None else self.load_retry_max
+        retry_limit     = max_retries if (max_retries is not None
+                                          and max_retries > 0 ) else self.load_retry_max
 
-        while retry_count < retry_limit:
+        while retry_count < retry_limit: # pragma: no branch  While loop is always true, suppress coverage warning about always being True
             if retry_count > 0:
                 delay = self._calculate_retry_delay(retry_count)
                 lane_name = self._resolve_lane_name(spool_idx)
@@ -690,9 +691,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             including attempt history on failure.
         """
         attempt_history = []
-        retry_limit     = max_retries if max_retries is not None else self.unload_retry_max
+        retry_limit     = max_retries if (max_retries is not None
+                                          and max_retries > 0) else self.unload_retry_max
 
-        while self._unload_retry_count < retry_limit:
+        while self._unload_retry_count < retry_limit: # pragma: no branch  While loop is always true, suppress coverage warning about always being True
             if self._unload_retry_count > 0:
                 delay = self._calculate_retry_delay(self._unload_retry_count)
                 self.logger.info(

@@ -88,6 +88,7 @@ class AFCBuffer:
         self.buffer_distance    = config.getfloat('distance', None)
         self.multiplier_high    = config.getfloat("multiplier_high", default=1.1, minval=1.0)
         self.multiplier_low     = config.getfloat("multiplier_low", default=0.9, minval=0.0, maxval=1.0)
+        self._last_multiplier   = 1
 
         if self.type == "switched":
             # Pull config for Turtleneck style buffer (advance and training switches)
@@ -355,6 +356,7 @@ class AFCBuffer:
         cur_stepper = self.current_lane.extruder_stepper.stepper
 
         self.current_lane.update_rotation_distance( multiplier )
+        self._last_multiplier = multiplier
         if multiplier > 1:
             self.last_state = ADVANCING_STATE_NAME
             if self.led:
@@ -676,6 +678,7 @@ class AFCBuffer:
         # Add in multiplier information for automated testing
         self.response['multiplier_high'] = self.multiplier_high
         self.response['multiplier_low'] = self.multiplier_low
+        self.response['multiplier'] = self._last_multiplier
 
         # Add fault detection information
         self.response['fault_detection_enabled'] = self.error_sensitivity > 0
@@ -929,8 +932,6 @@ class AFCFPSBuffer(AFCBuffer):
 
         # Timer interval for applying corrections
         self.update_interval: float = config.getfloat('update_interval', 0.25, minval=0.05)
-        self.flip_cooldown: float = config.getfloat('flip_cooldown', 180.0, minval=0.0)
-        self._flip_suppress_until: float = 0.0
         self._last_correction_direction: str = NEUTRAL_STATE_NAME
 
         # ---- Fault detection ----
@@ -957,6 +958,7 @@ class AFCFPSBuffer(AFCBuffer):
         # Track the last applied multiplier for the active lane so we can
         # restore it on tool changes. Key: extruder name → (lane_name, multiplier)
         self._last_multiplier = 1.0
+        self._count = 0
         self._saved_multipliers = {}
 
         # Software endstop wrappers — provide the MCU endstop interface so
@@ -1052,7 +1054,7 @@ class AFCFPSBuffer(AFCBuffer):
         # Keep last_state and advance/trailing booleans current even when
         # the correction loop isn't running (buffer disabled during
         # loading / calibration).  Without this, get_toolhead_pre_sensor_state()
-        # returns stale False and ACE load / calibration can't detect
+        # returns stale False and load / calibration can't detect
         # filament arrival at the toolhead.
         # Update advance/trailing state for non-stepper lanes even when
         # buffer is enabled — the correction timer doesn't run for them.
@@ -1074,7 +1076,7 @@ class AFCFPSBuffer(AFCBuffer):
                 self.trailing_state = False
             elif self._advance_latched:
                 # Latched during load: keep advance_state True even if
-                # pressure drops briefly between ACE motor pulses.
+                # pressure drops briefly between motor pulses.
                 self.advance_state = True
             elif self.smoothed_fps < self.set_point - half_db:
                 self.last_state = TRAILING_STATE_NAME
@@ -1163,28 +1165,27 @@ class AFCFPSBuffer(AFCBuffer):
         else:
             target_direction = NEUTRAL_STATE_NAME
 
-        # Flip cooldown — suppress rapid direction changes
-        if (self._last_correction_direction in (ADVANCING_STATE_NAME, TRAILING_STATE_NAME)
-            and target_direction not in (NEUTRAL_STATE_NAME, self._last_correction_direction)):
-            self._flip_suppress_until = eventtime + self.flip_cooldown
-            self._last_correction_direction = NEUTRAL_STATE_NAME
-
-        if eventtime < self._flip_suppress_until:
-            multiplier = 1.0
-            target_direction = NEUTRAL_STATE_NAME
+        log_event = False
+        if abs(self._last_multiplier - multiplier) > 0.001:
+            log_event = True
 
         # Apply multiplier
         self.set_multiplier(multiplier)
 
         # Update state flags
         if target_direction == ADVANCING_STATE_NAME:
+            if self.last_state != ADVANCING_STATE_NAME:
+                log_event = True
             self.last_state = ADVANCING_STATE_NAME
             self.advance_state = True
             self.trailing_state = False
+
             self._last_correction_direction = ADVANCING_STATE_NAME
             if self.led:
                 self.afc.function.afc_led(self.led_advancing, self.led_index)
         elif target_direction == TRAILING_STATE_NAME:
+            if self.last_state != TRAILING_STATE_NAME:
+                log_event = True
             self.last_state = TRAILING_STATE_NAME
             self.advance_state = False
             self.trailing_state = True
@@ -1192,6 +1193,8 @@ class AFCFPSBuffer(AFCBuffer):
             if self.led:
                 self.afc.function.afc_led(self.led_trailing, self.led_index)
         else:
+            if self.last_state != NEUTRAL_STATE_NAME:
+                log_event = True
             self.last_state = NEUTRAL_STATE_NAME
             self.advance_state = False
             self.trailing_state = False
@@ -1199,7 +1202,8 @@ class AFCFPSBuffer(AFCBuffer):
             if self.led:
                 self.afc.function.afc_led(self.led_neutral, self.led_index)
 
-        if self.debug:
+        if (log_event
+            and self.debug):
             self.logger.debug(
                 "FPS_buffer {}: fps={:.3f} smoothed={:.3f} "
                 "multiplier={:.4f} state={}".format(
@@ -1228,7 +1232,7 @@ class AFCFPSBuffer(AFCBuffer):
         Enable latching so advance_state stays True once triggered.
 
         Call before a load sequence. The latch prevents brief pressure
-        drops between ACE motor pulses from clearing the sensor state.
+        drops between motor pulses from clearing the sensor state.
         """
         self._latch_enabled = True
         self._advance_latched = False
@@ -1253,7 +1257,6 @@ class AFCFPSBuffer(AFCBuffer):
         self.enable = True
         self._latch_enabled = False
         self._advance_latched = False
-        self._flip_suppress_until = 0.0
         self._last_correction_direction = NEUTRAL_STATE_NAME
         has_stepper = self._lane_has_rotation_control(lane)
 
@@ -1285,7 +1288,7 @@ class AFCFPSBuffer(AFCBuffer):
 
             # Start fault detection — only for stepper lanes where the
             # correction timer keeps extruder position in sync with buffer.
-            # Non-stepper lanes (ACE) have no correction, so extruder pos
+            # Non-stepper lanes have no correction, so extruder pos
             # grows unbounded and falsely triggers the fault.
             # OpenAMS has its own OAMSMonitor for fault detection.
             if self.fault_detection_enabled():
