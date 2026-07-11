@@ -234,17 +234,16 @@ class AFCLane:
         # feeder module (the U1 `[filament_feed left|right]`) reports filament
         # presence per channel via get_status. Point feed_module + feed_channel
         # at that module's status channel and this lane mirrors the feeder's
-        # "staged" state (present AND preload_finish) into prep_state/_load_state
-        # so AFC sees the lane as loaded-and-ready — TOOL_LOAD then proceeds and
-        # runs custom_load_cmd to drive the final leg to the toolhead sensor,
-        # instead of bailing out as an empty lane.
+        # presence into prep_state/_load_state so AFC sees the lane as
+        # loaded-and-ready — TOOL_LOAD then proceeds and runs custom_load_cmd to
+        # drive the final leg to the toolhead sensor, instead of bailing out as
+        # an empty lane. We trust the feeder to stage the filament correctly, so
+        # a present channel is treated as ready with no wait for preload_finish.
         self.feed_module  = config.get('feed_module', None)    # 'left' or 'right'
         self.feed_channel = config.get('feed_channel', None)   # AFC extruder name ('e1') or raw feeder key ('extruder1')
         self._feed_obj = None
         self._feed_ch_index = None       # int channel index the feeder event carries
         self._feed_staged_last = None
-        self._feed_stage_timer = None    # short, self-cancelling stage-watch
-        self._feed_stage_deadline = 0.0
         if self.feed_module and self.feed_channel:
             # State is driven by the feeder, not the (absent) load switch.
             self._load_state = False
@@ -496,12 +495,10 @@ class AFCLane:
 
         # Wire up the external-feeder prep/load source for standalone lanes.
         # The U1 feeder announces filament *presence* changes via the
-        # "filament_feed:port" event, but emits NOTHING when a channel reaches
-        # its staged rest state (preload_finish). So the falling edge and the
-        # rising presence edge come from the event; the event-less gap up to
-        # preload_finish is bridged by a short, self-cancelling stage-watch
-        # timer that only runs while a channel is mid-preload — no perpetual
-        # poll. (On U1 hardware the detect->preload_finish gap was ~9s.)
+        # "filament_feed:port" event. We trust the feeder to stage the filament
+        # correctly, so both edges come straight from that event — presence
+        # marks the lane ready, absence marks it empty — with no stage-watch
+        # timer bridging up to preload_finish.
         if self.feed_module and self.feed_channel:
             self._feed_obj = self.printer.lookup_object(
                 "filament_feed {}".format(self.feed_module), None)
@@ -529,32 +526,14 @@ class AFCLane:
             self._feed_ch_index = int(suffix) if suffix.isdigit() else None
             self.printer.register_event_handler(
                 "filament_feed:port", self._feed_port_event)
-            self._feed_stage_timer = self.reactor.register_timer(
-                self._feed_stage_watch, self.reactor.NEVER)
             # Seed from the current feeder state — no event fires for filament
             # that is already present at startup.
             self._feed_reevaluate()
 
-    def _feed_channel_staged(self):
-        """Return True when the external feeder holds filament for this lane —
-        present AND at least staged to the toolhead entry. This covers both
-        'preload_finish' (staged, ready to load) and 'load_finish' (loaded to
-        the toolhead): in both the filament is physically present, so the lane
-        must read prep/load True. Treating only 'preload_finish' as present made
-        a loaded lane (load_finish) look empty to AFC and broke unload/state
-        reconciliation."""
-        try:
-            ch = self._feed_obj.get_status(
-                self.reactor.monotonic()).get(self.feed_channel, {})
-        except Exception:
-            return False
-        return (ch.get('filament_detected') is True
-                and ch.get('channel_state') in ('preload_finish', 'load_finish'))
-
     def _feed_channel_present(self):
-        """True when the feeder reports filament present in this lane's channel,
-        regardless of channel_state (i.e. inserted but maybe still preloading).
-        """
+        """True when the feeder reports filament present in this lane's channel.
+        We trust the feeder to have staged it correctly, so presence alone is
+        enough to read the lane as ready — regardless of channel_state."""
         try:
             ch = self._feed_obj.get_status(
                 self.reactor.monotonic()).get(self.feed_channel, {})
@@ -571,46 +550,12 @@ class AFCLane:
         self._feed_reevaluate()
 
     def _feed_reevaluate(self):
-        """Reconcile mirrored prep/load state to the feeder channel right now.
-        Already staged -> mark loaded-and-ready; present but not yet staged ->
-        watch for preload_finish; absent -> mark empty."""
-        if self._feed_channel_staged():
-            self._disarm_stage_watch()
-            self._apply_staged(True)
-        elif self._feed_channel_present():
-            self._arm_stage_watch()          # bridge the event-less preload gap
-        else:
-            self._disarm_stage_watch()
-            self._apply_staged(False)
-
-    def _arm_stage_watch(self):
-        """Start (or restart) the short poll that waits for the channel to reach
-        preload_finish. Bounded by a deadline so a channel that never preloads
-        (disable_auto, jam) stops on its own instead of polling forever."""
-        self._feed_stage_deadline = self.reactor.monotonic() + 30.0
-        self.reactor.update_timer(self._feed_stage_timer, self.reactor.NOW)
-
-    def _disarm_stage_watch(self):
-        if self._feed_stage_timer is not None:
-            self.reactor.update_timer(self._feed_stage_timer, self.reactor.NEVER)
-
-    def _feed_stage_watch(self, eventtime):
-        """Bridge the event-less rising edge: the feeder announces presence but
-        not the later preload_finish transition, so poll briefly until the
-        channel is staged (mark ready and stop), the filament is pulled back
-        mid-preload (mark empty and stop), or the deadline lapses (stop)."""
-        if self._feed_channel_staged():
-            self._apply_staged(True)
-            return self.reactor.NEVER
-        if not self._feed_channel_present():
-            self._apply_staged(False)
-            return self.reactor.NEVER
-        if eventtime > self._feed_stage_deadline:
-            return self.reactor.NEVER
-        return eventtime + 0.5
+        """Reconcile mirrored prep/load state to the feeder channel right now:
+        present -> mark loaded-and-ready; absent -> mark empty."""
+        self._apply_staged(self._feed_channel_present())
 
     def _apply_staged(self, staged):
-        """Edge-guarded mirror of the feeder's staged state into prep/load.
+        """Edge-guarded mirror of the feeder's presence into prep/load.
         On the rising edge TOOL_LOAD becomes valid (custom_load_cmd then drives
         the final leg to the toolhead sensor); on the falling edge the lane
         reads empty again. Persists only on an actual change."""
