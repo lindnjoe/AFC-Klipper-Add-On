@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2026-07-11]
+### Added
+- Added `enable_runout_in_bypass` configuration option (defaults to `False`) to allow users to enable toolhead filament sensor runout pausing when printing in bypass/manual mode.
+
+### Fixed
+- Fixed unexpected toolhead filament sensor runout pausing when printing in bypass/manual mode by defaulting the behavior to disabled.
+
 ## [2026-07-03]
 ### Added
 - Defaulting `tool_max_unload_attempts` to zero in Snapmaker U1 AFC config file.

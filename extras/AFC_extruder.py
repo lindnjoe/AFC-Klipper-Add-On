@@ -233,6 +233,7 @@ class AFCExtruder:
         self.buffer_name                = config.get('buffer', None)                                                    # Buffer to use for extruder, this variable can be overridden per lane
         self.enable_sensors_in_gui      = config.getboolean("enable_sensors_in_gui",    self.afc.enable_sensors_in_gui) # Set to True toolhead sensors switches as filament sensors in mainsail/fluidd gui, overrides value set in AFC.cfg
         self.enable_runout              = config.getboolean("enable_tool_runout",       self.afc.enable_tool_runout)
+        self.enable_runout_in_bypass    = config.getboolean("enable_runout_in_bypass", self.afc.enable_runout_in_bypass)
         self.debounce_delay             = config.getfloat("debounce_delay",             self.afc.debounce_delay)
         self.deadband                   = config.getfloat("deadband", 2)                                                # Deadband for extruder heater, default is 2 degrees Celsius
         self.toolchange_temp_drop: float = config.getfloat("toolchange_temp_drop",    self.afc.toolchange_temp_drop)  # Degrees to drop this extruder's temperature after it is the old extruder in a toolchange. Overrides global toolchange_temp_drop in AFC.cfg
@@ -491,14 +492,33 @@ class AFCExtruder:
         """
         Handles runout detection at the toolhead sensors (tool_start or tool_end).
         Notifies the currently loaded lane if filament is missing at the toolhead sensor.
+        If no lane is loaded (bypass/manual printing mode) and enable_runout_in_bypass
+        is set to True, raises an AFC error and pauses the print while printing.
         :param state: Boolean indicating sensor state (True = filament present, False = runout)
         :param sensor_name: Name of the triggering sensor ("tool_start" or "tool_end")
         """
         # Notify the currently loaded lane if filament is missing at toolhead
-        if not state and self.lane_loaded and self.lane_loaded in self.lanes:
-            lane = self.lanes[self.lane_loaded]
-            if hasattr(lane, "handle_toolhead_runout"):
-                lane.handle_toolhead_runout(sensor=sensor_name)
+        if not state:
+            if self.lane_loaded and self.lane_loaded in self.lanes:
+                lane = self.lanes[self.lane_loaded]
+                if hasattr(lane, "handle_toolhead_runout"):
+                    lane.handle_toolhead_runout(sensor=sensor_name)
+            elif (self.enable_runout
+                  and self.enable_runout_in_bypass
+                  and not self.afc.in_toolchange
+                  and not self.afc.error_state
+                  and self.on_shuttle()
+                  and self.afc.function.is_printing()):
+                # We are printing in bypass/manual mode (no lane is loaded).
+                # Only pause the print if:
+                #   1. Toolhead runout is globally enabled (enable_runout).
+                #   2. Bypass runout protection is explicitly enabled (enable_runout_in_bypass).
+                #   3. We are NOT in a toolchange sequence (which would cause false pauses during unloads).
+                #   4. We are NOT already in an error state (prevents duplicate pauses during async transitions).
+                #   5. The toolhead is active on the shuttle (prevents docked/parked toolheads from pausing in multi-tool setups).
+                #   6. The printer is actively printing.
+                msg = f"Toolhead runout detected by {sensor_name} sensor in bypass/manual mode."
+                self.afc.error.AFC_error(msg)
 
     def handle_start_runout( self, eventtime):
         """
