@@ -600,8 +600,9 @@ class Espooler:
         :param print_time: Pre-computed print_time for scheduling assist pins
         """
 
-        if self.afc_motor_rwd is None:
+        if self.afc_motor_fwd is None:
             return
+
         time = print_time = print_time if print_time is not None else self._get_print_time()
         if self.lane_obj.weight < self.enable_assist_weight:
             print_time = self._kick_start(print_time)
@@ -640,7 +641,7 @@ class Espooler:
         self.set_enable_pin(print_time, 1)
         self.afc_motor_rwd._set_pin(print_time, value)
 
-    def assist(self, value):
+    def assist(self, value: float):
         """
         This function is for setting espooler FWD/RWD/EN signals. FWD/RWD is dependent on the value that is
         passed in.  < 0 for RWD, > 0 for FWD and 0 for disable
@@ -649,10 +650,14 @@ class Espooler:
         """
         reverse = False
         print_time = self._get_print_time()
-        if self.afc_motor_rwd is None:
+        # Return if both pins are not defined
+        if (self.afc_motor_rwd is None
+            and self.afc_motor_fwd is None):
             return
 
         if value < 0:
+            if self.afc_motor_rwd is None:
+                return
             value *= -1
             assist_motor=self.afc_motor_rwd
             reverse = True
@@ -664,13 +669,14 @@ class Espooler:
             self.stats.direction = EspoolerDir.FWD
             self.stats.start_time = print_time
             assist_motor=self.afc_motor_fwd
-        elif value == 0:
+        else:
             self.break_espooler()
             self.stats.end_time = print_time
             return
 
         value /= assist_motor.scale
-        if not assist_motor.is_pwm and value not in [0., 1.]:
+        if (not assist_motor.is_pwm
+            and value not in [0., 1.]):
             if value > 0: value = 1
         if self.afc_motor_enb is not None:
             enable = 1 if value != 0 else 0
@@ -686,21 +692,25 @@ class Espooler:
         Helper function to "brake" n20 motors to hopefully help with keeping down back-feeding into MCU board
         """
         print_time = self._get_print_time()
-        if self.afc_motor_enb is not None:
+
+        if (self.afc_motor_fwd is not None
+            and self.afc_motor_rwd is not None
+            and self.afc_motor_enb is not None):
             self.afc_motor_rwd._set_pin(print_time, 1)
             self.set_enable_pin(print_time, 1)
-            if self.afc_motor_fwd is not None:
-                self.afc_motor_fwd._set_pin(print_time, 1)
+            self.afc_motor_fwd._set_pin(print_time, 1)
 
             # Forward predict delay time instead of adding reactor pause in code
             print_time += self.n20_break_delay_time
 
             self.set_enable_pin(print_time, 0)
+        elif self.afc_motor_enb is not None:
+            self.set_enable_pin(print_time, 0)
+
+        if self.afc_motor_rwd is not None:
             self.afc_motor_rwd._set_pin(print_time, 0)
-            if self.afc_motor_fwd is not None:
-                self.afc_motor_fwd._set_pin(print_time, 0)
-        else:
-            self.afc_motor_rwd._set_pin(print_time, 0)
+        if self.afc_motor_fwd is not None:
+            self.afc_motor_fwd._set_pin(print_time, 0)
 
     def enable_timer(self):
         """
