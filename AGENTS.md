@@ -12,7 +12,12 @@
 - **Match existing formatting** as closely as possible — follow the
    surrounding file's conventions rather than imposing a different style.
 - **Correct typing** — including things like `Optional[float]` instead of
-   `float = None`.
+   `float = None`. Methods should be fully annotated (parameters and return
+   type). Local variables and attributes only need an explicit annotation
+   when a linter/type checker (e.g. mypy) can't infer the type on its own —
+   for example an attribute first assigned `None` and later assigned a
+   concrete type elsewhere, or an empty `{}`/`[]` whose element type isn't
+   obvious from that line alone.
 - **Use f-strings, not `str.format()`** — `f"Lane {self.name}"` rather than
    `"Lane {}".format(self.name)`.
 - **Format error/exception strings before raising, not inline** — build the
@@ -30,24 +35,49 @@
 - **Keep comments short and succinct** — a sentence or two at most. Comments
    still need to make sense to the developer reading them, just don't let
    them turn into paragraphs.
-- **Docstring every method** — a short summary line, then a `:param name:`
-   line for each parameter and a `:return type:` (or `:return:`) line for any
-   non-`None` return value, matching the Sphinx-style convention already used
-   throughout `extras/` (e.g. `AFC_lane.py`, `AFC_assist.py`). Skip the
-   `:return:` line when the method returns `None`. A method that raises uses
-   a plain `raises error if ...` line rather than a `:raises:` tag, matching
-   existing convention.
+- **Docstrings** — every new or changed method needs a docstring matching
+   Sphinx-style convention in this shape: a short description, a blank line,
+   then one `:param name:` per parameter (skip `self`) and a `:return type:`
+   line if the method returns something meaningful (omit it otherwise).
+   No blank line between the `:param`/`:return` block and the closing `"""`.
 
    ```python
-   def _feed_channel_present(self):
+   def register_lane_macros(self, lane_obj: AFCLane):
        """
-       Checks whether the feeder currently reports filament present in this
-       lane's channel.
+       Callback function to register macros with proper lane names.
 
-       :return bool: True when the feeder reports filament present, False if
-                     absent, not found, or the feeder can't be queried
+       :param lane_obj: object for lane to register
        """
    ```
+
+   `cmd_*` gcode-command handlers follow a different, existing convention
+   instead — description, then `Usage`/`Example` sections — see
+   `cmd_AFC_QUIET_MODE` in `extras/AFC.py` for the pattern to match:
+
+   ````python
+   def cmd_AFC_QUIET_MODE(self, gcmd):
+       """
+       Set lower speed on any filament moves.
+
+       Mainly this would be used to turn down motor noise during quiet runs.
+
+       Usage
+       -------
+       `AFC_QUIET_MODE SPEED=<new quietmode speed> ENABLE=<1 or 0>`
+
+       Example
+       -------
+       ```
+       AFC_QUIET_MODE SPEED=75 ENABLE=1
+       ```
+       """
+   ````
+
+   Test methods (`tests/test_*.py`) are exempt from this rule — a docstring
+   is fine if it adds real context, but it's optional, not required. Test
+   method names are already descriptive enough on their own
+   (`test_success_after_one_retry_uses_resolved_lane_name`), so don't add
+   one just to satisfy this rule.
 - **All new code needs unit tests** — any code added must come with unit
    tests that follow the Unit Test Rules below.
 
@@ -72,6 +102,16 @@
    Pre-existing untested code elsewhere in the same file is out of scope
    unless the task specifically asks for it; don't expand scope to "fix"
    unrelated untested code without being asked.
+- **Inline (ternary) conditionals need both-branch coverage too, verified
+   by hand** — `coverage.py`'s branch tracking does not flag an inline
+   `a if cond else b` expression as partially covered the way it does a
+   full `if`/`else` statement, even when only one outcome was ever
+   exercised. A file can show 100% branch coverage while every ternary in
+   it only ever took one side. Don't trust the coverage report for these —
+   for each inline conditional in new/changed code, find the test(s) that
+   exercise it and confirm by reading them that one drives the condition
+   truthy and another drives it falsy, each with an assertion that would
+   fail under the other outcome.
 - **Multi-condition `if` statements: test each variable independently** —
    for something like `if A and B:`, there need to be tests proving A alone
    can't satisfy the condition and B alone can't either, not just one test

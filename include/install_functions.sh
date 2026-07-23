@@ -27,8 +27,12 @@ link_extensions() {
   local message
 
   if [ -d "${klipper_dir}/klippy/extras" ]; then
-    for extension in "${afc_path}"/extras/AFC*.py; do
-      ln -sf "${afc_path}/extras/$(basename "${extension}")" "${klipper_dir}/klippy/extras/$(basename "${extension}")"
+    for extension in "${afc_path}"/extras/*.py; do
+      case $extension in
+        # Excluding __init__.py from being linked into klipper folder
+        *__init__.py) continue;;
+        *) ln -sf "${afc_path}/extras/$(basename "${extension}")" "${klipper_dir}/klippy/extras/$(basename "${extension}")";;
+      esac
     done
   else
     export message="AFC Klipper extensions not installed; Klipper extras directory not found."
@@ -42,7 +46,11 @@ unlink_extensions() {
   #   - AFC_PATH: The path to the AFC Klipper Add-On repository.
   if [ -d "${klipper_dir}/klippy/extras" ]; then
     for extension in "${afc_path}"/extras/*.py; do
-      rm -f "${klipper_dir}/klippy/extras/$(basename "${extension}")"
+      case $extension in
+        # Excluding __init__.py files from being removed as this will make klipper dirty
+        *__init__.py) continue;;
+        *) rm -f "${klipper_dir}/klippy/extras/$(basename "${extension}")";;
+      esac
     done
   else
     print_msg ERROR "AFC Klipper extensions not uninstalled; Klipper extras directory not found."
@@ -299,6 +307,8 @@ install_afc() {
             # EMU's MCU board_pins config already defines a dedicated alias
             # for this sensor per lane.
             query_fps_pin "FPS_PSF" "$buffer_unit_name" "${buffer_unit_name}_lane1:TN"
+          elif [ "$installation_type" == "OpenAMS" ]; then
+            query_fps_pin "FPS_PSF" "$buffer_unit_name" "fps:PA2"
           else
             query_fps_pin "FPS_PSF" "$buffer_unit_name"
           fi
