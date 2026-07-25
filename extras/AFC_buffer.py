@@ -912,6 +912,13 @@ class AFCFPSBuffer(AFCBuffer):
         self.multiplier_low: float = config.getfloat('multiplier_low', 0.85, minval=0.0, maxval=1.0)
         self.trailing_min_multiplier: float = config.getfloat('trailing_min_multiplier', 1.00, minval=1.0)
 
+        # Hysteresis on the applied multiplier: a correction is only sent to the stepper
+        # (update_rotation_distance) when it differs from the last *applied* multiplier by more
+        # than this absolute amount (e.g. 0.003 means a multiplier of 1.050 -> 1.052 is
+        # suppressed, but 1.050 -> 1.054 is not).
+        self.multiplier_hysteresis: float = config.getfloat('multiplier_hysteresis', 0.003,
+                                                            minval=0.0, maxval=1.0)
+
         # Deadband — neutral window centered on set_point where no correction
         # is applied, giving headroom for retractions/tool changes.
         self.deadband: float = config.getfloat('deadband', 0.30, minval=0.0, maxval=0.6)
@@ -963,7 +970,6 @@ class AFCFPSBuffer(AFCBuffer):
         self.integral_extrusion_threshold: float = config.getfloat(
             'integral_extrusion_threshold', 0.02, minval=0.0)
         self._integral_last_extruder_pos: Optional[float] = None
-        self._last_correction_direction: str = NEUTRAL_STATE_NAME
 
         # ---- Fault detection ----
         self.min_event_systime: float = self.reactor.NEVER
@@ -1200,53 +1206,54 @@ class AFCFPSBuffer(AFCBuffer):
             # Clamp the combined P+I output to the configured band.
             multiplier = max(self.multiplier_low, min(self.multiplier_high, multiplier))
 
-        log_event = False
-        if abs(self._last_multiplier - multiplier) > 0.001:
-            log_event = True
-        if integral != self._last_logged_integral:
-            log_event = True
 
-        # Apply multiplier
-        self.set_multiplier(multiplier)
+        # Apply multiplier, gated by hysteresis when set so tiny, insignificant
+        # corrections don't trigger an update_rotation_distance call on
+        # every tick.
+        log_event = False
+        last_applied = self._last_multiplier
+        if self.multiplier_hysteresis <= 0.0:
+            self.set_multiplier(multiplier)
+            if abs(last_applied - multiplier) > 0.001:
+                log_event = True
+            if integral != self._last_logged_integral:
+                log_event = True
+        else:
+            if abs(multiplier - last_applied) > self.multiplier_hysteresis:
+                self.set_multiplier(multiplier)
+                log_event = True
 
         # Update state flags
         if target_direction == ADVANCING_STATE_NAME:
             if self.last_state != ADVANCING_STATE_NAME:
                 log_event = True
+                if self.led:
+                    self.afc.function.afc_led(self.led_advancing, self.led_index)
             self.last_state = ADVANCING_STATE_NAME
             self.advance_state = False
             self.trailing_state = True
-
-            self._last_correction_direction = ADVANCING_STATE_NAME
-            if self.led:
-                self.afc.function.afc_led(self.led_advancing, self.led_index)
         elif target_direction == TRAILING_STATE_NAME:
             if self.last_state != TRAILING_STATE_NAME:
                 log_event = True
+                if self.led:
+                    self.afc.function.afc_led(self.led_trailing, self.led_index)
             self.last_state = TRAILING_STATE_NAME
             self.advance_state = True
             self.trailing_state = False
-            self._last_correction_direction = TRAILING_STATE_NAME
-            if self.led:
-                self.afc.function.afc_led(self.led_trailing, self.led_index)
         else:
             if self.last_state != NEUTRAL_STATE_NAME:
                 log_event = True
+                if self.led:
+                    self.afc.function.afc_led(self.led_neutral, self.led_index)
             self.last_state = NEUTRAL_STATE_NAME
             self.advance_state = False
             self.trailing_state = False
-            self._last_correction_direction = NEUTRAL_STATE_NAME
-            if self.led:
-                self.afc.function.afc_led(self.led_neutral, self.led_index)
 
         if (log_event
             and self.debug):
             self.logger.debug(
-                "FPS_buffer {}: fps={:.3f} smoothed={:.3f} integral={:+.4f} "
-                "multiplier={:.4f} state={}".format(
-                    self.name, self.fps_value, self.smoothed_fps, integral,
-                    multiplier, self.last_state
-                )
+                f"FPS_buffer {self.name}: fps={self.fps_value:.3f} smoothed={self.smoothed_fps:.3f} "
+                f"integral={integral:+.4f} multiplier={self._last_multiplier:.4f} state={self.last_state}"
             )
             self._last_logged_integral = integral
 
@@ -1293,7 +1300,6 @@ class AFCFPSBuffer(AFCBuffer):
         self.enable = True
         self._latch_enabled = False
         self._advance_latched = False
-        self._last_correction_direction = NEUTRAL_STATE_NAME
         has_stepper = self._lane_has_rotation_control(lane)
 
         if self.led:

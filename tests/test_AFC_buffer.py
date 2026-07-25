@@ -160,7 +160,6 @@ def _make_fps_buffer(name="FPS_buffer1", **overrides):
     buf._last_logged_integral = 0.0
     buf.integral_extrusion_threshold = 1.0
     buf._integral_last_extruder_pos = None
-    buf._last_correction_direction = NEUTRAL_STATE_NAME
 
     buf.adv_filament_switch_name = f"{name}_expanded"
     buf.fila_adv = MagicMock()
@@ -2267,10 +2266,13 @@ class TestAdcCallback:
         assert buf.advance_state == "untouched"
         assert buf.trailing_state == "untouched"
     
-    def test_has_stepper_does_not_skip_logic(self):
-        """When has_stepper=True, enable=True and correction_running=False,
-        last_state/advance_state/trailing_state
-        are left untouched by _adc_callback (the correction loop owns them)."""
+    def test_correction_not_running_still_runs_fallback_classifier(self):
+        """When enable=False (correction isn't running), the fallback
+        classifier in _adc_callback still updates last_state/advance_state/
+        trailing_state from the raw reading -- even though has_stepper=True
+        would normally mean the correction loop owns that job. This is
+        what keeps state accurate during load/calibration before printing
+        starts, when the correction loop hasn't been enabled yet."""
         buf, afc, reactor, printer = _make_fps_buffer()
         buf._lane_has_rotation_control = MagicMock(return_value=True)
         buf.enable = False  # avoid the lazy-timer-start branch complicating this
@@ -2390,6 +2392,8 @@ class TestCorrectionEvent:
 
     def test_at_set_point_multiplier_is_exactly_one(self):
         buf, afc, reactor, printer, lane = self._ready()
+        buf.multiplier_hysteresis = 0.0  # isolate from the default filter -- this
+                                         # test is about the P-term math, not hysteresis
         buf.set_point = 0.5
         buf.smoothed_fps = 0.5
         buf.trailing_min_multiplier = 1.0
@@ -2454,7 +2458,6 @@ class TestCorrectionEvent:
         assert buf.last_state == TRAILING_STATE_NAME
         assert buf.advance_state is True
         assert buf.trailing_state is False
-        assert buf._last_correction_direction == TRAILING_STATE_NAME
         afc.function.afc_led.assert_called_once_with(buf.led_trailing, buf.led_index)
 
     def test_reading_inside_deadband_is_neutral(self):
@@ -2465,12 +2468,10 @@ class TestCorrectionEvent:
         buf.led = True
         buf.advance_state = True  # seed True so both resets to False are proven
         buf.trailing_state = True
-        buf._last_correction_direction = "something_else"
         buf._correction_event(100.0)
         assert buf.last_state == NEUTRAL_STATE_NAME
         assert buf.advance_state is False
         assert buf.trailing_state is False
-        assert buf._last_correction_direction == NEUTRAL_STATE_NAME
         afc.function.afc_led.assert_called_once_with(buf.led_neutral, buf.led_index)
 
     def test_led_disabled_skips_afc_led_call(self):
@@ -2479,14 +2480,6 @@ class TestCorrectionEvent:
         buf.smoothed_fps = 0.5
         buf._correction_event(100.0)
         afc.function.afc_led.assert_not_called()
-
-    def test_last_correction_direction_tracks_target(self):
-        buf, afc, reactor, printer, lane = self._ready()
-        buf.set_point = 0.5
-        buf.deadband = 0.3
-        buf.smoothed_fps = 0.2
-        buf._correction_event(100.0)
-        assert buf._last_correction_direction == ADVANCING_STATE_NAME
 
     def test_already_advancing_does_not_force_log_event_via_state(self):
         buf, afc, reactor, printer, lane = self._ready()
@@ -2514,6 +2507,151 @@ class TestCorrectionEvent:
         buf.logger.debug.assert_not_called()
 
 
+class TestCorrectionEventHysteresis:
+    """multiplier_hysteresis gates whether _correction_event actually calls
+    update_rotation_distance, without affecting the state/LED tracking that
+    happens every tick regardless. The gate compares the *absolute* delta
+    between the newly computed multiplier and the last applied multiplier
+    against multiplier_hysteresis -- it is not a relative/percentage
+    comparison."""
+
+    def _ready(self, **overrides):
+        buf, afc, reactor, printer = _make_fps_buffer(**overrides)
+        buf.enable = True
+        lane = _make_lane(buf)
+        lane.update_rotation_distance = MagicMock()
+        buf.current_lane = lane
+        buf._lane_has_rotation_control = MagicMock(return_value=True)
+        buf.fault_detection_enabled = MagicMock(return_value=False)
+        buf._update_virtual_sensors = MagicMock()
+        return buf, afc, reactor, printer, lane
+
+    def test_default_hysteresis_is_0_003(self):
+        buf, afc, reactor, printer, lane = self._ready()
+        assert buf.multiplier_hysteresis == pytest.approx(0.003)
+
+    def test_default_hysteresis_filters_a_sub_threshold_change(self):
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.set_point = 0.5
+        buf.low_point = 0.1
+        buf.multiplier_high = 1.2
+        buf._last_multiplier = 1.05
+
+        buf.smoothed_fps = 0.396  # multiplier ~1.052 -> delta ~0.002, clearly under the 0.003 default
+        buf._correction_event(100.0)
+
+        lane.update_rotation_distance.assert_not_called()
+
+    def test_default_hysteresis_still_applies_a_large_change(self):
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.set_point = 0.5
+        buf.low_point = 0.1
+        buf.multiplier_high = 1.2
+        buf._last_multiplier = 1.05
+
+        buf.smoothed_fps = 0.3  # multiplier ~1.10 -> delta ~0.05, well over the 0.003 default
+        buf._correction_event(100.0)
+
+        lane.update_rotation_distance.assert_called_once_with(pytest.approx(1.10))
+
+    def test_small_change_below_threshold_does_not_apply(self):
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.multiplier_hysteresis = 0.005  # absolute delta
+        buf.set_point = 0.5
+        buf.trailing_min_multiplier = 1.0
+        buf.low_point = 0.1
+        buf.multiplier_high = 1.2
+        buf._last_multiplier = 1.05  # seed a known non-default baseline directly
+
+        buf.smoothed_fps = 0.394  # computes multiplier=1.053 -> delta 0.003, under threshold
+        buf._correction_event(100.0)
+
+        lane.update_rotation_distance.assert_not_called()
+        assert buf._last_multiplier == pytest.approx(1.05)  # unchanged
+
+    def test_large_change_above_threshold_applies_and_updates_last_multiplier(self):
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.multiplier_hysteresis = 0.005  # absolute delta
+        buf.set_point = 0.5
+        buf.trailing_min_multiplier = 1.0
+        buf.low_point = 0.1
+        buf.multiplier_high = 1.2
+        buf._last_multiplier = 1.05  # seed a known non-default baseline directly
+
+        buf.smoothed_fps = 0.3  # computes multiplier=1.10 -> delta 0.05, over threshold
+        buf._correction_event(100.0)
+
+        lane.update_rotation_distance.assert_called_once_with(pytest.approx(1.10))
+        assert buf._last_multiplier == pytest.approx(1.10)
+
+    def test_just_under_threshold_does_not_apply_just_over_does(self):
+        """Proves the comparison is strictly greater-than by bracketing the
+        threshold with two realistic computed multipliers, rather than
+        relying on an exact floating-point boundary value (which is fragile
+        to construct/compare precisely)."""
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.multiplier_hysteresis = 0.005  # absolute delta
+        buf.set_point = 0.5
+        buf.trailing_min_multiplier = 1.0
+        buf.low_point = 0.1
+        buf.multiplier_high = 1.2
+        buf._last_multiplier = 1.05
+
+        buf.smoothed_fps = 0.3985  # multiplier ~1.0505 -> delta ~0.0005, clearly under 0.005
+        buf._correction_event(100.0)
+        lane.update_rotation_distance.assert_not_called()
+
+        buf.smoothed_fps = 0.394  # multiplier ~1.053 -> delta ~0.003, still under 0.005
+        buf._correction_event(100.25)
+        lane.update_rotation_distance.assert_not_called()
+
+        buf.smoothed_fps = 0.35  # multiplier ~1.075 -> delta ~0.025, clearly over 0.005
+        buf._correction_event(100.5)
+        lane.update_rotation_distance.assert_called_once()
+
+    def test_hysteresis_is_absolute_not_relative(self):
+        """A delta that is small *relative* to a large last-applied baseline
+        must still clear the gate, since it's compared against
+        multiplier_hysteresis as an absolute amount. Chosen so a
+        relative-scaled gate (delta/last_applied > threshold) would
+        disagree: delta=0.05 against last_multiplier=10.0 is only a 0.5%
+        relative change (would be suppressed by a 2% relative gate), but
+        0.05 > 0.02 absolute, so it must be applied."""
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.multiplier_hysteresis = 0.02  # absolute delta
+        buf.set_point = 0.5
+        buf.trailing_min_multiplier = 1.0
+        buf.low_point = 0.1
+        buf.multiplier_high = 10.05
+        buf._last_multiplier = 10.0
+
+        buf.smoothed_fps = 0.05  # saturates the P-term -> multiplier == multiplier_high == 10.05
+        buf._correction_event(100.0)
+
+        lane.update_rotation_distance.assert_called_once_with(pytest.approx(10.05))
+
+    def test_state_and_led_still_update_when_stepper_call_is_gated(self):
+        """State/LED tracking must reflect the freshly computed target
+        direction every tick, even when the hysteresis gate suppresses the
+        actual update_rotation_distance call."""
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.multiplier_hysteresis = 0.5  # very coarse -- essentially always gated
+        buf.set_point = 0.5
+        buf.deadband = 0.3
+        buf.led = False
+
+        buf.smoothed_fps = 0.5  # settle baseline first
+        buf._correction_event(100.0)
+        lane.update_rotation_distance.reset_mock()
+
+        buf.smoothed_fps = 0.2  # clearly advancing, but too small a multiplier
+                                # change to clear the 50% hysteresis gate
+        buf._correction_event(100.25)
+
+        lane.update_rotation_distance.assert_not_called()
+        assert buf.last_state == ADVANCING_STATE_NAME
+
+
 class TestCorrectionEventIntegral:
     def _ready(self, **overrides):
         buf, afc, reactor, printer = _make_fps_buffer(**overrides)
@@ -2530,6 +2668,8 @@ class TestCorrectionEventIntegral:
 
     def test_disabled_integral_correction_leaves_pure_p_term(self):
         buf, afc, reactor, printer, lane = self._ready()
+        buf.multiplier_hysteresis = 0.0  # isolate from the default filter -- this
+                                         # test is about the integral gate, not hysteresis
         buf.enable_integral_correction = False
         buf._integral_terms[lane.name] = 0.5  # seed a bias that must NOT apply
         buf.smoothed_fps = 0.5  # neutral -> pure P multiplier is exactly 1.0
@@ -2623,10 +2763,51 @@ class TestCorrectionEventLogging:
     def test_logs_when_multiplier_delta_exceeds_threshold(self):
         buf, afc, reactor, printer, lane = self._ready()
         buf.debug = True
+        buf.multiplier_hysteresis = 0.0  # exercise the hysteresis-disabled
+                                         # branch specifically, not the default
         buf._last_multiplier = 1.0
         buf.smoothed_fps = 0.2  # produces a multiplier well past 1.001
         buf._correction_event(100.0)
         buf.logger.debug.assert_called_once()
+
+    def test_log_reports_applied_multiplier_not_gated_target(self):
+        """When hysteresis suppresses set_multiplier() but a state
+        transition still sets log_event=True, the debug line must report
+        the multiplier actually applied to the stepper (_last_multiplier),
+        not the freshly computed target that was gated out -- otherwise
+        diagnostics show a value that was never sent to the stepper."""
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.debug = True
+        buf.multiplier_hysteresis = 0.1  # coarse enough to gate the ~0.06 delta below
+        buf._last_multiplier = 1.0
+        buf.last_state = NEUTRAL_STATE_NAME  # differs from the Advancing result -> log_event
+
+        buf.smoothed_fps = 0.34  # target=Advancing, computed multiplier ~1.06 (gated, unapplied)
+        buf._correction_event(100.0)
+
+        lane.update_rotation_distance.assert_not_called()  # gate held -- multiplier not applied
+        assert buf._last_multiplier == pytest.approx(1.0)  # unchanged by the gate
+        buf.logger.debug.assert_called_once_with(
+            "FPS_buffer FPS_buffer1: fps=0.000 smoothed=0.340 integral=+0.0000 "
+            "multiplier=1.0000 state=Advancing"
+        )
+
+    def test_hysteresis_disabled_still_suppresses_log_for_sub_threshold_delta(self):
+        """With multiplier_hysteresis explicitly disabled, set_multiplier()
+        always runs, but log_event still only fires if the applied value
+        actually moved by more than the old fixed 0.001 absolute delta."""
+        buf, afc, reactor, printer, lane = self._ready()
+        buf.debug = True
+        buf.multiplier_hysteresis = 0.0
+        buf.low_point = 0.1
+        buf.multiplier_high = 1.2
+        buf._last_multiplier = 1.05
+        buf.last_state = NEUTRAL_STATE_NAME  # avoid a spurious Unknown->Neutral
+                                             # "transition" from the initial default
+        buf.smoothed_fps = 0.3995  # multiplier ~1.0503 -> delta ~0.0003, under 0.001
+        buf._correction_event(100.0)
+        lane.update_rotation_distance.assert_called_once()  # still applied
+        buf.logger.debug.assert_not_called()  # but not logged
 
     def test_no_log_when_nothing_changed(self):
         buf, afc, reactor, printer, lane = self._ready()
@@ -2839,7 +3020,6 @@ class TestAFCFPSBufferInit:
         assert buf._last_logged_integral == 0.0
         assert buf.integral_extrusion_threshold == 0.02
         assert buf._integral_last_extruder_pos is None
-        assert buf._last_correction_direction == NEUTRAL_STATE_NAME
         assert buf.min_event_systime == buf.reactor.NEVER
         from extras.AFC_utils import VirtualFilamentSensor
         assert isinstance(buf.fila_adv, VirtualFilamentSensor)
@@ -2986,14 +3166,6 @@ class TestFPSEnableBuffer:
         buf.enable_buffer(lane)
         assert buf._latch_enabled is False
         assert buf._advance_latched is False
-
-    def test_resets_last_correction_direction(self):
-        buf, afc, reactor, printer = _make_fps_buffer()
-        lane = _make_lane(buf)
-        buf._lane_has_rotation_control = MagicMock(return_value=False)
-        buf._last_correction_direction = ADVANCING_STATE_NAME
-        buf.enable_buffer(lane)
-        assert buf._last_correction_direction == NEUTRAL_STATE_NAME
 
     def test_led_enabled_sets_neutral_led(self):
         buf, afc, reactor, printer = _make_fps_buffer()
