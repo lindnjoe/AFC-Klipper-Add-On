@@ -277,6 +277,31 @@ class TestGetStatus:
         msg = obj.get_status()["message"]
         assert msg["message"] == "test msg"
 
+    def test_version_matches_afc_version(self):
+        obj = _make_afc()
+        assert obj.get_status()["version"] == AFC_VERSION
+
+
+# ── _webhooks_status ─────────────────────────────────────────────────────────
+
+class TestWebhooksStatus:
+    def test_system_version_matches_afc_version(self):
+        obj = _make_afc()
+        web_request = MagicMock()
+        obj._webhooks_status(web_request)
+        payload = web_request.send.call_args[0][0]
+        assert payload["status:"]["AFC"]["system"]["version"] == AFC_VERSION
+
+    def test_sends_expected_top_level_shape(self):
+        obj = _make_afc()
+        web_request = MagicMock()
+        obj._webhooks_status(web_request)
+        payload = web_request.send.call_args[0][0]
+        system = payload["status:"]["AFC"]["system"]
+        assert system["num_units"] == 0
+        assert system["num_lanes"] == 0
+        assert system["num_extruders"] == 0
+
 
 # ── _check_extruder_temp ──────────────────────────────────────────────────────
 
