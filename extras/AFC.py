@@ -45,7 +45,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.1.37"
+AFC_VERSION="1.2.1"
 
 # Class for holding different states so its clear what all valid states are
 class State(str, Enum):
@@ -2533,6 +2533,7 @@ class afc:
         Displays current status of AFC for webhooks
         """
         str = {}
+        str['version']                  = AFC_VERSION
         str['current_load']             = self.current
         str['current_lane']             = self.current_loading
         str['next_lane']                = self.next_lane_load
@@ -2580,6 +2581,7 @@ class afc:
             str[unit.name]['system']['hub_loaded'] = unit.hub_obj.state if unit.hub_obj is not None else None
 
         str["system"]                           = {}
+        str["system"]['version']                = AFC_VERSION
         str["system"]['current_load']           = self.current
         str["system"]['num_units']              = len(self.units)
         str["system"]['num_lanes']              = numoflanes

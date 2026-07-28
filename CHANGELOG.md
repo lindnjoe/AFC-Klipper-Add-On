@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2026-07-26]
+### Fixed
+- Fixed issue 804 by exposing AFC_VERSION to `afc/status` and AFC object endpoints for moonraker
+
 ## [2026-07-24]
 ### Added
 - Adding additional states and status so that fluidd/mainsail UIs can be updated to show what tools are being dropped off/picked up when swapping toolheads for toolchangers.
