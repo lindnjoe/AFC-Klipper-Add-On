@@ -1236,6 +1236,11 @@ class TestSendLaneDataExtruderIndex:
         payload = _get_sent_payload(lane)
         assert payload["namespace"] == "lane_data"
 
+    def test_weight_is_included(self):
+        lane = _make_lane_for_moonraker()
+        payload = _get_sent_payload(lane)
+        assert payload["value"]["weight"] == 750.0
+
     def test_no_send_when_map_is_none(self):
         lane = _make_lane_for_moonraker()
         lane.map = None
@@ -1270,6 +1275,11 @@ class TestClearLaneDataExtruderIndex:
         lane = _make_lane_for_moonraker()
         payload = _get_cleared_payload(lane)
         assert payload["value"]["color"] == ""
+
+    def test_weight_is_cleared(self):
+        lane = _make_lane_for_moonraker()
+        payload = _get_cleared_payload(lane)
+        assert payload["value"]["weight"] == 0
 
     def test_no_clear_when_map_is_none(self):
         lane = _make_lane_for_moonraker()

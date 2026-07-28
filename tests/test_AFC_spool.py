@@ -270,6 +270,14 @@ class TestSetWeight:
         spool.cmd_SET_WEIGHT(gcmd)
         assert lane.weight == 250
 
+    def test_calls_send_lane_data(self):
+        spool = _make_spool()
+        lane = _make_lane("lane1")
+        spool.afc.lanes = {"lane1": lane}
+        gcmd = _make_gcmd(LANE="lane1", WEIGHT=250)
+        spool.cmd_SET_WEIGHT(gcmd)
+        lane.send_lane_data.assert_called()
+
     def test_set_weight_invalid_lane_logs_info(self):
         spool = _make_spool()
         spool.afc.lanes = {}

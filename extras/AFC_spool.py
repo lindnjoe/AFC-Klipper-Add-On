@@ -255,6 +255,7 @@ class AFCSpool:
             return
         cur_lane = self.afc.lanes[lane]
         cur_lane.weight = weight
+        cur_lane.send_lane_data()
         self.afc.save_vars()
 
     cmd_SET_MATERIAL_help = "Sets filaments material for a lane"

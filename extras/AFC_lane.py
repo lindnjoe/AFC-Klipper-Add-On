@@ -1773,7 +1773,8 @@ class AFCLane:
                     "td"             : "",
                     "lane"           : self.lane_index,
                     "extruder_index" : self.lane_extruder_index,
-                    "spool_id"       : None
+                    "spool_id"       : None,
+                    "weight"         : 0
                 }
             }
             self.afc.moonraker.send_lane_data(lane_data)
