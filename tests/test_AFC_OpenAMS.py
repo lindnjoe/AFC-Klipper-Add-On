@@ -42,7 +42,7 @@ import types
 import itertools
 import importlib.util
 import configparser
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import pytest
 
 # AFC_OpenAMS.py -> AFC_unit.py chain does not import `mcu`, but AFC_OAMS.py
@@ -467,16 +467,6 @@ class TestAMSHardwareService:
     def test_init_default_state(self):
         service, printer = self._service()
         assert service._status_callbacks == []
-        assert service._polling_timer is None
-        assert service._polling_interval == 2.0
-        assert service._polling_interval_idle == 4.0
-        assert service._consecutive_idle_polls == 0
-        assert service._idle_poll_threshold == 3
-        assert service._last_encoder_clicks is None
-        assert service._last_f1s_hes == [None, None, None, None]
-        assert service._last_hub_hes == [None, None, None, None]
-        assert service._last_fps_value is None
-        assert service._polling_enabled is False
         assert service._reactor is None
         assert service._controller is None
         assert service._status == {}
@@ -829,123 +819,6 @@ class TestAMSHardwareService:
         afc.units = {}
         printer._objects["AFC"] = afc
         assert service._resolve_lane_name_from_afc("ams1", 0) is None
-
-    def test_polling_callback_disabled_returns_never(self):
-        service, printer = self._service()
-        service._polling_enabled = False
-        service._reactor = MockReactor()
-        result = service._polling_callback(0.0)
-        assert result == MockReactor.NEVER
-
-    def test_polling_callback_disabled_lazily_caches_reactor(self):
-        service, printer = self._service()
-        service._polling_enabled = False
-        assert service._reactor is None  # not yet cached
-
-        result = service._polling_callback(0.0)
-
-        assert service._reactor is printer._reactor
-        assert result == MockReactor.NEVER
-
-    def test_polling_callback_publishes_f1s_and_hub_changes(self):
-        service, printer = self._service()
-        service._polling_enabled = True
-        service._reactor = MockReactor()
-        controller = MagicMock()
-        controller.get_status.return_value = {
-            "f1s_hes_value": [1, 0, 0, 0],
-            "hub_hes_value": [0, 1, 0, 0],
-            "encoder_clicks": 5,
-        }
-        service.attach_controller(controller)
-
-        f1s_events = []
-        hub_events = []
-        service.event_bus.subscribe(
-            "f1s_changed", lambda event_type, **kw: f1s_events.append(kw))
-        service.event_bus.subscribe(
-            "hub_changed", lambda event_type, **kw: hub_events.append(kw))
-
-        service._polling_callback(0.0)
-
-        assert len(f1s_events) == 4  # all 4 bays go from unseen(None) to a value
-        assert len(hub_events) == 4
-        bay0 = next(e for e in f1s_events if e["bay"] == 0)
-        assert bay0["value"] is True
-        assert service._last_f1s_hes == [True, False, False, False]
-        assert service._last_hub_hes == [False, True, False, False]
-
-    def test_polling_callback_no_status_backs_off(self):
-        service, printer = self._service()
-        service._polling_enabled = True
-        service._reactor = MockReactor()
-        result = service._polling_callback(100.0)
-        assert result == 100.0 + service._polling_interval_idle
-
-    def test_polling_callback_exception_backs_off(self):
-        service, printer = self._service()
-        service._polling_enabled = True
-        service._reactor = MockReactor()
-        service.poll_status = MagicMock(side_effect=Exception("boom"))
-        result = service._polling_callback(100.0)
-        assert result == 100.0 + service._polling_interval_idle
-
-    def test_polling_callback_idle_backoff_after_threshold(self):
-        service, printer = self._service()
-        service._polling_enabled = True
-        service._reactor = MockReactor()
-        service._idle_poll_threshold = 1
-        service._consecutive_idle_polls = 5
-        controller = MagicMock()
-        controller.get_status.return_value = {
-            "f1s_hes_value": [0, 0, 0, 0], "hub_hes_value": [0, 0, 0, 0],
-        }
-        service.attach_controller(controller)
-        result = service._polling_callback(100.0)
-        assert result == 100.0 + service._polling_interval_idle
-
-    def test_polling_callback_no_change_skips_publish(self):
-        service, printer = self._service()
-        service._polling_enabled = True
-        service._reactor = MockReactor()
-        # Pre-seed last-seen values identical to the upcoming poll so neither
-        # loop's "changed" branch is taken.
-        service._last_f1s_hes = [False, False, False, False]
-        service._last_hub_hes = [False, False, False, False]
-        controller = MagicMock()
-        controller.get_status.return_value = {
-            "f1s_hes_value": [0, 0, 0, 0], "hub_hes_value": [0, 0, 0, 0],
-        }
-        service.attach_controller(controller)
-        events = []
-        service.event_bus.subscribe(
-            "f1s_changed", lambda event_type, **kw: events.append(kw))
-        service.event_bus.subscribe(
-            "hub_changed", lambda event_type, **kw: events.append(kw))
-
-        service._polling_callback(0.0)
-
-        assert events == []
-
-    def test_polling_callback_encoder_progress_resets_idle_counter(self):
-        service, printer = self._service()
-        service._polling_enabled = True
-        service._reactor = MockReactor()
-        service._consecutive_idle_polls = 2
-        service._last_encoder_clicks = 10
-        controller = MagicMock()
-        controller.get_status.return_value = {
-            "f1s_hes_value": [0, 0, 0, 0], "hub_hes_value": [0, 0, 0, 0],
-            "encoder_clicks": 15,
-        }
-        service.attach_controller(controller)
-
-        service._polling_callback(0.0)
-
-        assert service._last_encoder_clicks == 15
-        # consecutive_idle_polls was reset to 0 then incremented once
-        assert service._consecutive_idle_polls == 1
-
 
 # ═════════════════════════════════════════════════════════════════════════
 # FollowerState / FollowerController
@@ -2203,8 +2076,14 @@ class TestAfcAMSInit:
         heaters = MagicMock()
         printer._objects["heaters"] = heaters
         self._build(config)
-        heaters.add_sensor_factory.assert_called_once_with(
-            "temperature_oams", TemperatureOAMS)
+        # Registers the temperature_oams factory plus the Fluidd aht3x alias
+        # (both map to TemperatureOAMS) so a temperature_sensor card can show
+        # humidity in Fluidd too.
+        heaters.add_sensor_factory.assert_has_calls([
+            call("temperature_oams", TemperatureOAMS),
+            call("aht3x", TemperatureOAMS),
+        ])
+        assert heaters.add_sensor_factory.call_count == 2
 
     def test_registers_mux_commands(self):
         config, printer, afc = self._config()
@@ -3635,7 +3514,7 @@ class TestPollOamsSensors:
         oams = MagicMock()
         ams, afc, printer, reactor = _make_ams(oams=oams)
         ams._operation_active = True
-        assert ams._poll_oams_sensors(100.0) == 102.0
+        assert ams._poll_oams_sensors(100.0) == 100.25
 
     def test_f1s_change_triggers_handle_load_runout(self):
         oams = MagicMock()
@@ -3647,9 +3526,11 @@ class TestPollOamsSensors:
         ams._last_f1s[0] = True  # was present, now gone
         ams._should_block_sensor_for_runout = MagicMock(return_value=False)
 
-        ams._poll_oams_sensors(100.0)
+        ams._poll_oams_sensors(100.0)      # starts the debounce window
+        lane.handle_load_runout.assert_not_called()
+        ams._poll_oams_sensors(101.0)      # held past f1s_debounce -> commits
 
-        lane.handle_load_runout.assert_called_once_with(100.0, False)
+        lane.handle_load_runout.assert_called_once_with(101.0, False)
         assert ams._last_f1s[0] is False
 
     def test_f1s_change_blocked_by_runout_guard_skips_handle(self):
@@ -3662,7 +3543,8 @@ class TestPollOamsSensors:
         ams._last_f1s[0] = True
         ams._should_block_sensor_for_runout = MagicMock(return_value=True)
 
-        ams._poll_oams_sensors(100.0)
+        ams._poll_oams_sensors(100.0)      # starts the debounce window
+        ams._poll_oams_sensors(101.0)      # held past f1s_debounce -> commits
 
         lane.handle_load_runout.assert_not_called()
         assert ams._last_f1s[0] is False
@@ -3706,7 +3588,8 @@ class TestPollOamsSensors:
         ams._hub_load_suppressed.add("lane1")
         ams._should_block_sensor_for_runout = MagicMock(return_value=False)
 
-        ams._poll_oams_sensors(100.0)
+        ams._poll_oams_sensors(100.0)      # starts the debounce window
+        ams._poll_oams_sensors(101.0)      # held past f1s_debounce -> commits
 
         assert lane._load_suppressed is True
         assert "lane1" not in ams._hub_load_suppressed
@@ -3724,13 +3607,16 @@ class TestPollOamsSensors:
         assert lane._load_state is True
         assert ams._last_hub[0] is True
 
-    def test_reschedules_two_seconds_later(self):
+    def test_reschedules_at_poll_interval(self):
+        # 0.25s default: the poll reads host-cached values only (no bus
+        # traffic), so the fast cadence is free and makes insert edges,
+        # runout edges, and post-op resyncs land near-instantly.
         oams = MagicMock()
         oams.f1s_hes_value = []
         oams.hub_hes_value = []
         ams, afc, printer, reactor = _make_ams(oams=oams)
         result = ams._poll_oams_sensors(50.0)
-        assert result == 52.0
+        assert result == 50.25
 
     def test_unmapped_lane_is_skipped(self):
         oams = MagicMock()
@@ -5562,6 +5448,8 @@ class TestOamsUnload:
         assert ams._oams_unload(self._lane()) is True
 
     def test_follower_reversed_before_retract(self):
+        # Field-preferred: reverse-with-the-retract unloads smoother than a
+        # full stop (the stop variant was tried and reverted).
         oams = self._ready_oams()
         ams, afc, printer, reactor = _make_ams(oams=oams)
         ams._wait_for_idle = MagicMock(return_value=True)

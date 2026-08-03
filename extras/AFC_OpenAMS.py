@@ -306,10 +306,10 @@ class AMSHardwareService:
     """
     Per-(printer, unit) façade over the [oams] hardware controller.
 
-    Resolves and caches the ``[AFC_OAMS <name>]`` controller, polls its sensors on
-    a reactor timer, caches the latest status and per-lane snapshots, and
-    publishes f1s/hub/spool change events on the shared ``AMSEventBus``. One
-    instance exists per (printer, unit name) pair.
+    Resolves and caches the ``[AFC_OAMS <name>]`` controller, caches the latest
+    status and per-lane snapshots, and publishes spool change events on the
+    shared ``AMSEventBus``. One instance exists per (printer, unit name) pair.
+    Sensor polling itself lives on ``afcOpenAMS._poll_oams_sensors``.
     """
     _instances: Dict[Tuple[int, str], AMSHardwareService] = {}
 
@@ -336,16 +336,6 @@ class AMSHardwareService:
         self.registry = LaneRegistry.for_printer(printer, logger=self.logger)
         self.event_bus = AMSEventBus.get_instance(logger=self.logger)
         self._reactor: Optional[Reactor] = None
-        self._polling_timer = None
-        self._polling_interval = 2.0
-        self._polling_interval_idle = 4.0
-        self._consecutive_idle_polls = 0
-        self._idle_poll_threshold = 3
-        self._last_encoder_clicks = None
-        self._last_f1s_hes: list[Optional[bool]] = [None, None, None, None]
-        self._last_hub_hes: list[Optional[bool]] = [None, None, None, None]
-        self._last_fps_value = None
-        self._polling_enabled = False
 
     @classmethod
     def for_printer(
@@ -414,53 +404,6 @@ class AMSHardwareService:
         if self._reactor is None:
             self._reactor = self.printer.get_reactor()
         return self._reactor.monotonic()
-
-    def _polling_callback(self, eventtime: float) -> float:
-        """
-        Reactor timer callback: poll status and publish sensor-change events.
-        Publishes ``f1s_changed``/``hub_changed`` events on transitions and
-        backs the poll interval off to the idle rate when nothing changes.
-
-        :param eventtime: reactor time the timer fired.
-        :return float: next scheduled reactor time, or ``NEVER`` if disabled.
-        """
-        if not self._polling_enabled:
-            if self._reactor is None:
-                self._reactor = self.printer.get_reactor()
-            return self._reactor.NEVER
-        try:
-            status = self.poll_status()
-            if not status:
-                return eventtime + self._polling_interval_idle
-            f1s_values = status.get("f1s_hes_value", [])
-            for bay in range(min(len(f1s_values), 4)):
-                new_val = bool(f1s_values[bay])
-                old_val = self._last_f1s_hes[bay]
-                if old_val is None or new_val != old_val:
-                    self.event_bus.publish(
-                        "f1s_changed", unit_name=self.name, bay=bay,
-                        value=new_val, eventtime=eventtime)
-                self._last_f1s_hes[bay] = new_val
-            hub_values = status.get("hub_hes_value", [])
-            for bay in range(min(len(hub_values), 4)):
-                new_val = bool(hub_values[bay])
-                old_val = self._last_hub_hes[bay]
-                if old_val is None or new_val != old_val:
-                    self.event_bus.publish(
-                        "hub_changed", unit_name=self.name, bay=bay,
-                        value=new_val, eventtime=eventtime)
-                self._last_hub_hes[bay] = new_val
-            encoder_clicks = status.get("encoder_clicks")
-            if encoder_clicks is not None:
-                if self._last_encoder_clicks is not None and encoder_clicks != self._last_encoder_clicks:
-                    self._consecutive_idle_polls = 0
-                self._last_encoder_clicks = encoder_clicks
-            self._consecutive_idle_polls += 1
-            if self._consecutive_idle_polls > self._idle_poll_threshold:
-                return eventtime + self._polling_interval_idle
-            return eventtime + self._polling_interval
-        except Exception:
-            return eventtime + self._polling_interval_idle
 
     def poll_status(self) -> Optional[Dict[str, Any]]:
         """
@@ -720,6 +663,68 @@ class afcAMS(afcUnit):
         self._defer_engagement = config.getboolean("defer_engagement", False)
         self._engagement_params: Dict[str, tuple[float, float]] = {}
 
+        # RFID scan-on-insert: on a fresh spool insert, feed the lane (a normal
+        # firmware load) so the spool rotates and its RFID tag passes the reader
+        # antenna, scan during the feed, stop the moment the tag is seen, read
+        # it, then unload back to the insert position. Opt-in per unit.
+        self.rfid_scan_on_insert = config.getboolean("rfid_scan_on_insert", False)
+        # Search window (s) before giving up — NOT counting the read/decode after
+        # a tag is first detected (the clock is frozen on detection).
+        self.rfid_scan_timeout = config.getfloat("rfid_scan_timeout", 15.0, minval=1.0)
+        # How often to poll the reader during the feed.
+        self.rfid_scan_poll = config.getfloat("rfid_scan_poll", 0.15, minval=0.05)
+        # How long to keep retrying the initial load while the firmware answers
+        # ERROR_BUSY (its own insert-staging routine runs right after the spool
+        # goes in; commands are rejected until it finishes).
+        self.rfid_scan_ready_timeout = config.getfloat(
+            "rfid_scan_ready_timeout", 30.0, minval=2.0)
+        # Encoder-quiet window required before the scan touches the hardware.
+        # 1s is enough with the busy-refusal retry as the safety net; raise it
+        # if a unit's staging regularly races the first load attempt.
+        self.rfid_scan_settle = config.getfloat(
+            "rfid_scan_settle", 1.0, minval=0.2)
+        # Encoder clicks of scan-feed before the load is cancelled in favor of
+        # slow follower creep. Backstop for firmwares whose runtime PTFE
+        # override doesn't actually shorten the load (2.0.255) — without it
+        # the scan feed runs the full path at full speed.
+        self.rfid_scan_feed_clicks = config.getint(
+            "rfid_scan_feed_clicks", 250, minval=50)
+        # Stationary full-read attempts once a tag is detected (per position).
+        self.rfid_scan_read_retries = config.getint(
+            "rfid_scan_read_retries", 3, minval=1)
+        # Consecutive polls a baseline uid must be ABSENT before its return
+        # counts as "it moved with the spool" (the inserted spool's own tag may
+        # rest in antenna range, so rest-time presence alone can't brand a uid
+        # a sister; a true sister is stationary and never blinks out).
+        self.rfid_scan_reappear_polls = config.getint(
+            "rfid_scan_reappear_polls", 3, minval=1)
+        # Sweep-read window (encoder clicks) used when a detected tag won't
+        # decode in place: re-feed to sweep_back BEFORE the remembered detect
+        # position, then read/nudge/read in sweep_step increments until
+        # sweep_past AFTER it. Widen back/past for antennas whose sweet spot
+        # sits further from where the moving tag first answers.
+        #
+        # sweep_back has to pay for the re-feed's OVERSHOOT before it buys any
+        # pre-roll: the load phase runs fast and the position loop only breaks
+        # once the encoder is already past the mark, measured at ~150 clicks.
+        # At the old default of 160 the sweep started 12 clicks before the
+        # detect point instead of 160, so every read but the first sat
+        # downstream of the tag. 240 lands the first read ~90 clicks early.
+        self.rfid_scan_sweep_back = config.getint(
+            "rfid_scan_sweep_back", 240, minval=0)
+        # The follower has no speed control and the encoder is polled every
+        # 50ms, so the ACHIEVED step overshoots this and floors out near 50
+        # clicks. This is the request, not the guarantee.
+        self.rfid_scan_sweep_step = config.getint(
+            "rfid_scan_sweep_step", 25, minval=5)
+        self.rfid_scan_sweep_past = config.getint(
+            "rfid_scan_sweep_past", 200, minval=0)
+        # How often the readiness wait probes the unit. The firmware answers
+        # with its motor state only when spoken to, so this IS the resolution
+        # of "is the insert stage finished yet".
+        self.rfid_ready_probe_interval = config.getfloat(
+            "rfid_ready_probe_interval", 0.5, minval=0.1)
+
         # Runtime state
         self.oams: AFC_OAMS = None  # type: ignore[assignment]  # resolved in handle_ready()
         self._follower: Optional[FollowerController] = None
@@ -741,6 +746,9 @@ class afcAMS(afcUnit):
         self.gcode.register_mux_command(
             'AFC_OAMS_CLEAR_ERRORS', "UNIT", self.name, self.cmd_AFC_OAMS_CLEAR_ERRORS,
             desc="Clear OpenAMS errors and resync state")
+        self.gcode.register_mux_command(
+            'AFC_OAMS_RFID_SCAN', "UNIT", self.name, self.cmd_AFC_OAMS_RFID_SCAN,
+            desc="Slow-feed a lane, scan its RFID tag, and unwind back")
         # Internal global command for stuck-spool auto-recovery. Multiple afcAMS
         # units share the printer gcode namespace, so ignore AlreadyRegistered.
         try:
@@ -751,29 +759,130 @@ class afcAMS(afcUnit):
         except Exception:
             pass
 
+        # Sensor polling rate. The poll only reads host-cached values the
+        # OAMS firmware streams on its own, so a fast rate adds ZERO bus
+        # traffic — just a tiny Python pass over the lanes. 0.25s makes
+        # insert edges, load/unload transitions, and post-op resyncs land
+        # near-instantly (the old 2s grid was the biggest fixed delay in
+        # scan-on-insert).
+        self.sensor_poll_interval = config.getfloat(
+            "sensor_poll_interval", 0.25, minval=0.05)
+        # A raw f1s state change must hold this long before the host acts on
+        # it (runout edges, insert scans). Shields flaky/threshold-riding
+        # sensors whose chatter otherwise fires false events — and, streamed
+        # as MCU edge reports, has locked up OAMS firmware mid-scan.
+        self.f1s_debounce = config.getfloat(
+            "f1s_debounce", 0.75, minval=0.0)
+        # Same shield for the hub HES (virtual hub / hub-clear checks only;
+        # live MCU reads used by load waits and the scan are raw). Shorter
+        # default: hub transit is a real, short-lived signal.
+        self.hub_debounce = config.getfloat(
+            "hub_debounce", 0.5, minval=0.0)
+
         # Sensor polling state
         self._last_f1s: list[Optional[bool]] = [None] * 4
+        self._f1s_pending_since: list[Optional[float]] = [None] * 4
+        self._hub_pending_since: list[Optional[float]] = [None] * 4
         self._last_hub: list[Optional[bool]] = [None] * 4
         self._poll_timer = None
 
         # Operation guard — prevents polling from corrupting state during load/unload
         self._operation_active = False
+        # Last-seen action (loading/unloading/following/…) for transition logging,
+        # parallel to afcACE._current_action. '' = idle.
+        self._current_action = ""
         self._prev_states_stale = False
         self._hub_load_suppressed: set[str] = set()
         self._pending_spool_loaded_timers: Dict[str, Any] = {}
         self._td1_last_capture_time = None
+
+        # RFID scan-on-insert bookkeeping. `_rfid_scan_timers` maps a lane name
+        # to its pending one-shot kickoff timer; `_rfid_scanned` latches lanes
+        # already scanned for the current insert so a seated spool isn't
+        # re-scanned. The latch clears on removal (on_filament_remove) so every
+        # fresh insert re-reads.
+        self._rfid_scan_timers: Dict[str, Any] = {}
+        self._rfid_scanned: set[str] = set()
+        self._rfid_coord = None      # AFC_OpenAMS_rfid coordinator, resolved lazily
 
         # Register temperature_oams sensor factory during config parsing
         try:
             from extras.temperature_oams import TemperatureOAMS
             pheaters = self.printer.load_object(config, "heaters")
             pheaters.add_sensor_factory("temperature_oams", TemperatureOAMS)
+            # Alias under a Fluidd-recognised sensor type so a
+            # [temperature_sensor] card shows humidity in Fluidd too (Fluidd
+            # maps aht3x -> aht10 and reads the "aht10 <name>" object the sensor
+            # registers). Use sensor_type: aht3x to get it.
+            pheaters.add_sensor_factory("aht3x", TemperatureOAMS)
         except Exception:
             pass
 
         # klippy:ready is registered by afcUnit.__init__ (upstream core) and
         # dispatches to our handle_ready override below — don't register it
         # again here or it would run twice (double poll timer / monitor init).
+
+    # Map the OAMS controller's action_status (OAMSStatus) and the monitor's
+    # FPSLoadState to readable strings for get_status.
+    _OAMS_ACTION_NAMES = {
+        OAMSStatus.LOADING: "loading",
+        OAMSStatus.UNLOADING: "unloading",
+        OAMSStatus.FORWARD_FOLLOWING: "forward_following",
+        OAMSStatus.REVERSE_FOLLOWING: "reverse_following",
+        OAMSStatus.COASTING: "coasting",
+        OAMSStatus.STOPPED: "stopped",
+        OAMSStatus.CALIBRATING: "calibrating",
+        OAMSStatus.ERROR: "error",
+    }
+    _FPS_STATE_NAMES = {0: "unloaded", 1: "loaded", 2: "loading", 3: "unloading"}
+
+    def _current_oams_action(self) -> str:
+        """
+        Readable current action from the controller's action_status (parallels
+        afcACE._derive_action).
+
+        :return str: action string ('loading'/'unloading'/...), or '' when idle.
+        """
+        if self.oams is None:
+            return ""
+        act = getattr(self.oams, "action_status", None)
+        if act is None:
+            return ""
+        return self._OAMS_ACTION_NAMES.get(act, "busy")
+
+    def get_status(self, eventtime: Optional[float] = None) -> dict:
+        """
+        Extend the base unit status with the OpenAMS's live state so it shows in
+        Moonraker/Mainsail/Fluidd, not just on the separate AFC_OAMS object.
+
+        Adds oams_connected, the controller's live sensors (oams_current_spool,
+        oams_fps_value, oams_f1s_hes, oams_hub_hes) and failure counts, a
+        readable oams_action, and the monitor's tracked load state.
+
+        :param eventtime: reactor event time (unused; Klipper status interface).
+        :return dict: the status dict.
+        """
+        response = super().get_status(eventtime)
+        oams = self.oams
+        response["oams_connected"] = oams is not None
+        if oams is not None:
+            response["oams_current_spool"] = getattr(oams, "current_spool", None)
+            response["oams_fps_value"] = getattr(oams, "fps_value", None)
+            response["oams_f1s_hes"] = list(getattr(oams, "f1s_hes_value", []) or [])
+            response["oams_hub_hes"] = list(getattr(oams, "hub_hes_value", []) or [])
+            response["oams_load_failures"] = getattr(oams, "load_retry_failures", 0)
+            response["oams_unload_failures"] = getattr(oams, "unload_retry_failures", 0)
+        response["oams_action"] = self._current_oams_action() or "idle"
+        response["oams_busy"] = bool(self._operation_active)
+        st = getattr(self._monitor, "state", None) if self._monitor else None
+        if st is not None:
+            response["oams_load_state"] = self._FPS_STATE_NAMES.get(
+                getattr(st, "state", None), "")
+            response["oams_current_lane"] = getattr(st, "current_lane", None)
+            response["oams_current_spool_idx"] = getattr(st, "current_spool_idx", None)
+            response["oams_clog_detecting"] = getattr(st, "clog_start_time", None) is not None
+            response["oams_stuck_detecting"] = getattr(st, "stuck_start_time", None) is not None
+        return response
 
     def handle_connect(self) -> None:
         """
@@ -946,8 +1055,19 @@ class afcAMS(afcUnit):
         if self.oams is None:
             return self.afc.reactor.NEVER
 
+        # Track the unit's live action and log transitions (parallels afcACE).
+        # Before the operation-active gate: the action is most informative
+        # during a load/unload, which is exactly when _operation_active is set.
+        action = self._current_oams_action()
+        if action != self._current_action:
+            self.logger.info(
+                "OpenAMS %s: %s -> %s"
+                % (self.name, self._current_action or "idle", action or "idle"))
+            self._current_action = action
+
+        poll_iv = getattr(self, 'sensor_poll_interval', 0.25)
         if self._operation_active:
-            return eventtime + 2.0
+            return eventtime + poll_iv
 
         resync_prev = self._prev_states_stale
         self._prev_states_stale = False
@@ -960,42 +1080,130 @@ class afcAMS(afcUnit):
             if slot < 0:
                 continue
 
-            # F1S -> prep_state (filament inserted in lane). When the spool is
-            # removed (F1S lost) the lane can no longer be loaded to hub, so clear
-            # the latched loaded_to_hub (mirrors Vivid clearing it when the prep
-            # sensor is lost). loaded_to_hub is otherwise NOT sensor-derived.
+            # F1S -> prep_state (filament inserted in lane), DEBOUNCED — see
+            # _update_f1s_debounced. Hub processing below must always run, so
+            # the f1s logic lives in the helper instead of inline continues.
             if slot < len(f1s_values):
-                new_f1s = bool(f1s_values[slot])
-
-                lane.prep_state = new_f1s
-                if not new_f1s:
-                    lane.loaded_to_hub = False
-
-                if resync_prev:
-                    self._last_f1s[slot] = new_f1s
-                else:
-                    old_f1s = self._last_f1s[slot] if slot < len(self._last_f1s) else None
-
-                    if old_f1s is not None and new_f1s != old_f1s:
-                        if self._should_block_sensor_for_runout(lane, new_f1s):
-                            self._last_f1s[slot] = new_f1s
-                            continue
-                        if lane_name in self._hub_load_suppressed:
-                            lane._load_suppressed = True
-                            self._hub_load_suppressed.discard(lane_name)
-                        lane.handle_load_runout(eventtime, new_f1s)
-
-                    self._last_f1s[slot] = new_f1s
+                self._update_f1s_debounced(
+                    lane, lane_name, slot, bool(f1s_values[slot]),
+                    eventtime, resync_prev)
 
             # Hub HES -> raw_load_state: live hub-junction occupancy aggregated by
             # the native virtual hub (any(lane.raw_load_state)). 0 at idle is
-            # correct — filament is staged clear of the junction.
+            # correct — filament is staged clear of the junction. DEBOUNCED
+            # like f1s (a fluttering hub HES flaps the virtual hub and "hub
+            # clear" checks); load/scan-critical paths read the live MCU
+            # values directly and are unaffected.
             if slot < len(hub_values):
-                new_hub = bool(hub_values[slot])
-                lane._load_state = new_hub
-                self._last_hub[slot] = new_hub
+                self._update_hub_debounced(
+                    lane, slot, bool(hub_values[slot]), eventtime, resync_prev)
 
-        return eventtime + 2.0
+        return eventtime + poll_iv
+
+    def _update_f1s_debounced(self, lane: AFCLane, lane_name: str, slot: int,
+                              raw_f1s: bool, eventtime: float,
+                              resync_prev: bool) -> None:
+        """
+        Debounced f1s handling for one lane. When the spool is removed (F1S
+        lost) the lane can no longer be loaded to hub, so the latched
+        loaded_to_hub clears with it. A flaky/threshold-riding f1s chatters
+        0/1 rapidly; acting on raw edges would fire runouts and insert scans
+        on noise, so a state change only commits after holding for
+        ``f1s_debounce`` seconds — until then the lane keeps the last
+        committed state.
+
+        :param lane: the AFC lane for this bay.
+        :param lane_name: the lane's name.
+        :param slot: bay index.
+        :param raw_f1s: current raw sensor reading.
+        :param eventtime: reactor time of this poll.
+        :param resync_prev: seed/resync pass — accept raw without edges.
+        """
+        # Shim-built test units bypass __init__ — lazy-init the debounce state.
+        if getattr(self, '_f1s_pending_since', None) is None:
+            self._f1s_pending_since = [None] * 4
+        debounce = getattr(self, 'f1s_debounce', 0.75)
+        committed = (self._last_f1s[slot]
+                     if slot < len(self._last_f1s) else None)
+
+        if resync_prev or committed is None:
+            self._last_f1s[slot] = raw_f1s
+            self._f1s_pending_since[slot] = None
+            lane.prep_state = raw_f1s
+            if not raw_f1s:
+                lane.loaded_to_hub = False
+            return
+
+        if raw_f1s == committed:
+            # Stable (or chattered back) — drop any pending change.
+            self._f1s_pending_since[slot] = None
+            lane.prep_state = committed
+            return
+
+        since = self._f1s_pending_since[slot]
+        if since is None:
+            self._f1s_pending_since[slot] = eventtime
+            lane.prep_state = committed
+            return
+        if eventtime - since < debounce:
+            lane.prep_state = committed
+            return
+
+        # Held long enough — commit the change and fire the edge.
+        self._f1s_pending_since[slot] = None
+        lane.prep_state = raw_f1s
+        if not raw_f1s:
+            lane.loaded_to_hub = False
+        if self._should_block_sensor_for_runout(lane, raw_f1s):
+            self._last_f1s[slot] = raw_f1s
+            return
+        if lane_name in self._hub_load_suppressed:
+            lane._load_suppressed = True
+            self._hub_load_suppressed.discard(lane_name)
+        lane.handle_load_runout(eventtime, raw_f1s)
+        self._last_f1s[slot] = raw_f1s
+
+    def _update_hub_debounced(self, lane: AFCLane, slot: int, raw_hub: bool,
+                              eventtime: float, resync_prev: bool) -> None:
+        """
+        Debounced hub-HES handling for one lane: a state change commits to
+        ``lane._load_state`` only after holding for ``hub_debounce`` seconds,
+        so a fluttering switch can't flap the virtual hub / "hub clear"
+        checks. Live consumers (load waits, scan hub-engage) read
+        ``oams.hub_hes_value`` directly and see the raw signal.
+
+        :param lane: the AFC lane for this bay.
+        :param slot: bay index.
+        :param raw_hub: current raw sensor reading.
+        :param eventtime: reactor time of this poll.
+        :param resync_prev: seed/resync pass — accept raw without debounce.
+        """
+        if getattr(self, '_hub_pending_since', None) is None:
+            self._hub_pending_since = [None] * 4
+        debounce = getattr(self, 'hub_debounce', 0.5)
+        committed = (self._last_hub[slot]
+                     if slot < len(self._last_hub) else None)
+
+        if resync_prev or committed is None:
+            self._last_hub[slot] = raw_hub
+            self._hub_pending_since[slot] = None
+            lane._load_state = raw_hub
+            return
+        if raw_hub == committed:
+            self._hub_pending_since[slot] = None
+            lane._load_state = committed
+            return
+        since = self._hub_pending_since[slot]
+        if since is None:
+            self._hub_pending_since[slot] = eventtime
+            lane._load_state = committed
+            return
+        if eventtime - since < debounce:
+            lane._load_state = committed
+            return
+        self._hub_pending_since[slot] = None
+        self._last_hub[slot] = raw_hub
+        lane._load_state = raw_hub
 
     # ── Engagement verification ─────────────────────────────────────
 
@@ -1975,7 +2183,8 @@ class afcAMS(afcUnit):
         # shoves filament back into the gears. The brief reactor pause lets the
         # follower actually spin up reverse before the extruder pulls (an M400
         # only waits on toolhead moves, not the follower MCU). The hardware
-        # unload (unload_spool, below) keeps driving it reverse.
+        # unload (unload_spool, below) keeps driving it reverse. (A "stop
+        # instead" experiment unloaded rougher in the field — reverted.)
         if self._follower and self.oams:
             try:
                 self._follower.enable_follower(
@@ -2413,6 +2622,9 @@ class afcAMS(afcUnit):
                 self.oams_name, lane.name, True, lane.loaded_to_hub,
                 self.afc.reactor.monotonic(), spool_index=spool_index)
         super().on_filament_insert(lane)
+        # Kick off an RFID scan of the freshly inserted spool (deferred to a
+        # one-shot timer so the blocking feed/read never runs inside this hook).
+        self._maybe_schedule_rfid_scan(lane)
 
     def on_filament_remove(self, lane: AFCLane) -> None:
         """
@@ -2441,6 +2653,8 @@ class afcAMS(afcUnit):
         if not getattr(lane, 'tool_loaded', False):
             self._clear_lane_info(lane)
             self._clear_oams_state_for_bay(spool_index, lane)
+        # Drop the scan latch + any pending kickoff so the next insert re-reads.
+        self._cancel_rfid_scan(lane.name)
 
     def _clear_oams_state_for_bay(self, spool_index: Optional[int], lane: AFCLane) -> None:
         """
@@ -2499,6 +2713,817 @@ class afcAMS(afcUnit):
             lane.send_lane_data()
         except Exception:
             pass
+
+    # ── RFID scan-on-insert ─────────────────────────────────────────
+
+    def _rfid_coordinator(self):
+        """Resolve (and cache) the [AFC_OpenAMS_rfid] coordinator, or None."""
+        if self._rfid_coord is None:
+            self._rfid_coord = self.printer.lookup_object(
+                "AFC_OpenAMS_rfid", None)
+        return self._rfid_coord
+
+    def _rfid_scan_slot(self, coord, lane: AFCLane) -> Optional[int]:
+        """Physical RFID slot for a lane: the coordinator's lane_slot_map wins,
+        else fall back to the bay index (they usually coincide)."""
+        slot = None
+        try:
+            slot = coord._get_slot(lane.name)
+        except Exception:
+            slot = None
+        if slot is None:
+            slot = self._spool_map.get(lane.name)
+        return slot
+
+    def _rfid_scan_blocked_reason(self, lane: AFCLane,
+                                  check_hub: bool = True) -> Optional[str]:
+        """
+        Safety gate for the scan feed — it drives real filament motion, so it
+        must only run when nothing else is using the filament path.
+
+        Blocked when: the target lane is loaded to a toolhead, ANY lane (from
+        any unit) is loaded to a toolhead this unit's lanes share, any bay's
+        hub HES shows filament at the shared hub junction, or the printer is
+        mid-print. A lane loaded to an UNRELATED toolhead on a multi-tool
+        machine does not block.
+
+        :param lane: the lane a scan is requested for.
+        :param check_hub: include the hub-HES-clear test. Skip it at insert
+            time — the firmware's own staging briefly trips the target bay's
+            hub HES; the scan re-checks after the ready-wait instead.
+        :return str: human-readable reason it may not run, or None if safe.
+        """
+        if getattr(lane, 'tool_loaded', False):
+            return f"{lane.name} is loaded to the toolhead"
+        seen_extruders = set()
+        for ln in self.lanes.values():
+            ext = getattr(ln, 'extruder_obj', None)
+            if ext is None or id(ext) in seen_extruders:
+                continue
+            seen_extruders.add(id(ext))
+            loaded = getattr(ext, 'lane_loaded', None)
+            if loaded:
+                return (f"{loaded} is loaded to this unit's toolhead "
+                        f"({getattr(ext, 'name', '?')})")
+        if check_hub:
+            try:
+                hub_vals = list(getattr(self.oams, 'hub_hes_value', []) or [])
+            except Exception:
+                hub_vals = []
+            for idx, val in enumerate(hub_vals):
+                if val:
+                    return f"hub sensor shows filament (bay {idx})"
+        try:
+            if self.afc is not None and self.afc.function.in_print():
+                return "printer is printing"
+        except Exception:
+            pass
+        return None
+
+    def _maybe_schedule_rfid_scan(self, lane: AFCLane) -> None:
+        """
+        On a fresh insert, schedule a one-shot RFID scan of the spool. Deferred
+        to a timer so the blocking feed/read never runs inside the insert hook,
+        and gated so a seated spool isn't re-scanned (the latch clears on
+        removal). No-op unless enabled and safe to move filament right now.
+
+        :param lane: the lane a spool was just inserted into.
+        """
+        if not self.rfid_scan_on_insert or self.oams is None:
+            return
+        if self._operation_active:
+            return
+        if lane.name in self._rfid_scanned or lane.name in self._rfid_scan_timers:
+            return
+        # Hub check deferred to the scan itself — the firmware's insert
+        # staging trips the target bay's hub HES right now.
+        reason = self._rfid_scan_blocked_reason(lane, check_hub=False)
+        if reason is not None:
+            self.logger.debug(
+                f"OAMS: skipping insert RFID scan for {lane.name}: {reason}")
+            return
+        if self._rfid_coordinator() is None:
+            return
+        slot = self._spool_map.get(lane.name)
+        if slot is None or not self.oams.is_bay_ready(slot):
+            return
+        self.logger.info(
+            f"OAMS: insert seen on {lane.name} — RFID scan scheduled")
+        timer = self.afc.reactor.register_timer(
+            lambda et, ln=lane.name: self._rfid_scan_kickoff(et, ln),
+            self.afc.reactor.monotonic() + 0.25)
+        self._rfid_scan_timers[lane.name] = timer
+
+    def _cancel_rfid_scan(self, lane_name: str) -> None:
+        """Drop the scan latch and cancel any pending kickoff for a lane so the
+        next insert re-reads."""
+        self._rfid_scanned.discard(lane_name)
+        timer = self._rfid_scan_timers.pop(lane_name, None)
+        if timer is not None:
+            try:
+                self.afc.reactor.unregister_timer(timer)
+            except Exception:
+                pass
+
+    def _rfid_scan_kickoff(self, eventtime: float, lane_name: str) -> float:
+        """One-shot timer callback: run the RFID scan for a lane, once."""
+        self._rfid_scan_timers.pop(lane_name, None)
+        lane = self.lanes.get(lane_name)
+        if lane is not None:
+            try:
+                self._do_rfid_scan(lane)
+            except Exception as e:
+                self.logger.warning(
+                    f"OAMS: RFID scan-on-insert failed for {lane_name}: {e}")
+        return self.afc.reactor.NEVER
+
+    def _do_rfid_scan(self, lane: AFCLane) -> bool:
+        """
+        Feed a lane so its spool rotates the RFID tag past the antenna, scan
+        during the feed, stop on detection, read + apply the tag, then cancel
+        + unload back to the insert position.
+
+        Slow rotation comes from cancelling the load early — at hub engage or
+        ``rfid_scan_feed_clicks`` of feed, whichever lands first — and letting
+        the forward follower creep the filament from there; a full-length load
+        spins far too fast to catch the tag. (An earlier design shrank the
+        live PTFE length instead, but that depends on firmware honoring a
+        runtime config_oams_ptfe — 2.0.255 silently ignores it — so the
+        host-side cancel is the single mechanism now.) The search is capped
+        at ``rfid_scan_timeout`` seconds from the accepted load; the clock
+        stops the moment a tag is detected so the read/decode never counts
+        against it.
+
+        :param lane: the lane whose spool to scan.
+        :return bool: True if a tag was decoded and applied.
+        """
+        coord = self._rfid_coordinator()
+        if coord is None or self.oams is None:
+            return False
+        # A real load/unload may have started between scheduling and kickoff —
+        # never drive filament on top of another operation.
+        if self._operation_active:
+            return False
+        reason = self._rfid_scan_blocked_reason(lane, check_hub=False)
+        if reason is not None:
+            self.logger.info(
+                f"OAMS: RFID scan for {lane.name} not run: {reason}")
+            return False
+        slot = self._spool_map.get(lane.name)
+        if slot is None or not self.oams.is_bay_ready(slot):
+            return False
+        rfid_slot = self._rfid_scan_slot(coord, lane)
+        if rfid_slot is None:
+            self.logger.warning(
+                f"OAMS: no RFID slot mapped for {lane.name}; skipping scan")
+            return False
+
+        reactor = self.afc.reactor
+        self._rfid_scanned.add(lane.name)
+        self._operation_active = True
+        follower_started = False
+        engaged = False           # did filament actually move toward the hub?
+        tag = None
+        try:
+            # 0) On a fresh insert the FIRMWARE auto-stages the filament itself
+            #    (feeds to the hub, then backs off). Any command sent during
+            #    that window is rejected with ERROR_BUSY — so first wait for
+            #    the encoder to go quiet (staging moves filament) and for any
+            #    host-side action to drain.
+            t0 = reactor.monotonic()
+            if not self._rfid_wait_for_unit_ready(
+                    self.rfid_scan_ready_timeout,
+                    quiet_time=self.rfid_scan_settle):
+                self.logger.warning(
+                    f"OAMS: RFID scan aborted — unit not ready within "
+                    f"{self.rfid_scan_ready_timeout:.0f}s on {lane.name}")
+                return False
+            self.logger.debug(
+                f"OAMS: RFID scan {lane.name} — unit ready after "
+                f"{reactor.monotonic() - t0:.1f}s settle")
+            # Full safety re-check now that staging is done (the hub HES must
+            # be clear before feeding into the shared hub junction).
+            reason = self._rfid_scan_blocked_reason(lane)
+            if reason is not None:
+                self.logger.info(
+                    f"OAMS: RFID scan for {lane.name} not run: {reason}")
+                return False
+            try:
+                clicks_start = int(self.oams.encoder_clicks)
+            except Exception:
+                clicks_start = None
+
+            # 1) Mirror the real load's pre-load choreography (_oams_load):
+            #    wait idle, stop the follower, enable it FORWARD, wait for the
+            #    AMS to ack — each step confirmed before the next command.
+            from extras.AFC_OAMS import OAMSOpCode
+            self._wait_for_idle()
+            self._rfid_set_follower(0, 0, "stop before rfid scan load")
+            reactor.pause(reactor.monotonic() + 0.3)
+            self._rfid_set_follower(1, 1, "forward before rfid scan load")
+            follower_started = True
+            reactor.pause(reactor.monotonic() + 0.3)
+            self._wait_for_idle()
+
+            # 2) Reader on FIRST: take the rest-time uid baseline. The antenna
+            #    covers TWO bays, so a uid present now may be the seated
+            #    neighbour's tag — but it may just as well be the inserted
+            #    spool's own tag parked on the antenna, so nothing is excluded
+            #    yet. Classification happens by MOTION during the feed: a true
+            #    sister is stationary and answers every poll; the inserted
+            #    spool's tag moves — it leaves the field (or arrives fresh).
+            try:
+                baseline = set(coord.scan_slot_uids(rfid_slot))
+            except Exception as e:
+                # Same call is tolerated inside the poll loop below, so a
+                # transient reader error here must not abort the whole scan.
+                # An empty baseline excludes nothing, which is the safe
+                # default: classification is by MOTION during the feed, so a
+                # true sister is still ruled out by answering every poll.
+                baseline = set()
+                self.logger.debug(
+                    f"OAMS: RFID baseline probe error on {lane.name}: {e}")
+            if baseline:
+                self.logger.debug(
+                    f"OAMS: RFID scan {lane.name} — tag(s) in field at rest: "
+                    f"{', '.join(sorted(baseline))} (sister vs own decided by "
+                    f"motion)")
+
+            # 3) Send the load (verified against the firmware's answer).
+            #    Encoder baseline is taken BEFORE the send so the detect
+            #    position is measured from the true feed start.
+            clicks_load_start = clicks_start if clicks_start is not None else 0
+            if not self._rfid_send_load(lane, slot):
+                return False
+
+            # 4) Scanner runs from the FIRST moment of the feed: every poll
+            #    enumerates all uids in the field and tracks presence.
+            #    Detection rules:
+            #      - a uid never seen at rest = the inserted spool's tag
+            #        arriving at the antenna;
+            #      - a baseline uid that vanished for >= rfid_scan_reappear_
+            #        polls and came back = it MOVED with the spool = also the
+            #        inserted spool's tag;
+            #      - a baseline uid that answers every poll = the stationary
+            #        sister — never detected, and excluded from the reads.
+            #    On detection: remember the encoder position, stop the feed,
+            #    full read stationary. If the load completes mid-window the
+            #    follower is re-enabled forward for slow rotation.
+            follower_reenabled = False
+            reads = 0
+            seen_uid = ""
+            target_uid = None
+            absent: Dict[str, int] = {u: 0 for u in baseline}
+            self.logger.debug(
+                f"OAMS: RFID scan {lane.name} — polling reader (window "
+                f"{self.rfid_scan_timeout:.0f}s)")
+            deadline = reactor.monotonic() + self.rfid_scan_timeout
+            while reactor.monotonic() < deadline:
+                if not engaged:
+                    try:
+                        engaged = bool(self.oams.hub_hes_value[slot]) or (
+                            self._enc_delta(self.oams.encoder_clicks,
+                                            clicks_load_start) != 0)
+                    except Exception:
+                        pass
+                # The LOAD phase runs far faster than the follower creep — too
+                # fast for a reliable stop on the tag. Cancel the load as soon
+                # as EITHER the hub engages OR the encoder shows
+                # rfid_scan_feed_clicks of feed (TD-1 style: the firmware
+                # keeps the spool "loaded" at its position), then creep with
+                # the follower — the rest of the scan rotates SLOWLY. The
+                # encoder cap matters on firmwares whose runtime PTFE override
+                # is a no-op (seen on 2.0.255: "override" accepted but the
+                # load ran the full path at full speed).
+                if not follower_reenabled and self.oams.action_status is not None:
+                    try:
+                        hub_now = bool(self.oams.hub_hes_value[slot])
+                    except Exception:
+                        hub_now = False
+                    fed = abs(self._enc_delta(self.oams.encoder_clicks,
+                                              clicks_load_start))
+                    if hub_now or fed >= self.rfid_scan_feed_clicks:
+                        why = "hub engaged" if hub_now else (
+                            f"{fed} clicks fed")
+                        self.logger.debug(
+                            f"OAMS: RFID scan {lane.name} — {why}, "
+                            f"cancelling load; follower creep for slow "
+                            f"rotation")
+                        self._rfid_scan_stop_load()
+                        self._rfid_set_follower(1, 1, "rfid scan creep")
+                        follower_reenabled = True
+                if (not follower_reenabled
+                        and self.oams.action_status is None
+                        and self.oams.action_status_code
+                        in (OAMSOpCode.SUCCESS,
+                            OAMSOpCode.SPOOL_ALREADY_IN_BAY)):
+                    # Load finished — keep the filament creeping forward.
+                    self.logger.debug(
+                        f"OAMS: RFID scan {lane.name} — load complete, "
+                        f"follower forward for slow rotation")
+                    self._rfid_set_follower(1, 1, "rfid scan slow feed")
+                    follower_reenabled = True
+                try:
+                    in_field = set(coord.scan_slot_uids(rfid_slot))
+                    reads += 1
+                except Exception as e:
+                    in_field = set()
+                    self.logger.debug(
+                        f"OAMS RFID probe error on {lane.name}: {e}")
+                for u in in_field:
+                    if u not in absent:
+                        # Brand-new uid — the moving tag just arrived.
+                        target_uid = u
+                        break
+                    if absent[u] >= self.rfid_scan_reappear_polls:
+                        # Rest-time uid that blinked out and returned — it
+                        # moves with the spool, so it's the inserted spool's.
+                        target_uid = u
+                        break
+                for u in absent:
+                    absent[u] = 0 if u in in_field else absent[u] + 1
+                if target_uid:
+                    seen_uid = target_uid
+                    sisters = set(baseline) - {target_uid}
+                    try:
+                        detect_clicks = int(self.oams.encoder_clicks)
+                    except Exception:
+                        detect_clicks = clicks_load_start
+                    detect_delta = abs(self._enc_delta(detect_clicks,
+                                                       clicks_load_start))
+                    kind = ("new in field" if target_uid not in baseline
+                            else "moved with the spool")
+                    self.logger.debug(
+                        f"OAMS: RFID scan {lane.name} — tag {target_uid} "
+                        f"({kind}) detected at {detect_delta} clicks after "
+                        f"{reads} polls; stopping feed to read")
+                    # Stop the feed right where the tag answered.
+                    self._rfid_set_follower(0, 0, "rfid scan tag detected")
+                    if self.oams.action_status is not None:
+                        self._rfid_scan_stop_load()
+                    tag = self._rfid_read_stationary(coord, rfid_slot, sisters)
+                    if tag is None:
+                        # Couldn't read in place — unload and re-feed back to
+                        # the remembered encoder position for a second try.
+                        tag = self._rfid_reposition_and_read(
+                            coord, lane, slot, rfid_slot, sisters,
+                            detect_delta)
+                    break
+                reactor.pause(reactor.monotonic() + self.rfid_scan_poll)
+
+            # 6) Stop the feed the instant we're done searching (detect or
+            #    timeout): stop the follower, cancel any still-running load.
+            if follower_started:
+                self._rfid_set_follower(0, 0, "rfid scan stop")
+            if self.oams.action_status is not None:
+                self._rfid_scan_stop_load()
+
+            # 7) Apply a decoded tag to the lane (surfaces in Mainsail).
+            if tag is not None:
+                try:
+                    coord.apply_to_lane(lane, tag)
+                    lane.send_lane_data()
+                    # Persist — without this a Klipper restart wipes the
+                    # applied data when PREP rebuilds lane_data (Bambu units
+                    # re-read from the live AMS at boot; OpenAMS data only
+                    # exists in the saved vars).
+                    self.afc.save_vars()
+                    self.logger.info(
+                        f"OAMS: RFID scan applied tag to {lane.name}")
+                except Exception as e:
+                    self.logger.warning(
+                        f"OAMS: failed to apply RFID tag to {lane.name}: {e}")
+            else:
+                hint = (f" (saw undecoded tag UID {seen_uid})"
+                        if seen_uid else "")
+                self.logger.info(
+                    f"OAMS: RFID scan found no tag on {lane.name} within "
+                    f"{self.rfid_scan_timeout:.0f}s ({reads} reader polls"
+                    f"{hint}) — keeping lane defaults")
+
+            # 8) Unwind: return the filament to the bay (cancel already sent;
+            #    now drive the firmware unload back). Skipped when the feed
+            #    never engaged — unloading an empty hub just reports
+            #    NO_SPOOL_IN_BAY noise. Keep the poll gated so the retract
+            #    can't flicker a false f1s removal that wipes the lane.
+            if engaged:
+                try:
+                    self._wait_for_idle()
+                    self.oams.unload_spool()
+                except Exception as e:
+                    self.logger.warning(f"OAMS: RFID scan unwind failed: {e}")
+            try:
+                self.oams.clear_errors()
+            except Exception:
+                pass
+            return tag is not None
+        finally:
+            # Defensively stop the follower (idempotent) so an exception
+            # mid-feed never leaves it running, restore the real PTFE length,
+            # then clear the guard.
+            if follower_started:
+                self._rfid_set_follower(0, 0, "rfid scan cleanup")
+            self.oams.current_spool = None
+            self._operation_active = False
+            self._prev_states_stale = True
+
+    @staticmethod
+    def _enc_delta(now: Any, ref: Any) -> int:
+        """
+        Signed encoder-click delta that survives u32 wrap. The OAMS encoder is
+        a 32-bit counter that the unload rewinds BELOW zero (seen live as
+        4294967135 = -161), so a plain subtraction produces garbage deltas.
+
+        :param now: current encoder reading.
+        :param ref: reference encoder reading.
+        :return int: signed difference now-ref in [-2^31, 2^31).
+        """
+        try:
+            d = (int(now) - int(ref)) & 0xFFFFFFFF
+        except Exception:
+            return 0
+        return d - 0x100000000 if d > 0x7FFFFFFF else d
+
+    def _rfid_send_load(self, lane: AFCLane, slot: int) -> bool:
+        """
+        Send the scan feed's load and VERIFY the firmware's answer: in-flight
+        or SUCCESS/SPOOL_ALREADY_IN_BAY = accepted; an instant completion with
+        any error code = refused (logged by name). Only a busy refusal earns
+        one fresh ready-wait + ONE resend — no hammering.
+
+        :param lane: the lane being fed (for log context).
+        :param slot: bay index to load.
+        :return bool: True when the firmware accepted the load.
+        """
+        from extras.AFC_OAMS import OAMSOpCode, _oams_enum_name
+        reactor = self.afc.reactor
+        refusal = None
+        for attempt in (1, 2):
+            self.logger.debug(
+                f"OAMS: RFID scan {lane.name} — sending load for bay "
+                f"{slot} (attempt {attempt})")
+            self.oams.action_status = OAMSStatus.LOADING
+            self.oams.action_status_code = None
+            self.oams.oams_load_spool_cmd.send([slot])
+            # A rejection comes back almost immediately; an accepted load
+            # stays LOADING for the duration of the feed (or completes
+            # SUCCESS if very short).
+            settle = reactor.monotonic() + 1.5
+            while (reactor.monotonic() < settle
+                    and self.oams.action_status is not None):
+                reactor.pause(reactor.monotonic() + 0.1)
+            code = self.oams.action_status_code
+            if self.oams.action_status is not None or code in (
+                    OAMSOpCode.SUCCESS, OAMSOpCode.SPOOL_ALREADY_IN_BAY):
+                return True
+            refusal = _oams_enum_name(OAMSOpCode, code, 'code')
+            if code == OAMSOpCode.ERROR_BUSY and attempt == 1:
+                # The ready-wait raced the staging routine — wait for the
+                # unit's ready once more, then ONE more send.
+                self.logger.debug(
+                    f"OAMS: RFID scan {lane.name} — load refused busy; "
+                    f"waiting for unit ready")
+                t0 = reactor.monotonic()
+                ok = self._rfid_wait_for_unit_ready(
+                    self.rfid_scan_ready_timeout, fresh=True)
+                self.logger.debug(
+                    f"OAMS: RFID scan {lane.name} — ready wait "
+                    f"{'satisfied' if ok else 'TIMED OUT'} after "
+                    f"{reactor.monotonic() - t0:.1f}s; resending")
+                # The wait probes with follower stops, so restore the forward
+                # follower the pre-load choreography left running before the
+                # resend.
+                self._rfid_set_follower(1, 1, "forward before rfid scan reload")
+                reactor.pause(reactor.monotonic() + 0.3)
+                continue
+            break
+        self.logger.warning(
+            f"OAMS: RFID scan aborted — firmware refused the load on "
+            f"{lane.name} (bay {slot}): {refusal}")
+        return False
+
+    def _rfid_read_stationary(self, coord: Any, rfid_slot: int,
+                              sisters: Any,
+                              attempts: Optional[int] = None) -> Optional[dict]:
+        """
+        Full tag read with the spool stopped, sisters excluded. A few
+        attempts — the tag may need the field to settle after motion.
+
+        :param coord: the AFC_OpenAMS_rfid coordinator.
+        :param rfid_slot: physical RFID slot to read.
+        :param sisters: uid hex strings to anticollide around.
+        :param attempts: read attempts (default rfid_scan_read_retries).
+        :return dict: decoded tag (with filament), or None.
+        """
+        reactor = self.afc.reactor
+        if attempts is None:
+            attempts = self.rfid_scan_read_retries
+        undecoded = None
+        for i in range(attempts):
+            try:
+                tag = coord.read_slot_excluding(rfid_slot, sisters)
+            except Exception as e:
+                tag = None
+                self.logger.debug(f"OAMS RFID stationary read error: {e}")
+            if tag and tag.get("filament"):
+                return tag
+            if tag and tag.get("uid"):
+                undecoded = tag
+            reactor.pause(reactor.monotonic() + 0.3)
+        if undecoded is not None:
+            # The tag ANSWERS here but its data won't decode — that is a key/
+            # format problem (e.g. missing bambu_master_key in
+            # [AFC_rfid_keys]), not a positioning problem; say so instead of
+            # letting it look like an empty antenna.
+            self.logger.info(
+                f"OAMS: RFID tag {undecoded.get('uid', '?')} answers at this "
+                f"position but won't decode "
+                f"({undecoded.get('tag_type') or 'unknown type'}) — check "
+                f"decode keys ([AFC_rfid_keys]) / tag format")
+        return None
+
+    def _rfid_reposition_and_read(self, coord: Any, lane: AFCLane, slot: int,
+                                  rfid_slot: int, sisters: Any,
+                                  detect_delta: int) -> Optional[dict]:
+        """
+        Recovery when the tag was detected but unreadable in place: unload
+        back, re-feed watching the encoder to just SHORT of the remembered
+        detection position, then sweep — read, creep a few clicks, read again
+        — across the position until the tag decodes. The stop after a moving
+        detection overshoots the antenna's sweet spot, so a single
+        stop-and-read at the recorded position often has only marginal
+        coupling (uid answers, data read fails); the sweep finds the spot.
+
+        :param coord: the AFC_OpenAMS_rfid coordinator.
+        :param lane: the lane being scanned.
+        :param slot: bay index.
+        :param rfid_slot: physical RFID slot to read.
+        :param sisters: uid hex strings to anticollide around.
+        :param detect_delta: encoder clicks from load start where the tag
+            answered.
+        :return dict: decoded tag, or None.
+        """
+        reactor = self.afc.reactor
+        sweep_back = self.rfid_scan_sweep_back   # start reading this early
+        sweep_step = self.rfid_scan_sweep_step   # creep between reads
+        sweep_past = self.rfid_scan_sweep_past   # give up this far past
+        target_early = max(0, detect_delta - sweep_back)
+        self.logger.debug(
+            f"OAMS: RFID scan {lane.name} — tag unreadable in place; "
+            f"unloading and re-feeding to {target_early} clicks for a sweep "
+            f"read across {detect_delta}")
+        try:
+            self._wait_for_idle()
+            self.oams.unload_spool()
+        except Exception as e:
+            self.logger.warning(
+                f"OAMS: RFID reposition unload failed: {e}")
+            return None
+        try:
+            start = int(self.oams.encoder_clicks)
+        except Exception:
+            start = 0
+        if not self._rfid_send_load(lane, slot):
+            return None
+        creeping = False
+        deadline = reactor.monotonic() + 30.0
+        while reactor.monotonic() < deadline:
+            try:
+                if abs(self._enc_delta(self.oams.encoder_clicks,
+                                       start)) >= target_early:
+                    break
+            except Exception:
+                pass
+            if self.oams.action_status is None and not creeping:
+                # Load finished short of the target (short PTFE override) —
+                # creep the rest of the way with the follower.
+                self._rfid_set_follower(1, 1, "rfid reposition creep")
+                creeping = True
+            reactor.pause(reactor.monotonic() + 0.05)
+        self._rfid_set_follower(0, 0, "rfid reposition stop")
+        if self.oams.action_status is not None:
+            self._rfid_scan_stop_load()
+        # Sweep: read at each position, nudging forward with short follower
+        # pulses until the tag decodes or we're well past the detect spot.
+        # Step-bounded too, so a stalled encoder can't loop forever.
+        max_steps = 2 + (sweep_back + sweep_past) // sweep_step
+        for _ in range(max_steps):
+            tag = self._rfid_read_stationary(coord, rfid_slot, sisters,
+                                             attempts=1)
+            if tag is not None:
+                return tag
+            try:
+                pos = abs(self._enc_delta(self.oams.encoder_clicks, start))
+            except Exception:
+                pos = detect_delta + sweep_past
+            # Log where the read actually happened. The follower has no speed
+            # control and the encoder is sampled every 50ms, so the ACHIEVED
+            # step routinely overshoots sweep_step — without this the sweep
+            # looks like it covered the window when it may have jumped over
+            # the sweet spot entirely.
+            self.logger.debug(
+                f"OAMS: RFID sweep {lane.name} — read at {pos} clicks "
+                f"(target {detect_delta}, window "
+                f"{target_early}-{detect_delta + sweep_past})")
+            if pos >= detect_delta + sweep_past:
+                self.logger.debug(
+                    f"OAMS: RFID sweep {lane.name} — past the window at "
+                    f"{pos} clicks; giving up")
+                return None
+            nudge_from = pos
+            self._rfid_set_follower(1, 1, "rfid sweep nudge")
+            nudge_deadline = reactor.monotonic() + 2.0
+            while reactor.monotonic() < nudge_deadline:
+                try:
+                    if abs(self._enc_delta(self.oams.encoder_clicks,
+                                           start)) - nudge_from >= sweep_step:
+                        break
+                except Exception:
+                    break
+                reactor.pause(reactor.monotonic() + 0.05)
+            self._rfid_set_follower(0, 0, "rfid sweep stop")
+            reactor.pause(reactor.monotonic() + 0.2)
+        self.logger.debug(
+            f"OAMS: RFID sweep {lane.name} — exhausted {max_steps} steps "
+            f"without a decode")
+        return None
+
+    def _rfid_wait_for_unit_ready(self, timeout: float,
+                                  fresh: bool = False,
+                                  quiet_time: float = 2.0) -> bool:
+        """
+        Wait for the OAMS unit to be ready to accept commands.
+
+        A fresh insert triggers the FIRMWARE's own auto-stage routine (feed to
+        hub, back off); commands sent during it are rejected ERROR_BUSY.
+
+        The firmware does NOT stream its motor state, and it does not announce
+        that a routine finished either. It emits a status only when a command
+        is REFUSED or when the motor state actually CHANGES. So there are two
+        traps, and the readiness rule has to dodge both:
+
+        * Waiting passively learns nothing — the last report keeps saying
+          whatever the unit was doing when we last spoke to it, forever.
+        * Probing and waiting for an explicit "STOPPED" learns nothing either:
+          a follower stop sent to an already-stopped unit changes no state, so
+          the firmware answers with silence.
+
+        Silence is therefore the ready signal, not any particular message. A
+        follower STOP is idempotent (it neither starts nor moves anything) and
+        is refused ERROR_BUSY while a routine owns the motor, so it makes a
+        free probe: while the unit is staging, every probe draws a busy reply;
+        once it is done, the replies simply stop. Ready = probes have been
+        going out, none has drawn a busy/active reply for ``quiet_time``, the
+        encoder is still, and no host-side action is in flight.
+
+        :param timeout: max seconds to wait overall.
+        :param fresh: retained for call-site clarity (a busy rejection proves
+            a routine is running). Every probe is fresh by construction, so
+            this no longer changes the decision.
+        :param quiet_time: seconds without a busy reply or encoder movement.
+        :return bool: True when ready, False on timeout.
+        """
+        from extras.AFC_OAMS import OAMSOpCode
+        reactor = self.afc.reactor
+        start = reactor.monotonic()
+        deadline = start + timeout
+        try:
+            last_clicks = int(self.oams.encoder_clicks)
+        except Exception:
+            last_clicks = 0
+        quiet_since = start
+        last_probe = 0.0
+        probes = 0
+        # Only reports that land during THIS wait count. Anything older is a
+        # leftover from the last command we sent and says nothing about now.
+        seen_report = getattr(self.oams, 'motion_status_time', 0.0)
+        active_states = (OAMSStatus.FORWARD_FOLLOWING,
+                         OAMSStatus.REVERSE_FOLLOWING,
+                         OAMSStatus.COASTING)
+        probe_iv = getattr(self, 'rfid_ready_probe_interval', 0.5)
+        # Silence only means "ready" once enough probes have gone unanswered
+        # to rule out a gap between replies.
+        min_probes = max(2, int(quiet_time / probe_iv) + 1)
+        while reactor.monotonic() < deadline:
+            now = reactor.monotonic()
+            if now - last_probe >= probe_iv:
+                last_probe = now
+                probes += 1
+                # Raw command, not _rfid_set_follower: this is a probe, not a
+                # state change, and it must not churn the follower
+                # controller's tracking or log a line per poll.
+                try:
+                    self.oams.set_oams_follower(0, 0)
+                except Exception:
+                    pass
+                reactor.pause(reactor.monotonic() + 0.15)
+                now = reactor.monotonic()
+            st_time = getattr(self.oams, 'motion_status_time', 0.0)
+            if st_time > seen_report:
+                # A fresh answer to a probe: the unit is still doing
+                # something, or is refusing us. Either way, not quiet.
+                seen_report = st_time
+                st = getattr(self.oams, 'motion_status', None)
+                code = getattr(self.oams, 'motion_status_code', None)
+                if st in active_states or code == OAMSOpCode.ERROR_BUSY:
+                    quiet_since = now
+            try:
+                clicks = int(self.oams.encoder_clicks)
+            except Exception:
+                clicks = last_clicks
+            if clicks != last_clicks:
+                last_clicks = clicks
+                quiet_since = now
+            busy = getattr(self.oams, 'action_status', None) is not None
+            if (not busy and probes >= min_probes
+                    and now - quiet_since >= quiet_time):
+                return True
+            reactor.pause(reactor.monotonic() + 0.2)
+        return False
+
+    def _rfid_set_follower(self, enable: int, direction: int, reason: str) -> None:
+        """
+        Drive the follower through the FollowerController when available (so
+        its state tracking stays honest), else fall back to the raw command.
+
+        :param enable: 1 to run the follower, 0 to stop it.
+        :param direction: 1 forward, 0 reverse.
+        :param reason: short reason string for the controller's log.
+        """
+        if self._follower is not None:
+            try:
+                if enable:
+                    self._follower.enable_follower(
+                        self._get_monitor_state(), self.oams, direction,
+                        reason, force=True)
+                else:
+                    self._follower.set_follower_state(
+                        self._get_monitor_state(), self.oams, 0, 0,
+                        reason, force=True)
+                return
+            except Exception:
+                pass
+        try:
+            self.oams.set_oams_follower(enable, direction)
+        except Exception:
+            pass
+
+    def _rfid_scan_stop_load(self) -> None:
+        """Cancel an in-flight scan feed and wait for the firmware to ack, so a
+        following unload isn't rejected as busy. Does NOT mark the spool loaded
+        (unlike the TD-1 path) — the scan never loads to the toolhead."""
+        try:
+            self.oams.load_spool_cancel()
+        except Exception:
+            pass
+        deadline = self.afc.reactor.monotonic() + 5.0
+        while self.oams.action_status is not None:
+            if self.afc.reactor.monotonic() > deadline:
+                self.oams.action_status = None
+                break
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.2)
+
+    cmd_AFC_OAMS_RFID_SCAN_help = "Slow-feed a lane, scan its RFID tag, unwind back"
+    def cmd_AFC_OAMS_RFID_SCAN(self, gcmd: GCodeCommand) -> None:
+        """
+        Manually run the RFID scan-on-insert flow for a lane.
+
+        Usage: ``AFC_OAMS_RFID_SCAN UNIT=<unit> LANE=<lane>``
+        """
+        lane_name = gcmd.get("LANE", None)
+        if lane_name is None:
+            raise gcmd.error("AFC_OAMS_RFID_SCAN requires LANE=")
+        lane = self.lanes.get(lane_name)
+        if lane is None:
+            msg = f"Unknown lane {lane_name} on unit {self.name}"
+            raise gcmd.error(msg)
+        if self._operation_active:
+            raise gcmd.error("OAMS is busy — try again once the current "
+                             "operation completes")
+        reason = self._rfid_scan_blocked_reason(lane)
+        if reason is not None:
+            msg = f"RFID scan blocked: {reason}"
+            raise gcmd.error(msg)
+        slot = self._spool_map.get(lane_name)
+        if slot is None or self.oams is None or not self.oams.is_bay_ready(slot):
+            raise gcmd.error(
+                f"RFID scan blocked: no filament inserted in {lane_name} "
+                f"(the scan feeds the lane to rotate the spool)")
+        # Manual scan bypasses the once-per-insert latch.
+        self._rfid_scanned.discard(lane_name)
+        applied = self._do_rfid_scan(lane)
+        if applied:
+            gcmd.respond_info(f"OpenAMS RFID: scanned and applied to {lane_name}")
+        else:
+            hint = ""
+            coord = self._rfid_coordinator()
+            if coord is not None:
+                try:
+                    hint = coord.undecoded_hint(lane_name)
+                except Exception:
+                    hint = ""
+            gcmd.respond_info(
+                f"OpenAMS RFID: no tag decoded on {lane_name}{hint}")
 
     # ── TD-1 support ────────────────────────────────────────────────
 

@@ -51,6 +51,10 @@ class AFC_vivid(afcBoxTurtle):
     VALID_CAM_ANGLES = [30,45,60]
     CALIBRATION_DISTANCE = 5000
     LANE_OVERSHOOT = 200
+    # Safety cap on stage-and-load feed segments — an RFID stop-on-detect fakes
+    # the sensor and re-issues the feed, so a normal load is 1-2 segments; this
+    # just bounds a pathological abort loop.
+    STAGE_MAX_SEGMENTS = 8
     def __init__(self, config: ConfigWrapper):
         """
         Initialize a ViViD style AFC unit.
@@ -218,20 +222,12 @@ class AFC_vivid(afcBoxTurtle):
         """
         self.lane_loading(lane)
         self.select_lane(lane, sel_prep=True)
-        num_tries = 0
-        if not lane.calibrated_lane:
-            distance = self.CALIBRATION_DISTANCE
-            move_speed = SpeedMode.SHORT
-        else:
-            distance = lane.dist_hub
-            move_speed = SpeedMode.LONG
-        homed = False
-        while (num_tries < 2
-               and lane.prep_state
-               and not lane.raw_load_state):
-            homed, distance, _ = lane.move_to(distance, move_speed, assist_active=AssistActive.NO,
-                                              endstop=lane.load_endstop_name, use_homing=True)
-            num_tries += 1
+        # Feed to the virtual hub with the normal homing move while an optional RFID
+        # module (AFC_Vivid_rfid) polls the reader CONCURRENTLY as the spool spins —
+        # a smooth load, no chunking. Without an RFID listener this is just the
+        # normal homing feed. `distance` is the total fed (origin -> sensor), used
+        # for the dist_hub calibration below.
+        homed, distance = self._stage_and_load(lane)
         if homed:
             lane.loaded_to_hub = True
             if not lane.calibrated_lane:
@@ -251,6 +247,63 @@ class AFC_vivid(afcBoxTurtle):
         self.selector_stepper_obj.do_enable(False)
         self.drive_stepper_obj.do_enable(False)
         self.afc.function.select_loaded_lane()
+
+    def _stage_and_load(self, lane: AFCLane):
+        """Feed the lane to the virtual hub with the NORMAL homing move, bracketed
+        by RFID stage-read events so an optional AFC_Vivid_rfid module can poll the
+        reader CONCURRENTLY while the spool spins. No chunking — the load motion is
+        the unmodified original, so ``loaded_to_hub`` and the ``dist_hub``
+        calibration are byte-identical to a no-RFID load; the RFID read is a purely
+        passive observer riding along on the feed. Without an RFID listener the
+        events are no-ops and this is exactly the stock ViViD load.
+
+        :param lane: AFCLane being staged.
+        :return tuple: (homed: bool, distance: float). The homing move's returned
+            distance (origin -> load sensor) feeds the dist_hub calibration.
+        """
+        if not lane.calibrated_lane:
+            budget = self.CALIBRATION_DISTANCE
+            move_speed = SpeedMode.SHORT
+        else:
+            budget = lane.dist_hub
+            move_speed = SpeedMode.LONG
+
+        # Tell an RFID module the feed is starting so it can poll the reader while
+        # the spool spins. Bracketed in try/finally so 'end' always fires and the
+        # module tears its poll timer down (and restores any moved sibling) even if
+        # the load errors.
+        try:
+            self.printer.send_event("afc_vivid:stage_read_begin", lane)
+        except Exception as e:
+            self.logger.error(f"ViViD stage read begin error: {e}")
+
+        # Re-issue the homing feed until the REAL load sensor trips. An RFID detect
+        # FAKES the sensor to abort the move early (stop-on-detect): the homing
+        # call then returns homed=True but the real sensor pin (raw_load_state) is
+        # still False — that's our cue to read and re-issue. A GENUINE miss returns
+        # homed=False (endstop never hit) and is retried at most twice, as before.
+        # Segment distances are summed so dist_hub calibration stays origin->sensor,
+        # and the real sensor (not the faked homing return) decides success.
+        total = 0.0
+        misses = 0
+        segments = 0
+        try:
+            while (lane.prep_state and not lane.raw_load_state
+                   and misses < 2 and segments < self.STAGE_MAX_SEGMENTS):
+                homed, moved, _ = lane.move_to(
+                    budget, move_speed, assist_active=AssistActive.NO,
+                    endstop=lane.load_endstop_name, use_homing=True)
+                total += moved
+                segments += 1
+                if not homed:
+                    misses += 1                        # real endstop not hit
+                # homed-but-sensor-still-false = our RFID fake-abort → re-issue
+        finally:
+            try:
+                self.printer.send_event("afc_vivid:stage_read_end", lane)
+            except Exception as e:
+                self.logger.error(f"ViViD stage read end error: {e}")
+        return bool(lane.raw_load_state), total
 
     def prep_post_load(self, lane: AFCLane):
         """

@@ -192,6 +192,15 @@ class AFC_OAMS:
         self.action_status_code: Optional[int] = None
         self.action_status_value: Optional[int] = None
 
+        # Last firmware-reported motor state (forward/reverse following,
+        # coasting, stopped) + when it arrived. The firmware emits one only
+        # when a command is REFUSED or the motor state CHANGES, never on a
+        # timer, so callers (RFID scan) probe and read the ABSENCE of a busy
+        # reply as "routine finished" -- there is no ready message to wait for.
+        self.motion_status: Optional[int] = None
+        self.motion_status_code: Optional[int] = None
+        self.motion_status_time: float = 0.0
+
         # MCU communication
         self._register_mcu_response(self._oams_action_status, "oams_action_status")
         self._register_mcu_response(self._oams_cmd_stats, "oams_cmd_stats")
@@ -1398,6 +1407,15 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             OAMSStatus.COASTING,
             OAMSStatus.STOPPED,
         ):
+            # Record the firmware's motor state so callers can wait for the
+            # unit to become ready (it reports STOPPED when a routine — e.g.
+            # the insert auto-stage — finishes and it will accept commands).
+            self.motion_status = action
+            self.motion_status_code = code
+            # Stamped so a caller can tell a fresh report from a stale one --
+            # the readiness wait reads SILENCE as ready, so it needs to know
+            # when the unit last actually said something.
+            self.motion_status_time = self.reactor.monotonic()
             self.logger.debug(
                 f"OAMS status update (non-action): "
                 f"{_oams_enum_name(OAMSStatus, action, 'action')} "

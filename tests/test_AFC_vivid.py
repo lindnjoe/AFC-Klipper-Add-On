@@ -457,8 +457,9 @@ class TestPrepLoad:
         unit.lane_loading = MagicMock()
         unit.select_lane = MagicMock()
         unit.lane_loaded = MagicMock()
+        # reads: loop check (False) -> feed -> loop check (True, exit) -> return.
         with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
-            mock_prop.side_effect = [False, True]
+            mock_prop.side_effect = [False, True, True]
             unit.prep_load(lane)
 
         assert lane.loaded_to_hub is True
@@ -493,15 +494,18 @@ class TestPrepLoad:
         unit.select_lane = MagicMock()
         unit.lane_loaded = MagicMock()
         with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
-            mock_prop.side_effect = [False, True]
+            mock_prop.side_effect = [False, True, True]
 
             unit.prep_load(lane)
 
         assert lane.calibrated_lane is True
         assert lane.dist_hub == round(300.0, 2) + AFC_vivid.LANE_OVERSHOOT
         unit.afc.function.ConfigRewrite.assert_called()
-    
-    def test_uncalibrated_lane_updates_dist_hub_and_config_two_tries(self):
+
+    def test_fake_abort_segments_sum_for_calibration(self):
+        # An RFID stop-on-detect splits the feed: the homing call returns homed but
+        # the real sensor is still false, so the feed re-issues. dist_hub must be
+        # the SUM of the segment distances (origin->sensor), not just the last one.
         unit = _make_vivid()
         lane = _make_afc_lane()
         lane.calibrated_lane = False
@@ -511,15 +515,16 @@ class TestPrepLoad:
         unit.lane_loading = MagicMock()
         unit.select_lane = MagicMock()
         unit.lane_loaded = MagicMock()
+        # two segments (sensor still false), then the real sensor trips.
         with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
-            mock_prop.side_effect = [False, False, True]
+            mock_prop.side_effect = [False, False, True, True]
 
             unit.prep_load(lane)
 
         assert lane.calibrated_lane is True
-        assert lane.dist_hub == round(300.0, 2) + AFC_vivid.LANE_OVERSHOOT
+        assert lane.dist_hub == round(600.0, 2) + AFC_vivid.LANE_OVERSHOOT
         unit.afc.function.ConfigRewrite.assert_called()
-    
+
     def test_uncalibrated_lane_updates_dist_hub_and_config_failed(self):
         unit = _make_vivid()
         lane = _make_afc_lane()
@@ -530,8 +535,9 @@ class TestPrepLoad:
         unit.lane_loading = MagicMock()
         unit.select_lane = MagicMock()
         unit.lane_loaded = MagicMock()
+        # genuine misses (homed False) -> retried twice, then give up; final read.
         with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
-            mock_prop.side_effect = [False, False, False]
+            mock_prop.side_effect = [False, False, False, False]
 
             unit.prep_load(lane)
 
@@ -541,17 +547,17 @@ class TestPrepLoad:
         # Failure should be reported/logged
         error_msgs = [m for lvl, m in unit.logger.messages if lvl == "error"]
         assert error_msgs
-    
+
     def test_uncalibrated_lane_updates_dist_hub_no_prep(self):
         unit = _make_vivid()
         lane = MagicMock()
         lane.calibrated_lane = False
         lane.prep_state = False
+        lane.raw_load_state = False                    # real bool, not a mock obj
         lane.move_to.return_value = (True, 300.0, False)
         unit.lane_loading = MagicMock()
         unit.select_lane = MagicMock()
         unit.lane_loaded = MagicMock()
-        lane.raw_load_state = PropertyMock(side_effect=[False])
 
         unit.prep_load(lane)
 
@@ -562,6 +568,8 @@ class TestPrepLoad:
         lane = MagicMock()
         lane.calibrated_lane = True
         lane.dist_hub = 200.0
+        lane.prep_state = True
+        lane.raw_load_state = False                    # real bool, never trips
         lane.move_to.return_value = (False, 0.0, False)
         unit.lane_loading = MagicMock()
         unit.select_lane = MagicMock()
@@ -572,6 +580,65 @@ class TestPrepLoad:
         unit.lane_loaded.assert_not_called()
         # Steppers are disabled regardless of homing result
         unit.selector_stepper_obj.do_enable.assert_called_with(False)
+
+
+class TestStageAndLoad:
+    def test_no_rfid_listener_is_a_plain_homing_feed(self):
+        unit = _make_vivid()
+        lane = MagicMock()
+        lane.calibrated_lane = True
+        lane.dist_hub = 200.0
+        lane.prep_state = True
+        lane.raw_load_state = False
+
+        def move_to(dist, speed, assist_active=None, endstop=None,
+                    use_homing=False):
+            lane.raw_load_state = True                  # the sensor trips (homed)
+            return (True, 200.0, False)
+
+        lane.move_to.side_effect = move_to
+        # MockPrinter.send_event does nothing -> no RFID fake-abort.
+        homed, dist = unit._stage_and_load(lane)
+        assert homed is True and dist == 200.0
+        assert lane.move_to.call_count == 1             # one homing feed, no chunks
+        for call in lane.move_to.call_args_list:
+            assert call.kwargs.get("use_homing") is True
+
+    def test_brackets_the_load_with_stage_read_events(self):
+        # begin/end events bracket the normal homing load, every move is a homing
+        # move (no chunking), and the real sensor decides completion.
+        unit = _make_vivid()
+        lane = MagicMock()
+        lane.calibrated_lane = True
+        lane.dist_hub = 500.0
+        lane.prep_state = True
+        lane.raw_load_state = False
+        lane.load_endstop_name = "load"
+        events = []
+        move_at_begin = {}
+
+        def move_to(dist, speed, assist_active=None, endstop=None,
+                    use_homing=False):
+            assert use_homing is True                  # only homing moves — smooth
+            lane.raw_load_state = True
+            return (True, dist, False)
+
+        lane.move_to.side_effect = move_to
+
+        def send_event(name, l=None):
+            events.append(name)
+            if name.endswith("stage_read_begin"):
+                move_at_begin["calls"] = lane.move_to.call_count
+
+        unit.printer.send_event = send_event
+        homed, _dist = unit._stage_and_load(lane)
+        assert "afc_vivid:stage_read_begin" in events
+        assert "afc_vivid:stage_read_end" in events
+        # begin fires BEFORE the feed, end AFTER.
+        assert move_at_begin["calls"] == 0
+        assert events.index("afc_vivid:stage_read_begin") < \
+            events.index("afc_vivid:stage_read_end")
+        assert homed is True
 
 
 # ── eject_lane ────────────────────────────────────────────────────────────────

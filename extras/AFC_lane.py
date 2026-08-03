@@ -36,7 +36,7 @@ try: from extras.AFC_stats import AFCStats_var
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
 # Unit types that only have load switch
-ONLY_LOAD_TYPES = ["HTLF", "Claymore", "OpenAMS"]
+ONLY_LOAD_TYPES = ["HTLF", "Claymore", "OpenAMS", "ACE", "ACE2"]
 EXCLUDE_TYPES = ONLY_LOAD_TYPES + [ "ViViD"]
 # Class for holding different states so its clear what all valid states are
 
@@ -130,6 +130,7 @@ class AFCLane:
         self.weight: float      = 0.
         self.auto_switch_triggered = False
         self._material: str     = None
+        self.sub_type: str      = ""     # tag/Spoolman variant, e.g. "Matte"
         self.extruder_temp      = None
         self.bed_temp           = None
         self.td1_data           = {}
@@ -2199,11 +2200,18 @@ class AFCLane:
         response["tool_loaded"] = self.tool_loaded
         response["loaded_to_hub"] = self.loaded_to_hub
         response["material"]=self.material
+        response["sub_type"] = self.sub_type
         if save_to_file:
             response["density"]=self.filament_density
             response["diameter"]=self.filament_diameter
             response["empty_spool_weight"]=self.empty_spool_weight
             response["need_purge"] = self.need_purge
+        else:
+            # Live status for the UIs — the same physical values the vars-file
+            # branch persists above.
+            response["density"] = self.filament_density
+            response["diameter"] = self.filament_diameter
+            response["empty_spool_weight"] = self.empty_spool_weight
 
         response["remember_spool"]= bool(self.remember_spool)
         response["spool_id"]= int(self.spool_id) if self.spool_id else None

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from extras.AFC_lane import AFCLane
 
 class AFCSpool:
+    SNAPMAKER_SET_PRINT_FILAMENT_CONFIG = "SET_PRINT_FILAMENT_CONFIG"
     def __init__(self, config):
         self.printer = config.get_printer()
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
@@ -90,7 +91,9 @@ class AFCSpool:
                     or getattr(self.afc, "default_material_type", None)
                     or "NONE"
                 )
-                tmp_config['filament_sub_type'][extruder_num] = "NONE"
+                tmp_config['filament_sub_type'][extruder_num] = (
+                    getattr(lane, "sub_type", "") or "NONE"
+                )
 
                 tmp_config['filament_color'][extruder_num] = int("FFFFFFFF", 16)
                 tmp_config['filament_color_rgba'][extruder_num] = "FFFFFFFF"

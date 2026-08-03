@@ -92,6 +92,7 @@ def _make_oams(oams_idx=0, config_values=None):
         oams = AFC_OAMS(config)
 
     oams.hardware_service = None
+    oams._cached_gcode = None
 
     # Command objects normally created in handle_connect()
     oams.oams_load_spool_cmd = MagicMock()
@@ -995,6 +996,8 @@ class TestUnloadSpoolWithRetry:
             captured_attempt_times.append(oams._last_unload_attempt)
             return (False, "busy")
         oams.unload_spool = MagicMock(side_effect=fake_unload)
+        gcode = MagicMock()
+        oams._cached_gcode = gcode
 
         success, message = oams.unload_spool_with_retry(max_retries=2)
 
@@ -1019,6 +1022,8 @@ class TestUnloadSpoolWithRetry:
         oams.unload_retry_max = 3
         oams.abort_current_action = MagicMock()
         oams.unload_spool = MagicMock(return_value=(False, "busy"))
+        gcode = MagicMock()
+        oams._cached_gcode = gcode
 
         success, message = oams.unload_spool_with_retry(max_retries=0)
 
@@ -1031,6 +1036,8 @@ class TestUnloadSpoolWithRetry:
         oams.unload_retry_max = 2
         oams.abort_current_action = MagicMock()
         oams.unload_spool = MagicMock(return_value=(False, "busy"))
+        gcode = MagicMock()
+        oams._cached_gcode = gcode
 
         success, message = oams.unload_spool_with_retry(max_retries=-5)
 
