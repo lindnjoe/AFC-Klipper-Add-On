@@ -12,20 +12,25 @@ Covers:
 
 from __future__ import annotations
 
+import sys
+import itertools
+import importlib.util
+import configparser
 from unittest.mock import MagicMock, patch, call, PropertyMock
 import pytest
 
-from extras.AFC_error import afcError
+from extras.AFC_error import afcError, load_config
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_afc_error():
-    """Create an afcError instance bypassing __init__ and wiring up mocks."""
+    """Create an afcError instance through its real __init__ and
+    handle_connect (fired via the klippy:connect event), mocking only the
+    Klipper collaborators (config/printer/AFC/reactor)."""
     from extras.AFC_error import afcError
-    from extras.AFC_lane import AFCLaneState
     from extras.AFC import State
-    from tests.conftest import MockAFC, MockPrinter, MockLogger
+    from tests.conftest import MockAFC, MockPrinter, MockConfig
 
     afc = MockAFC()
     afc.error_state = False
@@ -44,23 +49,23 @@ def _make_afc_error():
     printer._objects["pause_resume"] = pause_resume
     printer._objects["idle_timeout"] = idle_timeout
 
-    # Build afcError without running __init__ (it needs a Klipper config)
-    err = afcError.__new__(afcError)
-    err.printer = printer
-    err.afc = afc
-    err.logger = MockLogger()
-    err.pause = False
-    err.pause_resume = pause_resume
-    err.error_timeout = 600
-    err.idle_timeout_obj = idle_timeout
-    err.idle_timeout_val = idle_timeout.idle_timeout
-    err.BASE_RESUME_NAME = "RESUME"
-    err.AFC_RENAME_RESUME_NAME = "_AFC_RENAMED_RESUME_"
-    err.BASE_PAUSE_NAME = "PAUSE"
-    err.AFC_RENAME_PAUSE_NAME = "_AFC_RENAMED_PAUSE_"
-    err.errorLog = {}
+    config = MockConfig(name="AFC_error", printer=printer)
+    err = afcError(config)
+    printer.send_event("klippy:connect")
 
     return err, afc
+
+
+# ── load_config ───────────────────────────────────────────────────────────────
+
+class TestLoadConfig:
+    def test_load_config_returns_afc_error_instance(self):
+        from tests.conftest import MockConfig, MockPrinter, MockAFC
+        afc = MockAFC()
+        printer = MockPrinter(afc=afc)
+        config = MockConfig(name="AFC_error", printer=printer)
+        result = load_config(config)
+        assert isinstance(result, afcError)
 
 
 # ── afcError.__init__ and handle_connect ──────────────────────────────────────
@@ -178,6 +183,14 @@ class TestSetErrorState:
         err.set_error_state(True)
         afc.save_pos.assert_not_called()
 
+    def test_set_false_does_not_call_save_pos(self):
+        """state=False alone must skip save_pos, even though `not
+        afc.error_state` is satisfied (error_state is False beforehand)."""
+        err, afc = _make_afc_error()
+        afc.error_state = False
+        err.set_error_state(False)
+        afc.save_pos.assert_not_called()
+
 
 # ── reset_failure ─────────────────────────────────────────────────────────────
 
@@ -209,8 +222,7 @@ class TestResetFailure:
     def test_reset_failure_logs_debug(self):
         err, afc = _make_afc_error()
         err.reset_failure()
-        debug_msgs = [m for lvl, m in err.logger.messages if lvl == "debug"]
-        assert len(debug_msgs) > 0
+        assert err.logger.messages == [("debug", "Resetting failures")]
 
 
 # ── PauseUserIntervention ─────────────────────────────────────────────────────
@@ -248,8 +260,7 @@ class TestPauseUserIntervention:
         afc.function.is_homed.return_value = True
         afc.function.is_paused.return_value = False
         err.PauseUserIntervention("Bad thing happened")
-        error_msgs = [m for lvl, m in err.logger.messages if lvl == "error"]
-        assert any("Bad thing happened" in m for m in error_msgs)
+        assert err.logger.messages == [("error", "Bad thing happened")]
 
 
 # ── pause_print ───────────────────────────────────────────────────────────────
@@ -272,6 +283,17 @@ class TestPausePrint:
         afc.gcode.run_script_from_command = MagicMock()
         err.pause_print()
         err.set_error_state.assert_called_once_with(True)
+
+    def test_pause_print_logs_pausing_and_after_pause(self):
+        err, afc = _make_afc_error()
+        err.set_error_state = MagicMock()
+        afc.function.log_toolhead_pos = MagicMock()
+        afc.gcode.run_script_from_command = MagicMock()
+        err.pause_print()
+        assert err.logger.messages == [
+            ("info", "PAUSING"),
+            ("debug", "After User Pause"),
+        ]
 
 
 # ── handle_lane_failure ───────────────────────────────────────────────────────
@@ -308,6 +330,45 @@ class TestHandleLaneFailure:
         assert "lane2" in called_msg
         assert "overheated" in called_msg
 
+    def test_calls_afc_error_with_real_caller_function_name(self):
+        """Frame inspection resolves stack_name to the name of the function
+        that called handle_lane_failure."""
+        err, afc = _make_afc_error()
+        err.AFC_error = MagicMock()
+        cur_lane = MagicMock()
+        cur_lane.name = "lane2"
+        cur_lane.led_index = "2"
+        err.handle_lane_failure(cur_lane, "overheated", pause=False)
+        assert err.AFC_error.call_args.kwargs["stack_name"] == \
+            "test_calls_afc_error_with_real_caller_function_name"
+
+    def test_stack_name_falls_back_to_empty_when_currentframe_is_none(self):
+        """inspect.currentframe() returning None (interpreters without frame
+        support) must fall back to an empty stack_name, not crash on
+        frame.f_back."""
+        err, afc = _make_afc_error()
+        err.AFC_error = MagicMock()
+        cur_lane = MagicMock()
+        cur_lane.name = "lane2"
+        cur_lane.led_index = "2"
+        with patch("extras.AFC_error.inspect.currentframe", return_value=None):
+            err.handle_lane_failure(cur_lane, "overheated", pause=False)
+        assert err.AFC_error.call_args.kwargs["stack_name"] == ""
+
+    def test_stack_name_falls_back_to_empty_when_no_caller_frame(self):
+        """A frame with no caller (f_back is None) must also fall back to an
+        empty stack_name, not crash on None.f_code."""
+        err, afc = _make_afc_error()
+        err.AFC_error = MagicMock()
+        cur_lane = MagicMock()
+        cur_lane.name = "lane2"
+        cur_lane.led_index = "2"
+        fake_frame = MagicMock()
+        fake_frame.f_back = None
+        with patch("extras.AFC_error.inspect.currentframe", return_value=fake_frame):
+            err.handle_lane_failure(cur_lane, "overheated", pause=False)
+        assert err.AFC_error.call_args.kwargs["stack_name"] == ""
+
 
 # ── AFC_error (the method) ────────────────────────────────────────────────────
 
@@ -316,8 +377,51 @@ class TestAFCErrorMethod:
         err, afc = _make_afc_error()
         err.pause_print = MagicMock()
         err.AFC_error("Catastrophic failure", pause=False)
-        error_msgs = [m for lvl, m in err.logger.messages if lvl == "error"]
-        assert any("Catastrophic failure" in m for m in error_msgs)
+        assert err.logger.messages == [("error", "Catastrophic failure")]
+
+    def test_explicit_stack_name_skips_frame_inspection(self):
+        """A caller-supplied stack_name is passed through as-is, instead of
+        being overwritten by inspect.currentframe() lookup."""
+        err, afc = _make_afc_error()
+        err.pause_print = MagicMock()
+        err.logger = MagicMock()
+        err.AFC_error("Uh oh", pause=False, stack_name="custom_caller")
+        err.logger.error.assert_called_once_with(message="Uh oh", stack_name="custom_caller")
+
+    def test_no_stack_name_uses_real_caller_function_name(self):
+        """stack_name=None triggers frame inspection, resolving to the name
+        of the function that called AFC_error."""
+        err, afc = _make_afc_error()
+        err.pause_print = MagicMock()
+        err.logger = MagicMock()
+        err.AFC_error("Uh oh", pause=False)
+        err.logger.error.assert_called_once_with(
+            message="Uh oh",
+            stack_name="test_no_stack_name_uses_real_caller_function_name",
+        )
+
+    def test_no_stack_name_falls_back_to_empty_when_currentframe_is_none(self):
+        """inspect.currentframe() returning None (interpreters without frame
+        support) must fall back to an empty stack_name, not crash on
+        frame.f_back."""
+        err, afc = _make_afc_error()
+        err.pause_print = MagicMock()
+        err.logger = MagicMock()
+        with patch("extras.AFC_error.inspect.currentframe", return_value=None):
+            err.AFC_error("Uh oh", pause=False)
+        err.logger.error.assert_called_once_with(message="Uh oh", stack_name="")
+
+    def test_no_stack_name_falls_back_to_empty_when_no_caller_frame(self):
+        """A frame with no caller (f_back is None) must also fall back to an
+        empty stack_name, not crash on None.f_code."""
+        err, afc = _make_afc_error()
+        err.pause_print = MagicMock()
+        err.logger = MagicMock()
+        fake_frame = MagicMock()
+        fake_frame.f_back = None
+        with patch("extras.AFC_error.inspect.currentframe", return_value=fake_frame):
+            err.AFC_error("Uh oh", pause=False)
+        err.logger.error.assert_called_once_with(message="Uh oh", stack_name="")
 
     def test_pause_true_calls_pause_print(self):
         err, afc = _make_afc_error()
@@ -390,23 +494,29 @@ class TestFix:
         afc.function.afc_led.assert_called_with(lane.led_fault, lane.led_index)
 
     def test_fix_other_problem_calls_pause_user_intervention(self):
+        """A real lane object alone isn't enough to reach ToolHeadFix -
+        problem must also equal 'toolhead'."""
         err, afc = _make_afc_error()
         err.PauseUserIntervention = MagicMock()
+        err.ToolHeadFix = MagicMock()
         lane = MagicMock()
         lane.led_index = "2"
         err.fix("jam", lane)
         err.PauseUserIntervention.assert_called_with("jam")
+        err.ToolHeadFix.assert_not_called()
 
     def test_fix_none_problem_calls_pause_user_intervention_with_unknown_message(self):
-        """Covers line 58: problem is None → PauseUserIntervention('Paused for unknown error')."""
+        """problem is None -> PauseUserIntervention('Paused for unknown error')
+        exactly once; the elif chain must not also fall into the else branch
+        and call PauseUserIntervention(None) a second time."""
         err, afc = _make_afc_error()
         err.PauseUserIntervention = MagicMock()
         lane = MagicMock()
         lane.led_index = "1"
         err.fix(None, lane)
-        # Should be called with the 'unknown error' string
-        calls = [str(c) for c in err.PauseUserIntervention.call_args_list]
-        assert any("unknown" in c.lower() for c in calls)
+        assert err.PauseUserIntervention.call_args_list == [
+            call('Paused for unknown error'),
+        ]
 
     def test_fix_returns_error_handled_from_toolhead_fix(self):
         err, afc = _make_afc_error()
@@ -423,6 +533,39 @@ class TestFix:
         lane.led_index = "1"
         result = err.fix("jam", lane)
         assert result is False
+
+    def test_fix_resolves_lane_name_string_via_afc_lanes(self):
+        """A string LANE argument is looked up in afc.lanes before dispatch."""
+        from extras.AFC_unit import afcUnit
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        err.ToolHeadFix = MagicMock(return_value=False)
+        lane = MagicMock()
+        lane.led_index = "1"
+        lane.unit_obj = afcUnit.__new__(afcUnit)
+        lane.unit_obj.afc = afc
+        afc.lanes = {"lane1": lane}
+        err.fix("toolhead", "lane1")
+        err.ToolHeadFix.assert_called_once_with(lane)
+        afc.function.afc_led.assert_called_with(lane.led_fault, lane.led_index)
+
+    def test_fix_unmatched_lane_name_string_does_not_crash(self):
+        """A string LANE that doesn't match any key in afc.lanes resolves to
+        None via dict.get()'s fallback default. fix() must treat that as a
+        graceful no-match: skip ToolHeadFix (no lane to hand it), fall into
+        the PauseUserIntervention(problem) branch instead, skip lane_fault
+        (nothing to fault), and return False without raising."""
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        err.ToolHeadFix = MagicMock(return_value=False)
+        afc.lanes = {}  # "missing_lane" is not a registered lane
+        result = err.fix("toolhead", "missing_lane")
+        assert result is False
+        err.ToolHeadFix.assert_not_called()
+        err.PauseUserIntervention.assert_called_once_with(
+            "Unknown lane 'missing_lane' reported for problem: toolhead"
+        )
+        afc.function.afc_led.assert_not_called()
 
 
 # ── ToolHeadFix ───────────────────────────────────────────────────────────────
@@ -477,6 +620,10 @@ class TestToolHeadFix:
         assert result is True
         assert err.pause is False
         afc.save_vars.assert_called_once()
+        assert err.logger.messages == [
+            ("info", "Retracting lane1 back to load switch"),
+            ("info", "Done resetting lane1"),
+        ]
 
     def test_toolhead_empty_with_lane_filament_clears_flags_no_homing(self):
         from unittest.mock import PropertyMock
@@ -492,7 +639,11 @@ class TestToolHeadFix:
         assert lane.tool_loaded is False
         assert lane.loaded_to_hub is False
         assert lane.extruder_obj.lane_loaded == None
-    
+        assert err.logger.messages == [
+            ("info", "Retracting lane1 back to load switch"),
+            ("info", "Done resetting lane1"),
+        ]
+
     def test_toolhead_empty_with_lane_filament_returns_true_homing(self):
         """Filament is retracted to lane and reloaded; returns True."""
         from unittest.mock import PropertyMock
@@ -512,6 +663,10 @@ class TestToolHeadFix:
         assert result is True
         assert err.pause is False
         afc.save_vars.assert_called_once()
+        assert err.logger.messages == [
+            ("info", "Retracting lane1 back to load switch"),
+            ("info", "Done resetting lane1"),
+        ]
 
     def test_toolhead_empty_with_lane_filament_clears_flags_homing(self):
         from unittest.mock import PropertyMock
@@ -529,9 +684,56 @@ class TestToolHeadFix:
         assert lane.tool_loaded is False
         assert lane.loaded_to_hub is False
         assert lane.extruder_obj.lane_loaded == None
-    
+        assert err.logger.messages == [
+            ("info", "Retracting lane1 back to load switch"),
+            ("info", "Done resetting lane1"),
+        ]
+
+    def test_toolhead_empty_homing_no_hub_obj_excludes_bowden_length(self):
+        """When hub_obj is None during the homing retract loop, the move
+        distance must fall back to dist_hub + 500 without touching
+        hub_obj.afc_bowden_length (which would crash on None)."""
+        from unittest.mock import PropertyMock
+        from tests.test_AFC_lane import _make_afc_lane
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        afc.homing_enabled = True
+        lane = _make_afc_lane()
+        lane.get_toolhead_pre_sensor_state.return_value = False  # toolhead empty
+        lane.hub_obj = None
+        # Sequence: outer if check(True→enter), while check(True→loop), while check(False→exit)
+        with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
+            mock_prop.side_effect = [True, True, False]
+            result = err.ToolHeadFix(lane)
+        assert result is True
+        lane.unit_obj.move_to_load.assert_called_once()
+        total_move_dist = lane.unit_obj.move_to_load.call_args[0][1]
+        assert total_move_dist == lane.dist_hub + 500
+
+    def test_toolhead_empty_homing_with_hub_obj_includes_bowden_length(self):
+        """When hub_obj is set, the move distance must include
+        hub_obj.afc_bowden_length on top of dist_hub + 500."""
+        from unittest.mock import PropertyMock
+        from tests.test_AFC_lane import _make_afc_lane
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        afc.homing_enabled = True
+        lane = _make_afc_lane()
+        lane.get_toolhead_pre_sensor_state.return_value = False  # toolhead empty
+        lane.hub_obj = MagicMock()
+        lane.hub_obj.afc_bowden_length = 1300
+        # Sequence: outer if check(True→enter), while check(True→loop), while check(False→exit)
+        with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
+            mock_prop.side_effect = [True, True, False]
+            result = err.ToolHeadFix(lane)
+        assert result is True
+        lane.unit_obj.move_to_load.assert_called_once()
+        total_move_dist = lane.unit_obj.move_to_load.call_args[0][1]
+        assert total_move_dist == 2700
+
     def test_toolhead_empty_with_lane_filament_returns_false_timed_out_homing(self):
-        """Filament is retracted to lane and reloaded; returns True."""
+        """Homing retract never sees raw_load_state clear -> 5 tries exhausted,
+        pauses and returns False."""
         from unittest.mock import PropertyMock
         from tests.test_AFC_lane import _make_afc_lane
         err, afc = _make_afc_error()
@@ -549,7 +751,108 @@ class TestToolHeadFix:
         assert result is False
         assert err.pause is False
         err.PauseUserIntervention.assert_called_with("Failed to retract lane1 to load sensor")
+        assert err.logger.messages == [("info", "Retracting lane1 back to load switch")]
 
+    def test_toolhead_empty_retract_loop_times_out_no_homing(self):
+        """No-homing retract loop exhausts its max_length budget without ever
+        clearing raw_load_state, so it must pause and return False."""
+        from unittest.mock import PropertyMock
+        from tests.test_AFC_lane import _make_afc_lane
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        afc.homing_enabled = False
+        lane = _make_afc_lane()
+        lane.move = MagicMock()
+        lane.get_toolhead_pre_sensor_state.return_value = False  # toolhead empty
+        with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
+            mock_prop.return_value = True  # never clears -> loop runs until max_length exhausted
+            result = err.ToolHeadFix(lane)
+        assert result is False
+        err.PauseUserIntervention.assert_called_with("Failed to retract lane1 to load sensor")
+        assert err.logger.messages == [("info", "Retracting lane1 back to load switch")]
+
+    def test_toolhead_empty_reload_loop_times_out_no_homing(self):
+        """No-homing reload loop exhausts its max_length budget because
+        raw_load_state never goes True, so it must pause and return False."""
+        from unittest.mock import PropertyMock
+        from tests.test_AFC_lane import _make_afc_lane
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        afc.homing_enabled = False
+        lane = _make_afc_lane()
+        lane.move = MagicMock()
+        lane.get_toolhead_pre_sensor_state.return_value = False  # toolhead empty
+        with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
+            # First read is the outer `if cur_lane.raw_load_state` guard, which
+            # must be True to enter this branch at all; the first while loop's
+            # own check then reads False so it exits with zero iterations; the
+            # second loop ("while not raw_load_state") then never sees it go
+            # True, exhausting max_length.
+            mock_prop.side_effect = itertools.chain([True, False], itertools.repeat(False))
+            result = err.ToolHeadFix(lane)
+        assert result is False
+        err.PauseUserIntervention.assert_called_with("Failed to move back lane1 to load sensor")
+        assert err.logger.messages == [("info", "Retracting lane1 back to load switch")]
+
+    def test_toolhead_empty_already_at_lane_extruder_takes_no_action(self):
+        """When raw_load_state is already False, neither retract nor reload
+        is needed -> no PauseUserIntervention call, no move, and the method
+        returns False (falls off the end of the outer if)."""
+        from unittest.mock import PropertyMock
+        from tests.test_AFC_lane import _make_afc_lane
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        lane = _make_afc_lane()
+        lane.move = MagicMock()
+        lane.get_toolhead_pre_sensor_state.return_value = False  # toolhead empty
+        with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
+            mock_prop.return_value = False
+            result = err.ToolHeadFix(lane)
+        assert result is False
+        err.PauseUserIntervention.assert_not_called()
+        lane.move.assert_not_called()
+        assert err.logger.messages == []
+
+    def test_toolhead_empty_direct_hub_takes_no_action(self):
+        """raw_load_state alone isn't enough: a direct hub (is_direct_hub()
+        True) skips retract/reload even though raw_load_state is True and
+        tool_start != 'buffer'."""
+        from unittest.mock import PropertyMock
+        from tests.test_AFC_lane import _make_afc_lane
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        lane = _make_afc_lane()
+        lane.hub = "direct"  # VALID_DIRECT_HUB -> is_direct_hub() is True
+        lane.move = MagicMock()
+        lane.get_toolhead_pre_sensor_state.return_value = False  # toolhead empty
+        with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
+            mock_prop.return_value = True
+            result = err.ToolHeadFix(lane)
+        assert result is False
+        err.PauseUserIntervention.assert_not_called()
+        lane.move.assert_not_called()
+        assert err.logger.messages == []
+
+    def test_toolhead_empty_buffer_tool_start_takes_no_action(self):
+        """raw_load_state and a non-direct hub alone aren't enough: a
+        tool_start of 'buffer' skips retract/reload even with raw_load_state
+        True and is_direct_hub() False."""
+        from unittest.mock import PropertyMock
+        from tests.test_AFC_lane import _make_afc_lane
+        err, afc = _make_afc_error()
+        err.PauseUserIntervention = MagicMock()
+        lane = _make_afc_lane()
+        lane.hub = "PB1"  # not in VALID_DIRECT_HUB -> is_direct_hub() is False
+        lane.extruder_obj.tool_start = "buffer"
+        lane.move = MagicMock()
+        lane.get_toolhead_pre_sensor_state.return_value = False  # toolhead empty
+        with patch.object(type(lane), "raw_load_state", new_callable=PropertyMock) as mock_prop:
+            mock_prop.return_value = True
+            result = err.ToolHeadFix(lane)
+        assert result is False
+        err.PauseUserIntervention.assert_not_called()
+        lane.move.assert_not_called()
+        assert err.logger.messages == []
 
 
 # ── cmd_AFC_RESUME ────────────────────────────────────────────────────────────
@@ -568,8 +871,9 @@ class TestCmdAfcResume:
         err, afc = _make_afc_error()
         afc.function.is_paused.return_value = False
         err.cmd_AFC_RESUME(MagicMock())
-        debug_msgs = [m for lvl, m in err.logger.messages if lvl == "debug"]
-        assert any("not paused" in m.lower() or "not executing" in m.lower() for m in debug_msgs)
+        assert err.logger.messages == [
+            ("debug", "AFC_RESUME: Printer not paused, not executing resume code"),
+        ]
 
     def test_paused_calls_renamed_resume_macro(self):
         err, afc = _make_afc_error()
@@ -613,10 +917,21 @@ class TestCmdAfcResume:
         err.set_error_state = MagicMock()
         err.cmd_AFC_RESUME(gcmd)
         afc.move_z_pos.assert_not_called()
+        assert err.logger.messages == [
+            ("debug", "AFC_RESUME: not moving in z cur_pos:[0.0, 0.0, 10.0] move_z_pos:0.5"),
+            ("debug", "AFC_RESUME: Before User Restore"),
+            ("debug", "RESUME-Error State: False, Is Paused True, "
+                      "Position_saved False, in toolchange: False"),
+        ]
 
     def test_paused_with_error_state_calls_restore_pos(self):
+        """error_state alone, independent of temp_is_paused, is sufficient to
+        trigger the restore branch."""
         err, afc = _make_afc_error()
-        afc.function.is_paused.return_value = True
+        # is_paused(): True at the entry guard (bypasses the early return),
+        # then False for the temp_is_paused capture and the final debug log,
+        # so error_state is the only reason the restore branch runs here.
+        afc.function.is_paused.side_effect = [True, False, False]
         afc.error_state = True
         afc.position_saved = False
         afc.last_gcode_position = [0.0, 0.0, 0.0, 0.0]
@@ -626,8 +941,74 @@ class TestCmdAfcResume:
         gcmd = MagicMock()
         gcmd.get_raw_command_parameters.return_value = ""
         err.set_error_state = MagicMock()
+        err.pause = True
         err.cmd_AFC_RESUME(gcmd)
         afc.restore_pos.assert_called_once_with(False)
+        assert err.pause is False
+
+    def test_paused_with_position_saved_calls_restore_pos(self):
+        """position_saved alone, independent of error_state and
+        temp_is_paused, is sufficient to trigger the restore branch."""
+        err, afc = _make_afc_error()
+        afc.function.is_paused.side_effect = [True, False, False]
+        afc.error_state = False
+        afc.position_saved = True
+        afc.last_gcode_position = [0.0, 0.0, 0.0, 0.0]
+        afc.gcode_move.last_position = [0.0, 0.0, 0.0]
+        afc.move_z_pos = MagicMock()
+        afc.restore_pos = MagicMock()
+        gcmd = MagicMock()
+        gcmd.get_raw_command_parameters.return_value = ""
+        err.set_error_state = MagicMock()
+        err.pause = True
+        err.cmd_AFC_RESUME(gcmd)
+        afc.restore_pos.assert_called_once_with(False)
+        assert err.pause is False
+
+    def test_paused_with_temp_is_paused_alone_calls_restore_pos(self):
+        """temp_is_paused alone, independent of error_state and
+        position_saved, is sufficient to trigger the restore branch."""
+        err, afc = _make_afc_error()
+        # Constant True: the entry guard, the temp_is_paused capture, and the
+        # final debug log all see the printer as paused.
+        afc.function.is_paused.return_value = True
+        afc.error_state = False
+        afc.position_saved = False
+        afc.last_gcode_position = [0.0, 0.0, 0.0, 0.0]
+        afc.gcode_move.last_position = [0.0, 0.0, 0.0]
+        afc.move_z_pos = MagicMock()
+        afc.restore_pos = MagicMock()
+        gcmd = MagicMock()
+        gcmd.get_raw_command_parameters.return_value = ""
+        err.set_error_state = MagicMock()
+        err.pause = True
+        err.cmd_AFC_RESUME(gcmd)
+        afc.restore_pos.assert_called_once_with(False)
+        assert err.pause is False
+
+    def test_paused_without_error_or_saved_position_skips_restore_pos(self):
+        """Printer was paused at entry (temp_is_paused captured as True) but by
+        the time the resume block runs there's no error_state, the paused flag
+        has since cleared, and no position was saved -> restore branch must
+        not run."""
+        err, afc = _make_afc_error()
+        # 3 reads of is_paused(): early-return guard, temp_is_paused capture,
+        # final debug-log format call.
+        afc.function.is_paused.side_effect = [True, False, False]
+        afc.error_state = False
+        afc.position_saved = False
+        afc.last_gcode_position = [0.0, 0.0, 0.0, 0.0]
+        afc.gcode_move.last_position = [0.0, 0.0, 0.0]
+        afc.move_z_pos = MagicMock()
+        afc.restore_pos = MagicMock()
+        gcmd = MagicMock()
+        gcmd.get_raw_command_parameters.return_value = ""
+        err.set_error_state = MagicMock()
+        err.pause = True
+        err.cmd_AFC_RESUME(gcmd)
+        afc.restore_pos.assert_not_called()
+        err.set_error_state.assert_not_called()
+        assert err.pause is True
 
 
 # ── cmd_AFC_PAUSE ─────────────────────────────────────────────────────────────
@@ -672,8 +1053,11 @@ class TestCmdAfcPause:
         err, afc = _make_afc_error()
         afc.function.is_paused.return_value = True
         err.cmd_AFC_PAUSE(MagicMock())
-        debug_msgs = [m for lvl, m in err.logger.messages if lvl == "debug"]
-        assert any("not pausing" in m.lower() for m in debug_msgs)
+        assert err.logger.messages == [
+            ("debug", "AFC_PAUSE: Not Pausing"),
+            ("debug", "PAUSE-Error State: False, Is Paused True, "
+                      "Position_saved False, in toolchange: False"),
+        ]
 
     def test_already_paused_skips_pause_command(self):
         err, afc = _make_afc_error()
@@ -693,7 +1077,7 @@ class TestCmdAfcPause:
         afc.move_z_pos.assert_called_once()
 
     def test_not_paused_z_above_threshold_skips_move_z_pos(self):
-        """Covers line 239: current z already above target → log debug, skip move_z_pos."""
+        """Current z already above the z-hop target -> log debug, skip move_z_pos."""
         err, afc = _make_afc_error()
         afc.function.is_paused.return_value = False
         afc.save_pos = MagicMock()
@@ -705,3 +1089,78 @@ class TestCmdAfcPause:
         gcmd.get_raw_command_parameters.return_value = ""
         err.cmd_AFC_PAUSE(gcmd)
         afc.move_z_pos.assert_not_called()
+        assert err.logger.messages == [
+            ("debug", "AFC_PAUSE: Pausing"),
+            ("debug", "AFC_PAUSE: not moving in z cur_pos:[0.0, 0.0, 1.0] move_z_pos:0.5"),
+            ("debug", "PAUSE-Error State: False, Is Paused False, "
+                      "Position_saved False, in toolchange: False"),
+        ]
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Module-level import guards
+# ═════════════════════════════════════════════════════════════════════════
+
+def _exec_afc_error_with_blocked_dependency(blocked_module_name):
+    """Execute a throw-away copy of extras/AFC_error.py's module-level code
+    with `blocked_module_name` forced to fail import, to exercise the file's
+    top-level ``try: from X import Y / except: raise error(...)`` guards.
+
+    This never touches the real, already-imported ``extras.AFC_error``
+    module that the rest of this test suite depends on: the copy is loaded
+    under a throwaway module name and discarded afterward, whether or not it
+    raises. Blocking an import via ``sys.modules[name] = None`` is a standard
+    Python mechanism -- it makes any ``import``/``from ... import`` of that
+    name raise ImportError immediately, without touching the module itself.
+
+    Cleanup restores the *exact same* pre-existing module object in
+    sys.modules (not just removes the block) -- simply deleting the entry
+    would let it get re-imported fresh the next time anything touches it,
+    producing new, distinct class objects that no longer match what other
+    test files already imported and bound references to.
+    """
+    import extras.AFC_error as real_module
+    fresh_name = "extras.AFC_error_import_guard_probe"
+    original_blocked_module = sys.modules.get(blocked_module_name)
+    sys.modules[blocked_module_name] = None
+    try:
+        spec = importlib.util.spec_from_file_location(fresh_name, real_module.__file__)
+        fresh = importlib.util.module_from_spec(spec)
+        sys.modules[fresh_name] = fresh
+        try:
+            spec.loader.exec_module(fresh)
+        finally:
+            sys.modules.pop(fresh_name, None)
+    finally:
+        if original_blocked_module is not None:
+            sys.modules[blocked_module_name] = original_blocked_module
+        else:
+            sys.modules.pop(blocked_module_name, None)
+
+
+class TestModuleImportGuards:
+    """Covers the three module-level `try/except: raise error(...)` guards in
+    AFC_error.py, one per dependency import."""
+
+    def test_afc_utils_import_failure_raises_configparser_error(self):
+        """The very first guard imports ERROR_STR itself from AFC_utils, so
+        it can't use ERROR_STR.format(...) in its own except clause."""
+        with pytest.raises(configparser.Error) as exc_info:
+            _exec_afc_error_with_blocked_dependency("extras.AFC_utils")
+        assert str(exc_info.value).startswith(
+            "Error when trying to import AFC_utils.ERROR_STR"
+        )
+
+    def test_afc_import_failure_raises_configparser_error(self):
+        with pytest.raises(configparser.Error) as exc_info:
+            _exec_afc_error_with_blocked_dependency("extras.AFC")
+        assert str(exc_info.value).startswith(
+            "Error trying to import AFC, please rerun install-afc.sh"
+        )
+
+    def test_afc_lane_import_failure_raises_configparser_error(self):
+        with pytest.raises(configparser.Error) as exc_info:
+            _exec_afc_error_with_blocked_dependency("extras.AFC_lane")
+        assert str(exc_info.value).startswith(
+            "Error trying to import AFC_lane, please rerun install-afc.sh"
+        )
