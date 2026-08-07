@@ -45,7 +45,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.2.1"
+AFC_VERSION="1.2.3"
 
 # Class for holding different states so its clear what all valid states are
 class State(str, Enum):
@@ -1472,7 +1472,10 @@ class afc:
 
         purge_length = gcmd.get('PURGE_LENGTH', None)
 
-        self.TOOL_LOAD(cur_lane, purge_length)
+        if not self.TOOL_LOAD(cur_lane, purge_length):
+            # Error happened, reset toolchanges without error count
+            # and increase load error count
+            self.afc_stats.increase_load_error_count(self)
 
     def TOOL_LOAD(self, cur_lane: AFCLane, purge_length: Optional[float]=None, set_start_time=False):
         """
@@ -1530,6 +1533,7 @@ class afc:
                 msg = ('Failed to unload currently loaded lane {} from extruder {} before loading new lane {}.'.format(
                     lane_name, cur_extruder_obj.name, cur_lane.name))
                 self.error.fix(msg, self.lanes[lane_name])
+                self.afc_stats.increase_unload_error_count(self)
                 return False
 
         if cur_lane.name != self.current:
@@ -1876,7 +1880,10 @@ class afc:
             self.logger.info('{} Unknown'.format(lane))
             return
         cur_lane = self.lanes[lane]
-        self.TOOL_UNLOAD(cur_lane)
+        if not self.TOOL_UNLOAD(cur_lane):
+            # Error happened, reset toolchanges without error count
+            # and increase unload error count
+            self.afc_stats.increase_unload_error_count(self)
 
         # User manually unloaded spool from toolhead, remove spool from active status
         self.spool.set_active_spool(None)
@@ -2469,6 +2476,9 @@ class afc:
                             # Abort if the unloading process fails.
                             msg = (' UNLOAD ERROR NOT CLEARED')
                             self.error.fix(msg, unload_lane)  #send to error handling
+                            # Error happened, reset toolchanges without error count
+                            # and increase unload error count
+                            self.afc_stats.increase_unload_error_count(self)
                             return
 
                         if (force_unload
@@ -2519,8 +2529,8 @@ class afc:
                     cur_lane.extruder_obj.estats.increase_toolcount_change()
                 else:
                     # Error happened, reset toolchanges without error count
-                    if not self.testing:
-                        self.afc_stats.reset_toolchange_wo_error()
+                    # and increase load error count
+                    self.afc_stats.increase_load_error_count(self)
             else:
                 # Calling handle activate extruder just to make sure lanes are synced as tool
                 # could have been changed with KTC SELECT_TOOL and lane might not be synced

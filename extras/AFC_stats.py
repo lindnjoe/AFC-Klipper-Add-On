@@ -38,8 +38,22 @@ class AFCStats_var:
     moonraker : AFC_moonraker
         AFC_moonraker class to easily post values to moonraker
     """
-    def __init__(self, parent_name: str, name: str, data: dict, moonraker: AFC_moonraker,
+    def __init__(self, parent_name: str, name: str, data: Optional[dict], moonraker: AFC_moonraker,
                  new_parent_name: str='', new_average: bool=False):
+        """
+        Initialize a stat variable, loading its current value out of `data`
+        (the stats already stored in moonraker's database) if present.
+
+        :param parent_name: parent's name to store value into moonraker database
+        :param name: name to store value into moonrakers database
+        :param data: current afc_stat values stored in moonraker database, or
+                     None if moonraker has no stats stored yet
+        :param moonraker: AFC_moonraker instance used to post values to moonraker
+        :param new_parent_name: if set, migrate this stat from parent_name to
+                                 this new parent, deleting the old database entry
+        :param new_average: True to use the new sum-based average calculation
+                             instead of the old halving-average calculation
+        """
         self.parent_name = parent_name
         self.name        = name
         self.moonraker   = moonraker
@@ -66,23 +80,34 @@ class AFCStats_var:
                 multi_parent.append(name)
                 self.moonraker.remove_database_entry(self.moonraker.afc_stats_key, '.'.join(multi_parent))
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """
+        :return type: string form of the current value
+        """
         return str(self._value)
 
     @property
-    def value(self):
+    def value(self) -> Any:
+        """
+        :return type: current value being tracked
+        """
         return self._value
     @value.setter
-    def value(self, value):
+    def value(self, value: Any) -> None:
+        """
+        :param value: new value to store
+        """
         self._value = value
 
-    def _get_value(self, data: dict, parent_name: list):
+    def _get_value(self, data: dict, parent_name: list) -> None:
         """
         Helper function to get correct data from dictionary based off parents name
 
+        :param data: current afc_stat values stored in moonraker database
         :param parent_name: List in correct order of parent key name in database.
                             ex. extruder.cut -> ['extruder', 'cut']
         """
+        value: Any
         if len(parent_name) == 1:
             value = check_and_return( self.name, data[parent_name[0]])
         elif len(parent_name) == 2:
@@ -102,7 +127,7 @@ class AFCStats_var:
             except:
                 self._value = value
 
-    def average_time(self, value: float):
+    def average_time(self, value: float) -> None:
         """
         Helper function for averaging time, moonrakers database is updated after
         averaging numbers. If AFC is using new average calculation, then values are just
@@ -135,14 +160,14 @@ class AFCStats_var:
         else:
             return self._value
 
-    def increase_count(self):
+    def increase_count(self) -> None:
         """
         Helper function to easily increment count and updates moonrakers database
         """
         self._value += 1
         self.update_database()
 
-    def reset_count(self):
+    def reset_count(self) -> None:
         """
         Helper function to easily reset count and updates moonrakers database
         """
@@ -150,14 +175,14 @@ class AFCStats_var:
         self.update_database()
         self.new_average = True
 
-    def update_database(self):
+    def update_database(self) -> None:
         """
         Calls AFC_moonraker update_afc_stats function with correct key, value to update
         value in moonrakers database
         """
         self.moonraker.update_afc_stats(f"{self.parent_name}.{self.name}", self._value)
 
-    def set_current_time(self):
+    def set_current_time(self) -> None:
         """
         Grabs current date/time, sets variable and updates in moonrakers database.
         Use only for variables that are dates
@@ -182,7 +207,18 @@ class AFCStats:
     logger: AFC_logger
         AFC_logger class for logging and printing to console
     """
-    def __init__(self, moonraker: AFC_moonraker, logger: AFC_logger, multiple_tools: bool=False):
+    def __init__(self, moonraker: AFC_moonraker, logger: AFC_logger,
+                 multiple_tools: bool=False) -> None:
+        """
+        Build (or load, if already present in moonraker's database) all of
+        AFC's tracked stat variables.
+
+        :param moonraker: AFC_moonraker instance, passed into each AFCStats_var
+                           for easily updating values in database
+        :param logger: AFC_logger instance for logging and printing to console
+        :param multiple_tools: True to also track tool-select/unselect stats,
+                                only meaningful for multi-toolhead setups
+        """
         self.moonraker  = moonraker
         self.logger     = logger
         self.multiple_tools = multiple_tools
@@ -192,6 +228,10 @@ class AFCStats:
                                                self.moonraker, "error_stats")
         self.tc_last_load_error = AFCStats_var("toolchange_count", "last_load_error", values,
                                                self.moonraker, "error_stats")
+        self.total_load_errors = AFCStats_var("toolchange_count", "total_load_errors", values,
+                                              self.moonraker, "error_stats")
+        self.total_unload_errors = AFCStats_var("toolchange_count", "total_unload_errors", values,
+                                                self.moonraker, "error_stats")
 
         new_average_calc = 1
         if values is not None and "average_time" in values:
@@ -221,13 +261,13 @@ class AFCStats:
             self.average_tool_swap_time     = AFCStats_var("average_time", "tool_swap",   values,
                                                            self.moonraker, new_average=self.new_average_calc.value)
 
-    def increase_toolchange_wo_error(self):
+    def increase_toolchange_wo_error(self) -> None:
         """
         Common function to increase toolchange total value when errors do not occur.
         """
         self.tc_without_error.increase_count()
 
-    def reset_toolchange_wo_error(self):
+    def reset_toolchange_wo_error(self) -> None:
         """
         Helper function for resetting number of toolchanges without errors and
         sets last error date/time as current
@@ -235,7 +275,33 @@ class AFCStats:
         self.tc_without_error.reset_count()
         self.tc_last_load_error.set_current_time()
 
-    def reset_average_times(self):
+    def increase_load_error_count(self, afc: afc) -> None:
+        """
+        Helper function for increasing load error count and resetting number of toolchanges
+        without errors. Error only increases and data gets reset if AFC testing variable is not True.
+
+        :param afc: AFC object that holds testing variable
+        """
+        # Testing flag is set, return early
+        if afc.testing:
+            return
+        self.reset_toolchange_wo_error()
+        self.total_load_errors.increase_count()
+
+    def increase_unload_error_count(self, afc: afc) -> None:
+        """
+        Helper function for increasing unload error count and resetting number of toolchanges
+        without errors. Error only increases and data gets reset if AFC testing variable is not True.
+
+        :param afc: AFC object that holds testing variable
+        """
+        # Testing flag is set, return early
+        if afc.testing:
+            return
+        self.reset_toolchange_wo_error()
+        self.total_unload_errors.increase_count()
+
+    def reset_average_times(self) -> None:
         """
         Common function to easily reset all change times. Once resetting AFC will start
         using new calculation function when tracking and printing stats.
@@ -248,7 +314,7 @@ class AFCStats:
         self.new_average_calc.value = 1
         self.new_average_calc.update_database()
 
-    def print_stats(self, afc_obj: afc, short: bool=False):
+    def print_stats(self, afc_obj: afc, short: bool=False) -> None:
         """
         Prints all stat to console
 
@@ -264,13 +330,15 @@ class AFCStats:
         total_changes = 0
         total_unload = 0
         total_load = 0
+        print_str: str = ""
+        temp_str: str = ""
 
-        def end_string():
+        def end_string() -> None:
             nonlocal print_str, temp_str
             print_str += f"{temp_str:{' '}<{86}}|\n"
             temp_str = ""
 
-        def add_end():
+        def add_end() -> str:
             nonlocal short
             if short:
                 return END
@@ -290,6 +358,9 @@ class AFCStats:
         overall_str += f"|{'Changes without error':{' '}>22} : {self.tc_without_error.value:{' '}<17}"
         overall_str += add_end()
         overall_str += f"|{'Last error date':{' '}>22} : {self.tc_last_load_error.value:{' '}<17}|\n"
+        overall_str += f"|{'Total Load Errors':{' '}>22} : {self.total_load_errors.value:{' '}<17}"
+        overall_str += add_end()
+        overall_str += f"|{'Total Unload Errors':{' '}>22} : {self.total_unload_errors.value:{' '}<17}|\n"
 
 
         print_str = ""
@@ -374,15 +445,25 @@ class AFCStats:
 
         print_str = overall_str + avg_str + print_str
 
+        # Fixed centering offset for the name/count portion, baked on up front
+        # so "lane :" always lines up whether the row is paired or long
+        name_count_width = max(max_lane_name_size, 9) + len(" : Lane change count: ") + 7
+        long_format_pad = " " * ((SECTIONAL_LENGTH - name_count_width) // 2)
+
         strings = []
-        for lane in afc_obj.lanes.values():
-            espooler_stats = lane.espooler.get_spooler_stats(short)
-            string = f"{lane.name:{' '}>{max(max_lane_name_size,7)}} : Lane change count: {lane.lane_load_count.value:{' '}>7}"
-            if short: string = f"|{string:{' '}^{MAX_SPAN}}|\n"
-            if len(espooler_stats) > 0:
-                if short: string += f"|{espooler_stats:{' '}^{MAX_WIDTH-2}}|\n"
-                else: string += f"  {espooler_stats}"
-            strings.append(string)
+        for unit in afc_obj.units.values():
+            for lane in unit.lanes.values():
+                espooler_stats = lane.espooler.get_spooler_stats(short)
+                string = f"{lane.name:{' '}>{max(max_lane_name_size,9)}} : Lane change count: {lane.lane_load_count.value:{' '}>7}"
+                if short:
+                    string = f"|{string:{' '}^{MAX_SPAN}}|\n"
+                    if len(espooler_stats) > 0:
+                        string += f"|{espooler_stats:{' '}^{MAX_WIDTH-3}}|\n"
+                else:
+                    string = long_format_pad + string
+                    if len(espooler_stats) > 0:
+                        string += f" {espooler_stats}"
+                strings.append(string)
 
         if short:
             print_str += "".join(strings)
@@ -394,9 +475,9 @@ class AFCStats:
                 if len(s) > 60:
                     if len(temp_str) > 0: end_string()
 
-                    print_str += f"|{s}{'|':{' '}>4}\n"
+                    print_str += f"|{s:{' '}<{MAX_WIDTH-4}}  {'|'}\n"
                 else:
-                    temp_str += f"|{s:{' '}^{SECTIONAL_LENGTH}}"
+                    temp_str += f"|{s:{' '}<{SECTIONAL_LENGTH}}"
             if len(temp_str) > 0: end_string()
 
         print_str += f"{'':{'-'}<{MAX_WIDTH}}\n"

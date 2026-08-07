@@ -896,7 +896,7 @@ def _make_afc_for_change_tool(lane_name="lane2", next_extruder_name="extruder1",
     obj.afcDeltaTime = MagicMock()
     obj.afc_stats = MagicMock()
     obj.afc_stats.average_toolchange_time = MagicMock()
-    obj.testing = True
+    obj.testing = False
     obj.save_pos = MagicMock()
     obj.restore_pos = MagicMock()
     obj.TOOL_LOAD = MagicMock(return_value=True)
@@ -1321,11 +1321,15 @@ class TestChangeTool_UnloadPath:
         assert obj.TOOL_UNLOAD.call_args.kwargs["set_start_time"] is False
 
     def test_error_fix_called_when_tool_unload_returns_false(self):
-        """When TOOL_UNLOAD returns False, error.fix is called to signal the failure."""
+        """When TOOL_UNLOAD returns False, error.fix is called to signal the
+        failure, and increase_unload_error_count() is called to record it
+        (whether that actually counts the error depends on afc.testing,
+        which is AFCStats's responsibility -- see tests/test_AFC_stats.py)."""
         obj, cur_lane, _ = _make_afc_for_change_tool()
         obj.TOOL_UNLOAD.return_value = False
         obj.CHANGE_TOOL(cur_lane)
         obj.error.fix.assert_called_once()
+        obj.afc_stats.increase_unload_error_count.assert_called_once()
 
     def test_error_fix_receives_unload_lane_object(self):
         """error.fix second arg is the pre-resolved unload_lane, not None or cur_lane."""
@@ -1347,6 +1351,16 @@ class TestChangeTool_UnloadPath:
         obj.TOOL_UNLOAD.return_value = False
         obj.CHANGE_TOOL(cur_lane)
         assert obj.next_lane_load is None
+
+    def test_increase_unload_error_count_called_with_afc_instance(self):
+        """increase_unload_error_count() now takes the afc instance itself
+        (it, not the call site, decides whether to skip based on
+        afc.testing -- see tests/test_AFC_stats.py), so this verifies the
+        call is made with the correct argument regardless of obj.testing."""
+        obj, cur_lane, _ = _make_afc_for_change_tool()
+        obj.TOOL_UNLOAD.return_value = False
+        obj.CHANGE_TOOL(cur_lane)
+        obj.afc_stats.increase_unload_error_count.assert_called_once_with(obj)
 
 
 # ── CHANGE_TOOL: load path outcomes ───────────────────────────────────────────
@@ -1414,21 +1428,15 @@ class TestChangeTool_LoadPath:
         obj.CHANGE_TOOL(cur_lane)
         obj.afc_stats.average_toolchange_time.average_time.assert_called_once_with(7.5)
 
-    def test_reset_toolchange_wo_error_called_on_load_failure_not_testing(self):
-        """When TOOL_LOAD fails and testing=False, reset_toolchange_wo_error() is called."""
+    def test_increase_load_error_count_called_with_afc_instance(self):
+        """increase_load_error_count() now takes the afc instance itself (it,
+        not the call site, decides whether to skip based on afc.testing --
+        see tests/test_AFC_stats.py), so this verifies the call is made with
+        the correct argument regardless of obj.testing."""
         obj, cur_lane, _ = _make_afc_for_change_tool()
-        obj.testing = False
         obj.TOOL_LOAD.return_value = False
         obj.CHANGE_TOOL(cur_lane)
-        obj.afc_stats.reset_toolchange_wo_error.assert_called_once()
-
-    def test_reset_toolchange_wo_error_skipped_on_load_failure_when_testing(self):
-        """When TOOL_LOAD fails and testing=True, reset_toolchange_wo_error() is skipped."""
-        obj, cur_lane, _ = _make_afc_for_change_tool()
-        obj.testing = True
-        obj.TOOL_LOAD.return_value = False
-        obj.CHANGE_TOOL(cur_lane)
-        obj.afc_stats.reset_toolchange_wo_error.assert_not_called()
+        obj.afc_stats.increase_load_error_count.assert_called_once_with(obj)
 
     def test_wait_for_temp_called_with_heater_target_and_deadband(self):
         """_wait_for_temp_within_tolerance(heater, target_temp, deadband) is called.
@@ -1908,17 +1916,21 @@ class TestToolLoad_DestExtruderAlreadyLoaded:
         obj.TOOL_UNLOAD.assert_not_called()
 
     def test_unloads_when_extruder_already_has_different_lane_loaded(self):
-        """TOOL_UNLOAD is called for the already-loaded lane before proceeding."""
+        """TOOL_UNLOAD is called for the already-loaded lane before proceeding,
+        and since it succeeds, no unload error is recorded."""
         obj, target_lane, loaded_lane, dest_extruder = _make_afc_for_dest_extruder_loaded()
         obj.TOOL_LOAD(target_lane)
         obj.TOOL_UNLOAD.assert_called_once_with(loaded_lane, set_start_time=False)
+        obj.afc_stats.increase_unload_error_count.assert_not_called()
 
     def test_aborts_if_unload_fails(self):
-        """If TOOL_UNLOAD returns False, TOOL_LOAD returns False immediately."""
+        """If TOOL_UNLOAD returns False, TOOL_LOAD returns False immediately
+        and records the failure via increase_unload_error_count(self)."""
         obj, target_lane, loaded_lane, dest_extruder = _make_afc_for_dest_extruder_loaded()
         obj.TOOL_UNLOAD.return_value = False
         result = obj.TOOL_LOAD(target_lane)
         assert result is False
+        obj.afc_stats.increase_unload_error_count.assert_called_once_with(obj)
 
     def test_no_unload_when_extruder_already_has_target_lane_loaded(self):
         """If the extruder already has the target lane loaded, no unload is triggered."""
@@ -2150,6 +2162,8 @@ class TestCmdToolLoad_LaneLoadedGuard:
         obj.TOOL_LOAD = MagicMock(return_value=True)
         obj.error = MagicMock()
         obj.function.in_print.return_value = False
+        obj.afc_stats = MagicMock()
+        obj.testing = True
 
         extruder = MagicMock()
         extruder.name = "extruder"
@@ -2185,6 +2199,22 @@ class TestCmdToolLoad_LaneLoadedGuard:
         obj.error.AFC_error.assert_not_called()
         obj.TOOL_LOAD.assert_called_once_with(lane, None)
 
+    def test_increase_load_error_count_called_with_afc_instance(self):
+        """increase_load_error_count() now takes the afc instance itself (it,
+        not the call site, decides whether to skip based on afc.testing --
+        see tests/test_AFC_stats.py), so this verifies the call is made with
+        the correct argument regardless of obj.testing."""
+        obj, lane, extruder = self._make_cmd_afc()
+        extruder.lane_loaded = None
+        obj.TOOL_LOAD.return_value = False
+
+        gcmd = MagicMock()
+        gcmd.get = lambda key, default=None: {"LANE": "lane1", "PURGE_LENGTH": None}.get(key, default)
+
+        obj.cmd_TOOL_LOAD(gcmd)
+
+        obj.afc_stats.increase_load_error_count.assert_called_once_with(obj)
+
     def test_passes_through_when_nothing_loaded(self):
         """Normal case: nothing loaded, cmd_TOOL_LOAD proceeds."""
         obj, lane, extruder = self._make_cmd_afc()
@@ -2197,6 +2227,128 @@ class TestCmdToolLoad_LaneLoadedGuard:
 
         obj.error.AFC_error.assert_not_called()
         obj.TOOL_LOAD.assert_called_once_with(lane, None)
+
+
+class TestCmdToolLoad_UnknownLane:
+    """Tests for the cmd_TOOL_LOAD GCode handler's unknown-lane guard."""
+
+    def test_logs_info_with_lane_name_and_returns(self):
+        """When LANE doesn't resolve to a known lane, cmd_TOOL_LOAD logs the
+        exact info message and returns without touching TOOL_LOAD."""
+        obj = _make_afc()
+        obj.TOOL_LOAD = MagicMock(return_value=True)
+        obj.error = MagicMock()
+
+        params = {"LANE": "lane_missing", "PURGE_LENGTH": None}
+        gcmd = MagicMock()
+        gcmd.get = lambda key, default=None: params.get(key, default)
+
+        obj.cmd_TOOL_LOAD(gcmd)
+
+        assert obj.logger.messages == [("info", "lane_missing Unknown")]
+        obj.TOOL_LOAD.assert_not_called()
+        obj.error.AFC_error.assert_not_called()
+
+
+# ── cmd_TOOL_UNLOAD: error counting ──────────────────────────────────────────
+
+class TestCmdToolUnload_ErrorCounting:
+    """Tests for the increase_unload_error_count() call added to
+    cmd_TOOL_UNLOAD's TOOL_UNLOAD failure path."""
+
+    def _make_cmd_afc(self):
+        from tests.test_AFC_lane import _make_afc_lane
+        obj = _make_afc()
+        obj.TOOL_UNLOAD = MagicMock(return_value=True)
+        obj._check_bypass = MagicMock(return_value=False)
+        obj.spool = MagicMock()
+        obj.afc_stats = MagicMock()
+        obj.testing = True
+
+        lane = _make_afc_lane("AFC_stepper lane1")
+        obj.lanes["lane1"] = lane
+        return obj, lane
+
+    def _make_gcmd(self):
+        gcmd = MagicMock()
+        gcmd.get = lambda key, default=None: {"LANE": "lane1"}.get(key, default)
+        return gcmd
+
+    def test_increase_unload_error_count_called_with_afc_instance(self):
+        """increase_unload_error_count() now takes the afc instance itself
+        (it, not the call site, decides whether to skip based on
+        afc.testing -- see tests/test_AFC_stats.py), so this verifies the
+        call is made with the correct argument regardless of obj.testing."""
+        obj, _ = self._make_cmd_afc()
+        obj.TOOL_UNLOAD.return_value = False
+        obj.cmd_TOOL_UNLOAD(self._make_gcmd())
+        obj.afc_stats.increase_unload_error_count.assert_called_once_with(obj)
+
+    def test_increase_unload_error_count_not_called_on_unload_success(self):
+        """Distinguishes the failure branch from the success branch: no error
+        counting happens when TOOL_UNLOAD succeeds."""
+        obj, _ = self._make_cmd_afc()
+        obj.TOOL_UNLOAD.return_value = True
+        obj.cmd_TOOL_UNLOAD(self._make_gcmd())
+        obj.afc_stats.increase_unload_error_count.assert_not_called()
+
+
+class TestCmdToolUnload_Guards:
+    """Tests for cmd_TOOL_UNLOAD's early-exit guards: bypass detection, no
+    lane resolvable, and an unknown lane name."""
+
+    def _make_cmd_afc(self):
+        from tests.test_AFC_lane import _make_afc_lane
+        obj = _make_afc()
+        obj.TOOL_UNLOAD = MagicMock(return_value=True)
+        obj._check_bypass = MagicMock(return_value=False)
+        obj.spool = MagicMock()
+        obj.afc_stats = MagicMock()
+        obj.testing = True
+
+        lane = _make_afc_lane("AFC_stepper lane1")
+        obj.lanes["lane1"] = lane
+        return obj, lane
+
+    @staticmethod
+    def _make_gcmd(params=None):
+        params = params or {}
+        gcmd = MagicMock()
+        gcmd.get = lambda key, default=None: params.get(key, default)
+        return gcmd
+
+    def test_bypass_detected_returns_without_calling_tool_unload(self):
+        """When _check_bypass(unload=True) is truthy, cmd_TOOL_UNLOAD returns
+        immediately without resolving a lane or calling TOOL_UNLOAD."""
+        obj, _ = self._make_cmd_afc()
+        obj._check_bypass.return_value = True
+
+        obj.cmd_TOOL_UNLOAD(self._make_gcmd({"LANE": "lane1"}))
+
+        obj.TOOL_UNLOAD.assert_not_called()
+        obj.spool.set_active_spool.assert_not_called()
+
+    def test_no_lane_resolvable_returns_without_calling_tool_unload(self):
+        """When LANE isn't supplied and self.current (function.get_current_lane())
+        is None, lane resolves to None and cmd_TOOL_UNLOAD returns early."""
+        obj, _ = self._make_cmd_afc()
+        obj.function.get_current_lane.return_value = None
+
+        obj.cmd_TOOL_UNLOAD(self._make_gcmd())
+
+        obj.TOOL_UNLOAD.assert_not_called()
+        obj.spool.set_active_spool.assert_not_called()
+
+    def test_unknown_lane_logs_info_and_returns(self):
+        """When LANE resolves to a name not in self.lanes, cmd_TOOL_UNLOAD logs
+        the exact info message and returns without calling TOOL_UNLOAD."""
+        obj, _ = self._make_cmd_afc()
+
+        obj.cmd_TOOL_UNLOAD(self._make_gcmd({"LANE": "lane_missing"}))
+
+        assert obj.logger.messages == [("info", "lane_missing Unknown")]
+        obj.TOOL_UNLOAD.assert_not_called()
+        obj.spool.set_active_spool.assert_not_called()
 
 
 # ── capture_toolhead_temp ─────────────────────────────────────────────────────
