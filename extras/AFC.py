@@ -812,6 +812,26 @@ class afc:
         except Exception:
             self.logger.debug("Unable to restore extruder temperature", exc_info=True)
 
+    def _set_display_status(self, variable: str, value: bool) -> None:
+        """
+        Best-effort notification of a display status change during tool-change
+        actions (e.g. pushing new filament into the toolhead, retracting it back
+        out). Calls the user-defined _AFC_DISPLAY_STATUS macro (if any) with the
+        changed variable/value as params, letting any display integration (KNOMI
+        or otherwise) decide what to do with it. No-ops silently if the user
+        hasn't defined that macro, since this is purely cosmetic and must never
+        affect the actual load/unload sequence.
+
+        :param variable: Name of the status variable that changed
+        :param value: True/False the variable changed to
+        """
+        if 'gcode_macro _AFC_DISPLAY_STATUS' in self.printer.objects:
+            try:
+                self.gcode.run_script_from_command(
+                    f"_AFC_DISPLAY_STATUS VARIABLE={variable} VALUE={value}")
+            except Exception:
+                self.logger.debug("_AFC_DISPLAY_STATUS macro raised an error", exc_info=True)
+
     def _set_quiet_mode(self, val):
         """
         Helper function to set quiet mode to on or off
@@ -884,7 +904,11 @@ class afc:
             if self.get_bypass_state():
                 if unload:
                     self.logger.info("Bypass detected, calling manual unload filament routine")
-                    self.gcode.run_script_from_command(self.RENAMED_UNLOAD_FILAMENT)
+                    self._set_display_status('retraction', True)
+                    try:
+                        self.gcode.run_script_from_command(self.RENAMED_UNLOAD_FILAMENT)
+                    finally:
+                        self._set_display_status('retraction', False)
                     self.logger.info("Filament unloaded")
                 else:
                     msg = "Filament loaded in bypass, not doing tool load"
@@ -1530,7 +1554,11 @@ class afc:
                 temp_state = self.capture_toolhead_temp()
                 try:
                     # Run the load sequence, which may include custom gcode commands.
-                    success = self.load_sequence(cur_lane, cur_hub, cur_extruder)
+                    self._set_display_status('pushing', True)
+                    try:
+                        success = self.load_sequence(cur_lane, cur_hub, cur_extruder)
+                    finally:
+                        self._set_display_status('pushing', False)
                     if not success:
                         return success
 
@@ -1956,7 +1984,11 @@ class afc:
             temp_state = self.capture_toolhead_temp()
             try:
                 # Run the unload sequence, which may include custom gcode commands.
-                success = self.unload_sequence(cur_lane, cur_hub, cur_extruder)
+                self._set_display_status('retraction', True)
+                try:
+                    success = self.unload_sequence(cur_lane, cur_hub, cur_extruder)
+                finally:
+                    self._set_display_status('retraction', False)
                 if not success:
                     return success
             finally:
