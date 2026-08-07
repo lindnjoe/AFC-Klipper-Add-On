@@ -56,17 +56,17 @@ class afcUnit:
         self.reactor        = self.printer.get_reactor()
         self.function       = self.afc.function
         self.logger         = self.afc.logger
-        self.type           = None
+        self.type           = ""
 
         self.lanes: Dict[str, AFCLane] = {}
         self._eject_to_calibrate = False
 
         # Objects
-        self.buffer_obj: Optional[AFCBuffer|None] = None
-        self.hub_obj: Optional[afc_hub|None]       = None
-        self.extruder_obj: Optional[AFCExtruder|None] = None
-        self.drive_stepper_obj: AFCExtruderStepper = None
-        self.selector_stepper_obj: AFCExtruderStepper = None
+        self.buffer_obj: Optional[AFCBuffer] = None
+        self.hub_obj: Optional[afc_hub]       = None
+        self.extruder_obj: Optional[AFCExtruder] = None
+        self.drive_stepper_obj: Optional[AFCExtruderStepper] = None
+        self.selector_stepper_obj: Optional[AFCExtruderStepper] = None
         self.stepperless_drive: bool = False
 
         # Config get section
@@ -181,8 +181,7 @@ class afcUnit:
         error_bool   = False
         config_name = f'AFC_stepper {self.drive_stepper}'
         if section_in_config(config, config_name):
-            self.drive_stepper_obj: Optional[AFCExtruderStepper] = \
-                self.printer.load_object(config, config_name, None)
+            self.drive_stepper_obj  = self.printer.load_object(config, config_name, None)
         error, rtn_str = self._check_and_errorout(self.drive_stepper_obj, config_name,
                                                   "drive_stepper")
         error_string += rtn_str
@@ -190,8 +189,7 @@ class afcUnit:
 
         config_name = f'AFC_stepper {self.selector_stepper}'
         if section_in_config(config, config_name):
-            self.selector_stepper_obj: Optional[AFCExtruderStepper] = \
-                self.printer.load_object(config, config_name, None)
+            self.selector_stepper_obj = self.printer.load_object(config, config_name, None)
 
         error, rtn_str = self._check_and_errorout(self.selector_stepper_obj, config_name,
                                                   "selector_stepper")
@@ -629,6 +627,20 @@ class afcUnit:
         :param sel_prep: Set to true is selection is happing during prep macro
         """
         return True, 0.0
+
+    def _selector_cal_dis_adjust(self, lane: AFCLane) -> None:
+        """
+        Helper function for moving selector selector_cal_dis amount if specified in users config.
+        Moving selector_cal_dis is a fine adjustment that can help put more pressure on the filament
+        so that filament is not slipping in the gears when moving.
+
+        :param lane: Lane to check if selector_cal_dis is specified and move selector this amount
+        """
+        if (self.selector_stepper_obj
+            and lane.selector_cal_dis is not None
+            and lane.selector_cal_dis != 0.0):
+            self.selector_stepper_obj.move(lane.selector_cal_dis, lane.short_moves_speed,
+                                           lane.short_moves_accel, False)
 
     def return_to_home(self, prep=False):
         """
