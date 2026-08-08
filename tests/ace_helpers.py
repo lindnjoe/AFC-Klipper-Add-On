@@ -235,7 +235,7 @@ class FakeGcmd:
 class FakeAce:
     """ACE serial connection stand-in: records the commands the unit sends.
 
-    Models the V1 connection. Use :class:`FakeAce2` for the ACE Pro 2 transport.
+    Models the V1 connection. Use :class:`FakeAce2` for the ACE 2 Pro transport.
     """
 
     def __init__(self, connected=True):
@@ -254,7 +254,7 @@ class FakeAce:
 
 
 class FakeAce2(FakeAce):
-    """ACE Pro 2 connection stand-in."""
+    """ACE 2 Pro connection stand-in."""
 
     def __init__(self, connected=True):
         super().__init__(connected=connected)

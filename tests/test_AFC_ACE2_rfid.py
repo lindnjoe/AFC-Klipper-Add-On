@@ -28,6 +28,8 @@ def _load(name, relpath):
     return mod
 
 
+import extras.AFC_rfid_readers as readers  # noqa: E402
+
 rfid = _load("AFC_ACE2_rfid", "extras/AFC_ACE2_rfid.py")
 ace2 = _load("AFC_ACE2", "extras/AFC_ACE2.py")
 
@@ -1256,20 +1258,20 @@ def _b16(count, abgr_bytes=None):
 def test_bambu_apply_multicolor_dual():
     # count=2, second color stored reversed-ABGR [A,B,G,R] = FF,33,22,11 -> #112233
     fil = {"color_argb": 0xFFE94B3C}
-    rfid._bambu_apply_multicolor(fil, _b16(2, [0xFF, 0x33, 0x22, 0x11]))
+    readers._bambu_apply_multicolor(fil, _b16(2, [0xFF, 0x33, 0x22, 0x11]))
     assert fil["color_count"] == 2
     assert fil["colors_argb"] == [0xFFE94B3C, (0xFF << 24) | (0x11 << 16) | (0x22 << 8) | 0x33]
 
 
 def test_bambu_apply_multicolor_single_count():
     fil = {"color_argb": 0xFFE94B3C}
-    rfid._bambu_apply_multicolor(fil, _b16(1))
+    readers._bambu_apply_multicolor(fil, _b16(1))
     assert fil["color_count"] == 1 and fil["colors_argb"] == [0xFFE94B3C]
 
 
 def test_bambu_apply_multicolor_missing_block16():
     fil = {"color_argb": 0xFFE94B3C}
-    rfid._bambu_apply_multicolor(fil, None)
+    readers._bambu_apply_multicolor(fil, None)
     assert fil["color_count"] == 1 and fil["colors_argb"] == [0xFFE94B3C]
 
 
@@ -1277,7 +1279,7 @@ def test_bambu_apply_multicolor_count2_but_empty_second_stays_single():
     # count says 2 but the second-color bytes are all zero (block 16 not really
     # written) -> don't invent a black second colour.
     fil = {"color_argb": 0xFFE94B3C}
-    rfid._bambu_apply_multicolor(fil, _b16(2, [0, 0, 0, 0]))
+    readers._bambu_apply_multicolor(fil, _b16(2, [0, 0, 0, 0]))
     assert fil["colors_argb"] == [0xFFE94B3C]
 
 
@@ -1342,7 +1344,7 @@ def _build_btt_image(version=1000, manufacturer="BQ Tech", mfg="20240812_162600"
 
 def test_decode_btt_fields():
     d = _build_btt_image()
-    f = rfid.decode_btt(d)
+    f = readers.decode_btt(d)
     assert f is not None
     assert f["manufacturer"] == "BQ Tech"
     assert f["type"] == "PET"
@@ -1359,23 +1361,23 @@ def test_decode_btt_fields():
 
 def test_decode_btt_density_parsed():
     # 1240 on the tag -> 1.240 g/cm^3 (re-derived: 1240 / 1000)
-    f = rfid.decode_btt(_build_btt_image(density=1240))
+    f = readers.decode_btt(_build_btt_image(density=1240))
     assert f["density"] == 1240 / 1000
 
 
 def test_decode_btt_density_zero_is_none():
-    f = rfid.decode_btt(_build_btt_image(density=0))
+    f = readers.decode_btt(_build_btt_image(density=0))
     assert f["density"] is None
 
 
 def test_decode_btt_drying_parsed():
-    f = rfid.decode_btt(_build_btt_image(drying_time=8, drying_temp=70))
+    f = readers.decode_btt(_build_btt_image(drying_time=8, drying_temp=70))
     assert f["drying_time_h"] == 8
     assert f["drying_temp_c"] == 70
 
 
 def test_decode_btt_drying_zero_is_none():
-    f = rfid.decode_btt(_build_btt_image(drying_time=0, drying_temp=0))
+    f = readers.decode_btt(_build_btt_image(drying_time=0, drying_temp=0))
     assert f["drying_time_h"] is None
     assert f["drying_temp_c"] is None
 
@@ -1384,16 +1386,16 @@ def test_decode_btt_fingerprint_rejects_non_btt():
     # A dump read with the default FF key that ISN'T a BQ Tech tag (version != 1000)
     # must be rejected so it can't mis-decode a foreign tag.
     d = bytearray(_build_btt_image(version=2))
-    assert rfid.decode_btt(bytes(d)) is None
+    assert readers.decode_btt(bytes(d)) is None
     # A blank/all-zero image is likewise rejected.
-    assert rfid.decode_btt(bytes(1024)) is None
+    assert readers.decode_btt(bytes(1024)) is None
 
 
 def test_decode_btt_maps_to_slot_info_single_color():
     # The shared _map() turns a BQ Tech decode into AFC slot_info like any brand.
     obj = _bare_rfid(_Ace2(), lane_slot={"lane1": 0})
     tag = {"uid": "aabbccdd", "tag_type": "MifareClassic1k",
-           "filament": rfid.decode_btt(_build_btt_image(rgb=(0xC0, 0xFF, 0xEE)))}
+           "filament": readers.decode_btt(_build_btt_image(rgb=(0xC0, 0xFF, 0xEE)))}
     si = obj._map(tag)
     assert si["brand"] == "BQ Tech"
     assert si["material"] == "PET"
@@ -1415,7 +1417,7 @@ class _FakeMc:
 
 def test_classic_btt_reads_and_decodes():
     mc = _FakeMc(_build_btt_image(material="PLA"))
-    f = rfid._classic_btt(mc, b"\xaa\xbb\xcc\xdd")
+    f = readers._classic_btt(mc, b"\xaa\xbb\xcc\xdd")
     assert f is not None and f["type"] == "PLA" and f["manufacturer"] == "BQ Tech"
 
 
@@ -1423,7 +1425,7 @@ def test_classic_btt_none_when_read_fails():
     class _NoRead:
         def read_blocks(self, *a):
             return None
-    assert rfid._classic_btt(_NoRead(), b"\x01\x02\x03\x04") is None
+    assert readers._classic_btt(_NoRead(), b"\x01\x02\x03\x04") is None
 
 
 # ── get_status: lane map + last_reads records ────────────────────────────────

@@ -28,6 +28,7 @@ from extras.AFC_BambuAMS import (
     parse_bridge_line,
     prep_lane_state,
     unit_env,
+    _fault_reason,
 )
 
 
@@ -113,7 +114,10 @@ class TestBridgeSlotToInfo:
         assert info == {
             "index": 2, "present": True, "state": "idle", "material": "PLA",
             "sku": "GFA00", "color": "00AE42", "temp_min": 220,
-            "temp_max": 240, "weight": 1000, "rfid_uid": None}
+            "temp_max": 240, "weight": 1000, "rfid_uid": None,
+            # Added when spool measurement and tray identity landed. An exact
+            # dict comparison is worth keeping -- it is what noticed.
+            "remain_pct": None, "tray_uid": None}
 
     def test_no_uid_ever(self):
         # Bambu never exposes a per-spool UID, even if 'rfid' were present
@@ -375,8 +379,9 @@ class TestBambuBridgeHandleLine:
     def test_ack_logged_to_afc_log_and_not_dispatched(self):
         # Motion acks are the record of what the bridge was asked to do, so they
         # belong in AFC.log at debug -- not on the console, and not to status
-        # listeners. They used to go to python logging.debug, which klipper runs
-        # at INFO, so they were discarded rather than merely kept off screen.
+        # listeners. Sending them to python logging.debug discards them
+        # entirely -- klipper runs that at INFO -- rather than merely keeping
+        # them off screen.
         bridge, reactor, logger, seen = _bridge()
         bridge.handle_line('{"evt":"ack","cmd":"feed","slot":0}')
         assert seen == []
@@ -435,15 +440,19 @@ class TestUidPinning:
         shim.SLOTS_PER_UNIT = 4
         shim._slots = [{} for _ in range(4)]
         shim._send_ht_flag = afcBambuAMS._send_ht_flag.__get__(shim)
-        shim.self_centres = True
-        shim._send_selfcentre_flag = (
-            afcBambuAMS._send_selfcentre_flag.__get__(shim))
         # MC poll addressing is pushed alongside the other per-unit config.
         shim.mc_dev_addr = 0x0700
         shim.mc_id_base = 0x00
         shim.mc_ams_id = -1              # -1 -> derive from base|index
         shim._send_mc_addr = afcBambuAMS._send_mc_addr.__get__(shim)
         shim._is_ht = afcBambuAMS._is_ht.__get__(shim)
+        # Announces are DEFERRED until a UID resolves to a chain index, so
+        # adopting one is what releases them. The shim needs the flag that
+        # gate reads.
+        shim._announce_deferred = False
+        shim._announce_defer_warned = False
+        shim._id_resolved = True
+        shim._announce_unit = lambda: None
         shim._adopt_index = afcBambuAMS._adopt_index.__get__(shim)
         shim._match_uid_index = afcBambuAMS._match_uid_index.__get__(shim)
         shim._resolve_uid_index = afcBambuAMS._resolve_uid_index.__get__(shim)
@@ -614,7 +623,14 @@ from extras.AFC_BambuAMS import afcBambuAMS, AFCLaneState  # noqa: E402
 
 
 class TestFollowTick:
-    """Demand-gated follower re-engage: re-select only on real extrusion."""
+    """The follower holds for as long as a lane is loaded to the toolhead.
+
+    Not demand-gated. A real printer streams the hold (op-04 mode 07 / ref 7F)
+    at a 149ms median for the whole time a tray is loaded: 3664 frames in
+    547.6s, where perfectly continuous would be 3675. It never waits to see the
+    extruder move. Asserting the opposite -- "idle does not ping" -- leaves
+    the HT arming and dropping once a second instead of assisting.
+    """
 
     def _shim(self, e_start=100.0):
         th_ext = object()
@@ -630,9 +646,7 @@ class TestFollowTick:
             _bridge=types.SimpleNamespace(
                 send=lambda o: state["sent"].append(o),
                 latest_status=lambda: {"fstate": 4}),
-            follow_min_extrude=0.4, follow_always=False,
-            follow_when_loaded=False, follow_idle_ping=False,
-            _follow_manual_off=False, _unload_in_progress=False,
+            follow_min_extrude=0.4, follow_when_loaded=False,            _follow_manual_off=False, _unload_in_progress=False,
             _follow_last_demand=99.0, follow_rearm_window=3.0,
             _check_ams_fault=lambda ln: None,
             _fault_hold_active=lambda: False,
@@ -641,26 +655,27 @@ class TestFollowTick:
             afc=types.SimpleNamespace(toolhead=toolhead))
         return shim, state
 
-    def test_first_sample_sets_baseline_no_ping(self):
+    def test_holds_from_the_very_first_tick(self):
         shim, state = self._shim(e_start=100.0)
         afcBambuAMS._follow_tick(shim, 1.0)
-        assert state["sent"] == []              # baseline only
-        assert shim._follow_last_e == 100.0
+        assert state["sent"] == [{"cmd": "follow"}]
 
-    def test_extrusion_beyond_threshold_pings(self):
+    def test_holds_while_extruding(self):
         shim, state = self._shim(e_start=100.0)
-        afcBambuAMS._follow_tick(shim, 1.0)     # baseline 100
-        state["e"] = 100.5                       # extruded 0.5mm (> 0.4)
+        afcBambuAMS._follow_tick(shim, 1.0)
+        state["e"] = 100.5
         afcBambuAMS._follow_tick(shim, 1.3)
-        assert state["sent"] == [{"cmd": "follow"}]   # window refreshed
-        assert shim._follow_last_e == 100.5
+        assert state["sent"] == [{"cmd": "follow"}] * 2
 
-    def test_idle_does_not_ping(self):
+    def test_holds_at_idle_too(self):
+        """The case that mattered: no extrusion at all, hold every tick.
+
+        Travel moves, between layers, a paused print -- the tray stays held.
+        """
         shim, state = self._shim(e_start=100.0)
-        afcBambuAMS._follow_tick(shim, 1.0)
-        afcBambuAMS._follow_tick(shim, 1.3)     # no extrusion
-        afcBambuAMS._follow_tick(shim, 1.6)
-        assert state["sent"] == []               # silent at idle
+        for t in (1.0, 1.3, 1.6):
+            afcBambuAMS._follow_tick(shim, t)
+        assert state["sent"] == [{"cmd": "follow"}] * 3
 
     def test_reschedules(self):
         shim, _ = self._shim()
@@ -683,9 +698,8 @@ class TestFollowAutoArm:
             _bridge=types.SimpleNamespace(
                 send=lambda o: state["sent"].append(o),
                 latest_status=lambda: {"fstate": fstate, "buff": 120}),
-            follow_always=False, follow_when_loaded=True,
+            follow_when_loaded=True,
             _follow_last_demand=99.0, follow_rearm_window=3.0,
-            follow_idle_ping=False,      # exercise the demand-gated path
             follow_debug_interval=0.0, _follow_last_log=0.0,
             follow_poll_interval=0.1, ams_index=0,
             _tool_loaded_lane=lambda: loaded_lane,
@@ -711,39 +725,29 @@ class TestFollowAutoArm:
         assert state["engaged"] == []
         assert state["assist"] == []
 
-    def test_engages_when_tool_loaded_but_does_not_ping_without_extrusion(self):
-        # Auto-arm still puts the tray in mode:4 so it is ready, but with no
-        # extrusion the firmware window must stay shut. Pinging here is what
-        # held the window open permanently and made the HT tick at ~20Hz.
+    def test_engages_and_holds_as_soon_as_a_lane_is_loaded(self):
+        # Loaded is the whole condition. The tray goes to mode:4 AND the hold
+        # starts on the same tick -- no waiting to see the extruder move.
         lane = types.SimpleNamespace(name="lane1")
         shim, state = self._shim(loaded_lane=lane, following=None)
         afcBambuAMS._follow_tick(shim, 1.0)
-        assert state["engaged"] == ["lane1"]           # auto-engaged
-        assert state["sent"] == []                     # but NOT pinged
+        assert state["engaged"] == ["lane1"]
+        assert state["sent"] == [{"cmd": "follow"}]
         assert shim._following_lane is lane
 
-    def test_pings_once_the_extruder_advances(self):
+    def test_holds_while_the_extruder_advances(self):
         lane = types.SimpleNamespace(name="lane1")
-        # Baseline already established below the new position, so this tick
-        # sees real extrusion (1.0mm >= follow_min_extrude).
         shim, state = self._shim(loaded_lane=lane, following=lane, e=1.0,
                                  last_e=0.0)
         afcBambuAMS._follow_tick(shim, 1.0)
         assert state["sent"] == [{"cmd": "follow"}]
-        assert shim._follow_last_e == 1.0
 
-    def test_retract_resets_baseline_without_pinging(self):
+    def test_a_retract_does_not_drop_the_hold(self):
+        # E going BACKWARDS must not reset the baseline or skip the ping: a
+        # retract is not a reason to stop holding the tray.
         lane = types.SimpleNamespace(name="lane1")
         shim, state = self._shim(loaded_lane=lane, following=lane, e=2.0,
                                  last_e=5.0)
-        afcBambuAMS._follow_tick(shim, 1.0)
-        assert state["sent"] == []
-        assert shim._follow_last_e == 2.0
-
-    def test_follow_always_pings_regardless_of_extrusion(self):
-        lane = types.SimpleNamespace(name="lane1")
-        shim, state = self._shim(loaded_lane=lane, following=lane)
-        shim.follow_always = True
         afcBambuAMS._follow_tick(shim, 1.0)
         assert state["sent"] == [{"cmd": "follow"}]
 
@@ -752,26 +756,41 @@ class TestFollowAutoArm:
         shim, state = self._shim(loaded_lane=lane, following=lane, fstate=0)
         afcBambuAMS._follow_tick(shim, 10.0)
         assert state["assist"] == [("lane1", True)]     # re-asserted mode:4
-        assert state["sent"] == []                      # no idle ping
+        assert state["sent"] == [{"cmd": "follow"}]     # and still held
 
-    def test_idle_state_0_does_not_reassert(self):
-        # state:0 is the AMS RESTING, not a fault -- it arms, finishes its
-        # assist, and sits at 0 until something wants filament. Re-arming on
-        # state alone loops forever at ~2s, each one an LED flash and a motor
-        # nudge, and it floods the console with assist acks.
+    def test_state_0_without_extrusion_is_resting_not_dropped(self):
+        # Do not re-assert on state 0 alone; the 2s rate limit does not stop
+        # that becoming a storm. MEASURED at a healthy, loaded,
+        # IDLE unit: 14 assist re-arms in 30 seconds -- one every two seconds,
+        # forever, each narrated by the unit and each a motor nudge. The rate
+        # limit does not prevent the storm, it sets its period.
+        #
+        # state 0 at an idle unit means CENTRED, not dropped, and the printer
+        # holds a loaded tray without re-issuing anything: 3664 hold frames in
+        # 547.6 s, ~100% continuous. The hold is a stream, not a repeated
+        # command.
         lane = types.SimpleNamespace(name="lane1")
         shim, state = self._shim(loaded_lane=lane, following=lane, fstate=0)
-        shim._follow_last_demand = 0.0          # no recent extrusion
-        shim.follow_rearm_window = 3.0
+        shim._follow_last_demand = 0.0          # no extrusion for ages
         afcBambuAMS._follow_tick(shim, 100.0)
-        assert state["assist"] == []
+        assert state["assist"] == []            # left alone
+        assert state["sent"] == [{"cmd": "follow"}]   # still held by the stream
 
-    def test_state_0_with_recent_demand_does_reassert(self):
+    def test_state_0_with_recent_extrusion_still_reasserts(self):
+        # The other half, and the reason the gate has a window rather than
+        # being removed: a tray that drops to IDLE while the printer is between
+        # extrusions must not stay dropped once it is asked for filament again.
         lane = types.SimpleNamespace(name="lane1")
         shim, state = self._shim(loaded_lane=lane, following=lane, fstate=0)
         shim._follow_last_demand = 99.0         # extruded a moment ago
-        shim.follow_rearm_window = 3.0
+        afcBambuAMS._follow_tick(shim, 100.0)   # inside follow_rearm_window
+        assert state["assist"] == [("lane1", True)]
+
+    def test_the_reassert_is_still_rate_limited(self):
+        lane = types.SimpleNamespace(name="lane1")
+        shim, state = self._shim(loaded_lane=lane, following=lane, fstate=0)
         afcBambuAMS._follow_tick(shim, 100.0)
+        afcBambuAMS._follow_tick(shim, 100.5)   # inside the 2s window
         assert state["assist"] == [("lane1", True)]
 
     def test_following_state_3_does_not_reassert(self):
@@ -868,10 +887,25 @@ class TestToolLoadedLaneActiveGate:
         u = self._unit([lane], current="extruder")
         assert afcBambuAMS._tool_loaded_lane(u) is lane
 
-    def test_no_active_answer_falls_back_to_shuttle(self):
-        docked = self._lane("lane1", on_shuttle=False)
-        u = self._unit([docked], current=None)
-        assert afcBambuAMS._tool_loaded_lane(u) is None
+    def test_no_active_answer_still_follows_a_loaded_lane(self):
+        """Uncertainty must not strip the follower.
+
+        Falling back to on_shuttle() breaks this: a docked toolhead answers
+        False, so after a G28, or after a Klipper restart with a lane still
+        tool_loaded, the follower tick sees "nothing loaded here" and actively
+        STOPS the follower. Live: the tray took the arm, held state:4 for
+        under a second, dropped to state:0, and filament pulled by hand was
+        never recovered. A real printer holds a loaded tray unconditionally.
+        """
+        lane = types.SimpleNamespace(
+            name="lane1", tool_loaded=True,
+            extruder_obj=types.SimpleNamespace(on_shuttle=lambda: False))
+        shim = types.SimpleNamespace(
+            lanes={"lane1": lane}, _slot_of=lambda ln: 0,
+            afc=types.SimpleNamespace(
+                function=types.SimpleNamespace(
+                    get_current_extruder=lambda: None)))
+        assert afcBambuAMS._tool_loaded_lane(shim) is lane
 
     def test_no_extruder_object_treated_as_active(self):
         # Single-toolhead / unwired lanes must not lose their follower.
@@ -959,7 +993,7 @@ class TestHeaterStart:
         lanes = {"a": self._lane("a")}
         shim, sent, _ = _heater_shim(lanes)
         gcmd = _HeaterGcmd({"TEMP": 55, "TIME": 480, "ROTATE": 1})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["rotate"] == 1
         assert shim._drying is True
 
@@ -967,7 +1001,7 @@ class TestHeaterStart:
         lanes = {"a": self._lane("a", tool_loaded=True)}
         shim, sent, _ = _heater_shim(lanes)
         gcmd = _HeaterGcmd({"TEMP": 55, "TIME": 480, "ROTATE": 1})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["rotate"] == 0
         assert any("ROTATE disabled" in m for m in gcmd.info)
 
@@ -975,7 +1009,7 @@ class TestHeaterStart:
         lanes = {"a": self._lane("a")}
         shim, sent, _ = _heater_shim(lanes)
         gcmd = _HeaterGcmd({"TEMP": 85, "TIME": 480, "ROTATE": 0})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["temp"] == _mod.MAX_DRY_TEMP_C
         assert any("clamping" in m for m in gcmd.info)
 
@@ -984,7 +1018,7 @@ class TestHeaterStart:
         shim, sent, _ = _heater_shim(lanes, name="BambuAMS_3")
         shim.dry_max_temp = 85                              # AMS HT
         gcmd = _HeaterGcmd({"TEMP": 85, "TIME": 480, "ROTATE": 0})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["temp"] == 85                        # not clamped
         assert not any("clamping" in m for m in gcmd.info)
 
@@ -994,7 +1028,7 @@ class TestHeaterStart:
         shim.dry_dev_addr = 0x1800                          # AMS HT device addr
         shim.dry_ams_id = 2                                 # HT id = chain index
         gcmd = _HeaterGcmd({"TEMP": 55, "TIME": 480, "ROTATE": 0})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["addr"] == 0x1800
         assert sent[0]["amsid"] == 2
 
@@ -1002,7 +1036,7 @@ class TestHeaterStart:
         lanes = {"a": self._lane("a")}
         shim, sent, _ = _heater_shim(lanes, name="BambuAMS_2", ams_index=1)
         gcmd = _HeaterGcmd({"TEMP": 55, "TIME": 480, "ROTATE": 0})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["addr"] == 0x0700
         assert sent[0]["amsid"] == 1                        # ams_index
 
@@ -1017,7 +1051,7 @@ class TestHeaterStart:
         shim, sent, _ = _heater_shim(lanes, name="BambuAMS_3")
         shim.dry_max_temp = 85
         gcmd = _HeaterGcmd({"TEMP": 99, "TIME": 480, "ROTATE": 0})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["temp"] == 85
         assert any("clamping" in m for m in gcmd.info)
 
@@ -1028,7 +1062,7 @@ class TestHeaterStart:
         shim.dry_ams_id = 2
         shim._drying = True
         gcmd = _HeaterGcmd({})
-        afcBambuAMS.cmd_BAMBU_HEATER_STOP(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_STOP(shim, gcmd)
         assert sent[0]["on"] == 0
         assert sent[0]["addr"] == 0x1800                    # HT hears the stop
         assert sent[0]["amsid"] == 2
@@ -1039,7 +1073,7 @@ class TestHeaterStart:
         shim, sent, _ = _heater_shim(lanes, name="BambuAMS_1")
         shim.has_heater = False
         gcmd = _HeaterGcmd({"TEMP": 55, "TIME": 480, "ROTATE": 0})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent == []                                   # nothing sent
         assert shim._drying is False
         assert any("no drying heater" in m for m in gcmd.info)
@@ -1049,8 +1083,13 @@ def _vhub(virtual=True):
     return types.SimpleNamespace(is_virtual_pin=lambda: virtual)
 
 
-def _sync_shim(slot_map, lanes, slots):
-    """Duck-typed self for afcBambuAMS._sync_lanes (no Klipper needed)."""
+def _sync_shim(slot_map, lanes, slots, verdict="none", surfaced=None,
+               finalized=None):
+    """Duck-typed self for afcBambuAMS._sync_lanes (no Klipper needed).
+
+    ``verdict`` stands in for what the unit said about a scan on the bay --
+    the single thing _sync_lanes consults before letting a record reach a lane.
+    """
     return types.SimpleNamespace(
         _slot_map=slot_map, lanes=lanes, _slots=slots,
         _ACTIVE_STATES=afcBambuAMS._ACTIVE_STATES,
@@ -1059,7 +1098,15 @@ def _sync_shim(slot_map, lanes, slots):
         lane_loaded=lambda lane: None,
         lane_not_ready=lambda lane: None,
         lane_illuminate_spool=lambda lane: None,
-        _surface_slot_info=lambda lane, info: None)
+        # No scan open by default.
+        _scan_verdict=lambda slot: verdict,
+        _scan_notag=[False] * max(len(slots), 1),
+        _finalize_scan=lambda slot: (finalized if finalized is not None
+                                     else []).append(slot),
+        _release_scan_hold=lambda slot: None,
+        _apply_remain_weight=lambda lane, info: None,
+        _surface_slot_info=lambda lane, info: (
+            surfaced if surfaced is not None else []).append(lane))
 
 
 class TestIsVirtualHub:
@@ -1182,7 +1229,19 @@ def _autoscan_shim(auto_scan=True, in_print=False, prev=False, scanned=False,
         lanes={},
         _prev_present=[prev, prev, prev, prev],
         _auto_scanned=[scanned, scanned, scanned, scanned],
-        _bridge=object(),
+        _scan_t0=[None] * 4,
+        _scan_notag=[False] * 4,
+        SCAN_FALLBACK_CAP=45.0,
+        # A bare object() is not enough: a BOXED unit's insert scan goes out
+        # as a capscan FRAME rather than through self.scan(), so record that
+        # here too. What
+        # these tests mean is "bay N got scanned", and that has to stay true
+        # however the scan is delivered. The HT path still uses self.scan().
+        _bridge=types.SimpleNamespace(
+            send=lambda o: (scans.append(o["slot"])
+                            if o.get("cmd") == "capscan" else None)),
+        # The capscan frame is addressed to a unit, so the shim needs an index.
+        ams_index=0,
         logger=_Logger(),
         afc=types.SimpleNamespace(
             function=types.SimpleNamespace(in_print=lambda: in_print),
@@ -1191,6 +1250,8 @@ def _autoscan_shim(auto_scan=True, in_print=False, prev=False, scanned=False,
         scan=lambda slot: scans.append(slot))
     shim._is_ht = afcBambuAMS._is_ht.__get__(shim)
     shim._lane_for_slot = afcBambuAMS._lane_for_slot.__get__(shim)
+    shim._release_scan_hold = afcBambuAMS._release_scan_hold.__get__(shim)
+    shim._open_scan = afcBambuAMS._open_scan.__get__(shim)
     return shim, scans
 
 
@@ -1281,7 +1342,7 @@ def _load_shim(sensor_after=1, timeout=5.0, arrivals=None,
     the AMS-arrival path stays out of the way of the sensor tests.
     """
     clock = _Clock()
-    calls = {"stop": 0, "feed": [], "sensor": 0}
+    calls = {"stop": 0, "feed": [], "sensor": 0, "arm": []}
 
     def sensor(lane):
         calls["sensor"] += 1
@@ -1302,8 +1363,17 @@ def _load_shim(sensor_after=1, timeout=5.0, arrivals=None,
         ams_arrival_completes_load=ams_arrival,
         afc=types.SimpleNamespace(reactor=clock),
         _toolhead_sensor_triggered=sensor,
+        _ams_declared_fault=lambda: False,
         _finish_seq_now=lambda: 0,
         _finish_since=finish_since,
+        # Default to "there is a sensor", which is the safe reading and what
+        # every real lane on this machine has.
+        _has_toolhead_sensor=lambda ln: True,
+        # The odometer read at the sensor trip -- telemetry, never control.
+        # None here is the "unit has not reported one" case, which must not
+        # disturb a single thing about the loop.
+        _odom_now_mm=lambda: None,
+        _load_odom_at_sensor=None,
         stop=lambda: calls.__setitem__("stop", calls["stop"] + 1),
         feed=lambda lane, mm: calls["feed"].append(mm))
     return shim, calls, clock
@@ -1313,7 +1383,7 @@ _LANE = types.SimpleNamespace(name="lane1")
 
 
 class TestRecover:
-    """BAMBU_RECOVER / eject-based recovery of a stuck load."""
+    """AFC_BAMBU_RECOVER / eject-based recovery of a stuck load."""
 
     def _shim(self, present=True):
         order = []
@@ -1355,7 +1425,7 @@ class TestRecover:
         shim = types.SimpleNamespace(name="BambuAMS_1")
         lane = types.SimpleNamespace(name="lane3")
         cmd = afcBambuAMS.get_lane_reset_command(shim, lane, 50.0)
-        assert cmd == "BAMBU_RECOVER UNIT=BambuAMS_1 LANE=lane3"
+        assert cmd == "AFC_BAMBU_RECOVER UNIT=BambuAMS_1 LANE=lane3"
 
 
 class TestPrepArmsFollower:
@@ -1397,13 +1467,18 @@ class TestPrepArmsFollower:
 
 
 class TestFeedUntilSensor:
-    def test_already_at_sensor_stops_and_returns(self):
+    def test_already_at_sensor_arms_and_returns(self):
         shim, calls, _ = _load_shim(sensor_after=0)      # triggers immediately
         assert afcBambuAMS._feed_until_sensor(shim, _LANE, 5.0) is True
         assert calls["stop"] == 1                        # halted right away
         assert calls["feed"] == []                       # no feed needed
 
-    def test_stops_the_instant_sensor_triggers(self):
+    def test_it_arms_the_instant_the_sensor_triggers(self):
+        # THE LOAD CHOREOGRAPHY DEPENDS ON THIS. The phase machine gates its
+        # load transition on the follow flag -- `phase_to(loaded ? PH_ARRIVED
+        # : PH_IDLE)` -- and stop() clears that flag, so a bare stop here sent
+        # every load DRIVE -> IDLE and skipped 09/A5 and the 07/00 pre
+        # entirely. bb_assist sets the flag and clears the motion in one call.
         shim, calls, _ = _load_shim(sensor_after=3)
         assert afcBambuAMS._feed_until_sensor(shim, _LANE, 5.0) is True
         assert calls["stop"] == 1                        # exactly one halt
@@ -1442,24 +1517,182 @@ class TestLoadRecover:
             _feed_until_sensor=lambda ln, t: False)     # never reaches sensor
         # Bound to the real implementation: with no measurement it is a no-op,
         # which is the case that must not disturb the load path.
+        shim._path_measurement = lambda: afcBambuAMS._path_measurement(shim)
         shim._adopt_measured_path = (
             lambda: afcBambuAMS._adopt_measured_path(shim))
+        # Also real: _bridge here has no last_fault, so a quiet unit -- which
+        # is what a shim that stubs _feed_until_sensor is standing in for.
+        shim._fault_seen = 0
+        shim._declared_fault_text = None
+        shim._ams_fault_since = (
+            lambda mark, consume=True:
+                afcBambuAMS._ams_fault_since(shim, mark, consume))
+        # Odometer + spool telemetry: a quiet unit reports neither, which is
+        # the case that must leave the load path completely unchanged.
+        shim._odom_now_mm = lambda: None
+        shim._load_odom_start = None
+        shim._load_odom_at_sensor = None
+        shim._load_t0 = 0.0
+        shim.ODOM_PATH_MIN_MM = afcBambuAMS.ODOM_PATH_MIN_MM
+        shim.ODOM_PATH_MAX_MM = afcBambuAMS.ODOM_PATH_MAX_MM
+        shim._measure_path_from_odom = (
+            lambda: afcBambuAMS._measure_path_from_odom(shim))
+        shim._dw_len_mm = lambda: None
+        shim._path_measurement = lambda: afcBambuAMS._path_measurement(shim)
+        shim._adopt_load_measured_remain = lambda ln: None
         lane = types.SimpleNamespace(name="lane1", loaded_to_hub=False)
         return shim, lane, calls
 
     def test_stalled_load_rehomes_then_fails(self):
         shim, lane, calls = self._shim(attempts=2)
-        assert afcBambuAMS.unit_load_lane(shim, lane) is False
+        assert afcBambuAMS._unit_load_lane(shim, lane) is False
         assert calls["rehome"] == 2                # one re-home per recover attempt
         assert len(calls["feed"]) == 3            # initial feed + 2 re-feeds
         assert calls["fail"] == 1                 # reported once, after exhausting
 
     def test_recover_disabled_fails_immediately(self):
         shim, lane, calls = self._shim(attempts=0)
-        assert afcBambuAMS.unit_load_lane(shim, lane) is False
+        assert afcBambuAMS._unit_load_lane(shim, lane) is False
         assert calls["rehome"] == 0               # no re-home when disabled
         assert len(calls["feed"]) == 1           # just the initial feed
         assert calls["fail"] == 1
+
+
+class TestADeclaredFaultGetsOneRetryNotTwo:
+    """The re-home IS the right answer to a latch -- mode 0F/0E is what the
+    printer's Retry sends, and the capture shows it missing once then
+    succeeding. It is not something to do twice.
+
+    Measured on the HT, lane23. The fault break fired correctly, 7ms after
+    "TIMEOUT error 0", and then the recovery opened two more full 101s windows
+    at a unit that neither moved nor spoke again until both had expired:
+
+        10:46:05  break on the fault           (5 kicks -- correct)
+        10:46:08  recover 1/2, 26 kicks, 101s  (nothing)
+        10:47:53  recover 2/2, 26 kicks, 101s  (nothing)
+        10:49:34  failed
+
+    3.5 minutes, of which the part that worked was the first six seconds.
+    """
+
+    def _shim(self, declared, odom=None):
+        shim, lane, calls = TestLoadRecover._shim(attempts=2)
+
+        # Both are filled from INSIDE the load, which is where the real ones are
+        # filled -- the verdict by _feed_until_sensor -> _ams_declared_fault,
+        # the odometer range by _track_odom off the status frames. Setting
+        # either on the shim beforehand proves nothing: _unit_load_lane clears
+        # both on entry so a previous load's evidence cannot describe this one.
+        def feed_until(ln, t):
+            if declared:
+                shim._declared_fault_text = declared
+            if odom is not None:
+                shim._load_odom_lo, shim._load_odom_hi = odom
+            return False
+        shim._feed_until_sensor = feed_until
+        shim._load_odom_lo = shim._load_odom_hi = None
+        shim._load_odom_span_mm = (
+            lambda: afcBambuAMS._load_odom_span_mm(shim))
+        shim._jam_location = (
+            lambda span=None: afcBambuAMS._jam_location(shim, span))
+        shim.ODOM_MOVED_MM = afcBambuAMS.ODOM_MOVED_MM
+        return shim, lane, calls
+
+    def test_a_declared_fault_gets_one_rehome(self):
+        shim, lane, calls = self._shim("[AMS_LED]TIMEOUT error 0")
+        assert afcBambuAMS._unit_load_lane(shim, lane) is False
+        assert calls["rehome"] == 1
+        assert len(calls["feed"]) == 2            # initial + one re-feed
+
+    def test_a_silent_stall_still_gets_both(self):
+        # No verdict means no evidence the unit has given up -- the second
+        # Retry is exactly the case the recovery was built for.
+        shim, lane, calls = self._shim(None)
+        assert afcBambuAMS._unit_load_lane(shim, lane) is False
+        assert calls["rehome"] == 2
+
+    def test_the_operator_is_told_what_the_unit_said(self):
+        said = []
+        shim, lane, calls = self._shim(
+            "[AMS_COMMON]state:7,tray_now:0 [AMS_LED]TIMEOUT error 0")
+        shim.afc.error.handle_lane_failure = \
+            lambda l, m, pause=False: said.append(m)
+        afcBambuAMS._unit_load_lane(shim, lane)
+        assert said
+        assert "TIMEOUT error 0" in said[0]
+        # ...and NOT sent to measure a bowden that had nothing to do with it.
+        assert "afc_bowden_length" not in said[0]
+
+    def test_a_real_timeout_still_blames_the_bowden(self):
+        # The other failure is still the other failure: a load that simply ran
+        # out of window has no verdict, and the calibration hint is the right
+        # advice for it.
+        said = []
+        shim, lane, calls = self._shim(None)
+        shim.afc.error.handle_lane_failure = \
+            lambda l, m, pause=False: said.append(m)
+        afcBambuAMS._unit_load_lane(shim, lane)
+        assert said and "afc_bowden_length" in said[0]
+
+    def test_the_failure_says_where_from_the_odometer(self):
+        # THE CASE THIS WAS BUILT FOR: the PTFE tube was not connected to the
+        # HT, so the AMS fed five metres onto the floor and the toolhead sensor
+        # never saw a thing. Every host-side signal said "nothing arrived"; only
+        # the unit's odometer knew the filament had gone somewhere. It was in
+        # the status frame throughout and we never read it, so the operator was
+        # told to check their afc_bowden_length calibration.
+        said = []
+        shim, lane, calls = self._shim(None, odom=(0.0, 5004.0))
+        shim.afc.error.handle_lane_failure = \
+            lambda l, m, pause=False: said.append(m)
+        afcBambuAMS._unit_load_lane(shim, lane)
+        assert said
+        assert "DOWNSTREAM OF THE AMS" in said[0]
+        assert "5004mm" in said[0]        # the number, not just the verdict
+
+    def test_a_unit_that_never_moved_points_at_the_spool_instead(self):
+        said = []
+        shim, lane, calls = self._shim(None, odom=(1500.0, 1514.0))
+        shim.afc.error.handle_lane_failure = \
+            lambda l, m, pause=False: said.append(m)
+        afcBambuAMS._unit_load_lane(shim, lane)
+        assert said and "AT THE AMS" in said[0]
+
+    def test_no_odometer_readings_add_nothing(self):
+        # Hedging beats guessing: a unit that went quiet gets no verdict, and
+        # the message is the same one a reading-less unit always gets.
+        said = []
+        shim, lane, calls = self._shim(None)
+        shim.afc.error.handle_lane_failure = \
+            lambda l, m, pause=False: said.append(m)
+        afcBambuAMS._unit_load_lane(shim, lane)
+        assert said
+        assert "DOWNSTREAM" not in said[0] and "AT THE AMS" not in said[0]
+
+    def test_the_location_rides_along_with_a_declared_fault_too(self):
+        # The two answer different questions -- WHAT the unit said and WHERE
+        # the filament got to -- so a failure with both should carry both.
+        said = []
+        shim, lane, calls = self._shim("[AMS_LED]TIMEOUT error 0",
+                                       odom=(0.0, 5004.0))
+        shim.afc.error.handle_lane_failure = \
+            lambda l, m, pause=False: said.append(m)
+        afcBambuAMS._unit_load_lane(shim, lane)
+        assert said
+        assert "TIMEOUT error 0" in said[0]
+        assert "DOWNSTREAM OF THE AMS" in said[0]
+
+    def test_the_verdict_does_not_outlive_its_load(self):
+        # A verdict belongs to ONE load. Left set, the previous failure's words
+        # would be attached to this failure -- and this one has none.
+        shim, lane, calls = self._shim(None)
+        shim._declared_fault_text = "[AMS_LED]TIMEOUT error 0"   # stale
+        said = []
+        shim.afc.error.handle_lane_failure = \
+            lambda l, m, pause=False: said.append(m)
+        afcBambuAMS._unit_load_lane(shim, lane)
+        assert shim._declared_fault_text is None
+        assert said and "TIMEOUT" not in said[0]
 
 
 # ── eject: clears stuck motion before rewinding, works from any state ───────────
@@ -1474,8 +1707,14 @@ def _eject_shim():
         retract=lambda lane, d: order.append(("retract", d)),
         # Returns True: the AMS normally reports its own completion, and the
         # timeout branch is a distinct case with its own test below.
-        _wait_move=lambda d, s=None: (order.append(("wait", d)), True)[1],
+        _wait_move=lambda d, s=None, fault_mark=None: (
+            order.append(("wait", d)), True)[1],
         measured_path_mm=lambda: None,
+        _measure_path_from_odom=lambda: None,
+        _dw_len_mm=lambda: None,
+        # Quiet unit by default; the latch case has its own test below.
+        _ams_fault_seq=lambda: 0,
+        _ams_fault_since=lambda mark, consume=True: None,
         _is_virtual_hub=lambda lane: True)
     # Bound to the real implementation rather than stubbed, so the distance
     # arithmetic under test is the shipped one.
@@ -1501,6 +1740,341 @@ class TestEjectLane:
                                      _load_state=True)
         afcBambuAMS.eject_lane(shim, lane)               # no raise
         assert order == [] and lane.loaded_to_hub is True
+
+
+class TestTheSpoolSummaryIsReadableByAHuman:
+    """The three facts worth knowing -- what tag was read, how full it is, and
+    whether that reached Spoolman -- were split across three machine-shaped
+    lines seconds apart, each phrased for whoever wrote the code:
+
+        applied tag to lane23: Bambu PLA Matte #A3D8E1
+        measured spool in slot 0: 102% remaining (~1000 g) [capscan]
+        wrote 1000 g remaining to Spoolman spool 87 (physical AMS measurement)
+
+    One sentence instead, at the operator.
+    """
+
+    def _u(self, material="Bambu PLA Basic", colour="#0080ff", sid=87,
+           sync=True):
+        said = []
+        log = types.SimpleNamespace(info=said.append)
+        u = types.SimpleNamespace(
+            name="BambuAMS_2", logger=log, sync_measured_to_spoolman=sync,
+            _slots=[{"index": 2, "material": material, "color": colour,
+                     "weight": 1000}])
+        lane = types.SimpleNamespace(name="lane20", spool_id=sid)
+        return u, lane, said
+
+    def test_it_says_the_tag_the_amount_and_where_it_went(self):
+        u, lane, said = self._u()
+        afcBambuAMS._say_spool_summary(u, 2, lane, 73, 730, 1000)
+        assert len(said) == 1
+        m = said[0]
+        assert "Bambu PLA Basic" in m and "#0080ff" in m
+        assert "73% left" in m and "730 g" in m and "1000 g spool" in m
+        assert "Spoolman spool 87" in m
+
+    def test_a_spool_with_no_tag_says_so_plainly(self):
+        # Third-party reels have no tag. Ordinary, so stated, not warned about.
+        u, lane, said = self._u(material=None, colour=None)
+        afcBambuAMS._say_spool_summary(u, 2, lane, 73, 730, 1000)
+        assert "no tag on this spool" in said[0]
+
+    def test_an_unbound_spool_explains_where_the_number_went_instead(self):
+        # The silence around this has already cost two rounds of "why didn't
+        # it write?" -- the figure IS kept, on the lane.
+        u, lane, said = self._u(sid=None)
+        afcBambuAMS._say_spool_summary(u, 2, lane, 73, 730, 1000)
+        assert "not linked to a Spoolman spool" in said[0]
+        assert "kept on the lane" in said[0]
+
+    def test_sync_turned_off_is_distinguished_from_unbound(self):
+        u, lane, said = self._u(sync=False)
+        afcBambuAMS._say_spool_summary(u, 2, lane, 54, 540, 1000)
+        assert "Spoolman sync is off" in said[0]
+
+    def test_over_100_percent_reads_as_full_not_as_a_number_to_discount(self):
+        # 102/107/113/119 all captured on real hardware: a spool sitting proud
+        # of the reference radius, not extra filament. The operator should not
+        # have to know how to interpret that.
+        u, lane, said = self._u()
+        afcBambuAMS._say_spool_summary(u, 2, lane, 113, 1000, 1000)
+        m = said[0]
+        assert "full" in m and "1000 g of a 1000 g spool" in m
+        assert "113%" in m               # still stated, just explained
+
+    def test_it_names_the_lane_the_operator_knows(self):
+        u, lane, said = self._u()
+        afcBambuAMS._say_spool_summary(u, 2, lane, 73, 730, 1000)
+        assert "lane20" in said[0]
+
+    def test_no_lane_falls_back_to_the_bay(self):
+        u, _lane, said = self._u()
+        afcBambuAMS._say_spool_summary(u, 2, None, 73, 730, 1000)
+        assert "bay 2" in said[0]
+
+
+class TestTheSummaryWaitsForTheRecordItDescribes:
+    """
+    The measurement finishes BEFORE the record it describes catches up, by
+    design: the firmware does not read 0x0211 during the capacity window, so it
+    clears info_valid at the window close and lets the fill collect the result
+    after. The measured percent arrives from narration, which is why it is
+    here first.
+
+    Said immediately, the line read the record in exactly the gap it is being
+    refreshed through and announced the blank as a conclusion. Captured live:
+
+        13:15  STEP:card auth success! ... read success,valid
+        13:15  slot 1 calibration completed -- re-reading the bay
+        13:15  lane16: NO TAG ON THIS SPOOL. Measured about 25% left
+        13:16  applied tag to lane16: Bambu PLA Sparkle #2D2B28
+
+    The unit had just narrated a successful read. Nothing was wrong except the
+    moment we chose to speak.
+    """
+
+    def _u(self, material=None, uid=None, now=100.0):
+        said = []
+        u = types.SimpleNamespace(
+            name="BambuAMS_1", logger=types.SimpleNamespace(info=said.append),
+            sync_measured_to_spoolman=True, SCAN_FALLBACK_CAP=45.0,
+            _slots=[{"index": 0, "material": material, "color": "#2D2B28",
+                     "rfid_uid": uid, "weight": 1000}],
+            _lane_for_slot=lambda s: types.SimpleNamespace(
+                name="lane16", spool_id=None),
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: now)))
+        u._say_spool_summary = afcBambuAMS._say_spool_summary.__get__(u)
+        u._drain_spool_summary = afcBambuAMS._drain_spool_summary.__get__(u)
+        u._queue_spool_summary = afcBambuAMS._queue_spool_summary.__get__(u)
+        return u, said
+
+    def test_a_blank_record_holds_the_line(self):
+        u, said = self._u(material=None)
+        u._queue_spool_summary(0, 25, 250, 1000)
+        assert said == [], "announced a conclusion mid-refresh"
+        assert 0 in u._pending_summary
+
+    def test_it_speaks_once_the_record_lands(self):
+        u, said = self._u(material=None)
+        u._queue_spool_summary(0, 25, 250, 1000)
+        u._slots[0]["material"] = "Bambu PLA Sparkle"      # the re-read landed
+        u._drain_spool_summary(0)
+        assert len(said) == 1
+        assert "Bambu PLA Sparkle" in said[0] and "25% left" in said[0]
+        assert "no tag" not in said[0]
+        assert 0 not in u._pending_summary
+
+    def test_a_record_that_already_answers_is_not_held(self):
+        u, said = self._u(material="Bambu PLA Sparkle")
+        u._queue_spool_summary(0, 25, 250, 1000)
+        assert len(said) == 1
+
+    def test_a_uid_alone_answers_it(self):
+        # A third-party tag has a UID even when its profile will not decode --
+        # that is an answer, not a blank, so there is nothing to wait for.
+        u, said = self._u(material=None, uid="84ea7601")
+        u._queue_spool_summary(0, 25, 250, 1000)
+        assert len(said) == 1 and "84EA7601" in said[0]
+
+    def test_the_backstop_stops_it_waiting_forever(self):
+        u, said = self._u(material=None, now=100.0)
+        u._queue_spool_summary(0, 25, 250, 1000)
+        assert said == []
+        u.afc.reactor.monotonic = lambda: 100.0 + 46.0
+        u._drain_spool_summary(0)
+        assert len(said) == 1
+        assert 0 not in u._pending_summary
+
+
+class TestEachUnitMeasuresItsOwnTubeItsOwnWay:
+    """THREE UNITS, THREE TUBES, THREE DIALECTS -- and no single source covers
+    them. Measured on this rig 2026-08-07:
+
+        unit    bowden   odometer          dw_len          tube_len
+        AMS 1   3000     3338 (adopted)    --              never
+        AMS 2   3497     intermittent      3504 observed   never
+        HT      3679     ALWAYS None       3672 (x2)       never
+
+    The HT is the case that forces the chain: it reported odom=None on 225
+    consecutive samples across a full load and has never narrated tube_len
+    here, so without dw_len it can never measure its own path at all.
+    """
+
+    def _u(self, odom=None, dw=None, tube=None, addr=0x0700, dw_addr=0x0700):
+        u = types.SimpleNamespace(
+            ODOM_PATH_MIN_MM=afcBambuAMS.ODOM_PATH_MIN_MM,
+            ODOM_PATH_MAX_MM=afcBambuAMS.ODOM_PATH_MAX_MM,
+            ams_index=0, dry_dev_addr=addr,
+            _load_odom_start=0.0 if odom is not None else None,
+            _load_odom_at_sensor=odom,
+            measured_path_mm=lambda: tube,
+            _bridge=types.SimpleNamespace(
+                dw_len=lambda idx: (dw, 1 if dw else 0, dw_addr)))
+        u._measure_path_from_odom = (
+            lambda: afcBambuAMS._measure_path_from_odom(u))
+        u._dw_len_mm = lambda: afcBambuAMS._dw_len_mm(u)
+        return u
+
+    def test_ams1_measures_by_odometer(self):
+        assert afcBambuAMS._path_measurement(
+            self._u(odom=3338.0)) == (3338.0, "odometer")
+
+    def test_the_ht_falls_through_to_dw_len(self):
+        # No odometer, ever. Without this the HT has no path measurement.
+        u = self._u(odom=None, dw=3672.0, addr=0x1800, dw_addr=0x1800)
+        assert afcBambuAMS._path_measurement(u) == (3672.0, "dw_len")
+
+    def test_tube_len_is_still_the_last_resort(self):
+        u = self._u(odom=None, dw=None, tube=2186.0)
+        assert afcBambuAMS._path_measurement(u) == (2186.0, "tube_len")
+
+    def test_a_unit_with_no_source_measures_nothing(self):
+        assert afcBambuAMS._path_measurement(self._u()) == (None, "")
+
+    def test_the_odometer_outranks_dw_len_when_both_exist(self):
+        # The odometer is the distance actually travelled to the sensor THIS
+        # load; dw_len is the unit's own figure for the same journey.
+        u = self._u(odom=3338.0, dw=3504.0)
+        assert afcBambuAMS._path_measurement(u)[1] == "odometer"
+
+    def test_a_dw_len_from_another_units_device_is_refused(self):
+        # dw_len is filed under _active_unit, which a load SETS and nothing
+        # clears -- so it names whichever unit loaded LAST. An HT value must
+        # not be adopted as a boxed unit's tube.
+        u = self._u(odom=None, dw=3672.0, addr=0x0700, dw_addr=0x1800)
+        assert afcBambuAMS._path_measurement(u) == (None, "")
+
+    def test_an_absurd_dw_len_is_refused(self):
+        # 0.000 is what a load reported with the PTFE tube disconnected.
+        for bad in (0.0, 50.0, 99000.0):
+            u = self._u(odom=None, dw=bad)
+            assert afcBambuAMS._path_measurement(u) == (None, ""), bad
+
+    def test_every_real_tube_on_this_rig_survives_the_chain(self):
+        for mm in (3338.0, 3504.0, 3672.0):
+            assert afcBambuAMS._path_measurement(
+                self._u(odom=None, dw=mm))[0] == mm
+
+
+class TestThePathIsMeasuredFromTheOdometer:
+    """The odometer at the instant the toolhead sensor trips IS the bay-to-
+    sensor distance, and it is a TYPED STATUS FIELD -- so it works on all three
+    units, unlike tube_len/dw_len which are text the AMS 1 does not use.
+
+    Traced on an AMS 1 (lane15, alone on the wire, 1 Hz):
+
+        17:44:24  odom 0.0      unload finished, odometer zeroed
+        17:44:48  odom 3.346    TOOLHEAD SENSOR TRIPS
+        17:45:19  odom 3.469    tool_stn + purge, pulled by the extruder
+
+    3346 mm, against a configured 3000 default.
+    """
+
+    def _shim(self, start, at_sensor):
+        return types.SimpleNamespace(
+            _load_odom_start=start, _load_odom_at_sensor=at_sensor,
+            ODOM_PATH_MIN_MM=afcBambuAMS.ODOM_PATH_MIN_MM,
+            ODOM_PATH_MAX_MM=afcBambuAMS.ODOM_PATH_MAX_MM)
+
+    def test_the_traced_load_measures_its_own_tube(self):
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(0.0, 3346.0)) == 3346.0
+
+    def test_it_is_a_delta_not_the_raw_reading(self):
+        # A lane staged at the hub starts partway along. Reading the raw value
+        # would record a path shorter than the real one.
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(800.0, 4146.0)) == 3346.0
+
+    def test_the_post_arrival_creep_is_excluded_by_construction(self):
+        # 3.469 is what the odometer reads 30s later, and 123mm of that is
+        # tool_stn plus the purge -- real filament the toolhead consumed, which
+        # the odometer rightly counts. Taking the reading at the trip is what
+        # keeps it out; there is no subtraction anywhere to get wrong.
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(0.0, 3346.0)) == 3346.0
+
+    def test_a_unit_that_reports_no_odometer_measures_nothing(self):
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(None, 3346.0)) is None
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(0.0, None)) is None
+
+    def test_absurd_spans_are_rejected(self):
+        # A sign flip or a stuck sentinel, not a tube.
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(0.0, -3346.0)) is None
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(0.0, 99000.0)) is None
+        assert afcBambuAMS._measure_path_from_odom(
+            self._shim(0.0, 50.0)) is None
+
+    def test_every_real_tube_on_record_is_inside_the_bounds(self):
+        # AMS 1 3346, AMS 2 ~3500, HT ~3660 on this rig; 1693 and 2186 on the
+        # capture rig. The guard must not reject a real machine.
+        for mm in (1693.0, 2186.0, 3346.0, 3497.0, 3679.0):
+            assert afcBambuAMS._measure_path_from_odom(
+                self._shim(0.0, mm)) == mm
+
+
+class TestEjectReportsALatch:
+    """eject is what AFC_BAMBU_RECOVER and AFC_RESET run, and it holds
+    _unload_in_progress for its whole duration -- which MUTES both fault
+    detectors by design.
+
+    So when the unit gave up, nothing inside this path was reading its verdict.
+    It sat in the bridge until the mute lifted in the `finally` and the next
+    follower tick happened to pick it up: measured 22s late on an AMS 2, and
+    lost outright if anything else consumed the sequence first. Recovery told
+    the operator "done" while the filament was still out of the bay.
+    """
+
+    def _rig(self, fault=None):
+        shim, order = _eject_shim()
+        shim._ams_fault_seq = lambda: 0
+        shim._ams_fault_since = \
+            lambda mark, consume=True: fault
+        return shim, order
+
+    def _lane(self):
+        return types.SimpleNamespace(name="lane20", loaded_to_hub=True,
+                                     _load_state=True)
+
+    def test_a_latch_is_said_in_the_units_own_words(self):
+        shim, order = self._rig(
+            fault="[AMS_COMMON]en:1,mode:3 [AMS_LED]TIMEOUT error 2")
+        afcBambuAMS.eject_lane(shim, self._lane())
+        said = " ".join(m for _lvl, m in shim.logger.messages)
+        assert "TIMEOUT error 2" in said
+        assert "latched" in said
+        assert "free it by hand" in said.lower()
+
+    def test_the_ams1_state_only_verdict_lands_here_too(self):
+        shim, order = self._rig(
+            fault="[AMS_COMMON]state:6,tray_now:255,tray_exit:6 "
+                  "[AMS_LINK]en:0,mode:7,idx:255,ref:0")
+        afcBambuAMS.eject_lane(shim, self._lane())
+        said = " ".join(m for _lvl, m in shim.logger.messages)
+        assert "en:0,mode:7,idx:255" in said
+        assert "state:6" in said
+
+    def test_a_quiet_eject_says_nothing(self):
+        shim, order = self._rig(fault=None)
+        afcBambuAMS.eject_lane(shim, self._lane())
+        assert shim.logger.messages == []
+
+    def test_the_wait_is_given_the_mark_so_it_can_end_early(self):
+        # Without it the wait sits out its full deadline at a unit that has
+        # already stopped listening -- the 22s that made the fault look like
+        # it arrived late when it had been available the whole time.
+        seen = {}
+        shim, order = self._rig(fault=None)
+        shim._wait_move = lambda d, s=None, fault_mark=None: (
+            seen.update(mark=fault_mark), True)[1]
+        afcBambuAMS.eject_lane(shim, self._lane())
+        assert "mark" in seen and seen["mark"] is not None
 
 
 # ── disconnect / FIRMWARE_RESTART teardown ──────────────────────────────────────
@@ -1616,8 +2190,16 @@ def _bare_lane():
                                  extruder_temp=None)
 
 
-def _surface_self():
-    return types.SimpleNamespace(name="AMS", logger=_Logger(), afc=None)
+def _surface_self(saves=None):
+    # _surface_slot_info gained two collaborators after these tests were
+    # written: it pushes the tag onward to Spoolman, and it applies the
+    # measured remain% to the lane's weight. Both are no-ops here -- this
+    # fixture is about what lands ON THE LANE -- but they have to exist.
+    return types.SimpleNamespace(
+        name="AMS", logger=_Logger(), afc=None,
+        _spoolman_sync=lambda lane, info: None,
+        _apply_remain_weight=lambda lane, info: None,
+        _save_lane_vars=lambda: (saves.append(1) if saves is not None else None))
 
 
 class TestSurfaceSlotInfo:
@@ -1634,8 +2216,8 @@ class TestSurfaceSlotInfo:
         assert lane.bambu_slot_info is info
 
     def test_tag_overrides_previous_value(self):
-        # the AMS tag is authoritative for the bay -- it wins over a value we
-        # previously auto-set (e.g. an AFC default), which was the bug.
+        # the AMS tag is authoritative for the bay -- it wins over a value
+        # auto-set elsewhere (e.g. an AFC default).
         lane = types.SimpleNamespace(name="lane1", material="ABS",
                                      color="#FF0000", extruder_temp=250.0)
         info = bridge_slot_to_info({
@@ -1646,7 +2228,14 @@ class TestSurfaceSlotInfo:
         assert lane.color == "#00AE42"
         assert lane.extruder_temp == 210.0
 
-    def test_spoolman_linked_lane_not_overridden(self):
+    def test_a_spoolman_link_does_not_block_the_tag(self):
+        # A bound lane takes the tag like any other. Spoolman is a RECORD of
+        # what is in the bay; the tag IS the bay -- and every other AFC reader
+        # (OpenAMS, ACE 2, U1, Vivid) applies the tag first and syncs after.
+        #
+        # Gating on the link would leave a bound lane's material and colour
+        # coming from Spoolman on Spoolman's schedule and never from the tag,
+        # so a scan on that lane would never reach Mainsail at all.
         lane = types.SimpleNamespace(name="lane1", material="ABS",
                                      color="#FF0000", extruder_temp=250.0,
                                      spool_id=42)
@@ -1654,8 +2243,9 @@ class TestSurfaceSlotInfo:
             "i": 0, "present": True, "material": "PLA", "color": "00ae42ff",
             "tmin": 210, "tmax": 230})
         afcBambuAMS._surface_slot_info(_surface_self(), lane, info)
-        assert lane.material == "ABS"                # Spoolman is authoritative
-        assert lane.color == "#FF0000"
+        assert lane.material == "PLA"
+        assert lane.color == "#00AE42"
+        assert lane.spool_id == 42                   # the link itself stands
 
     def test_unknown_material_not_applied(self):
         lane = _bare_lane()
@@ -1731,7 +2321,7 @@ class TestEngageFollowerOrder:
 
 
 class TestFollowManualOff:
-    """BAMBU_FOLLOWER ENABLE=0 must survive the auto-arm, which otherwise
+    """AFC_BAMBU_FOLLOWER ENABLE=0 must survive the auto-arm, which otherwise
     re-engages on the next ~100ms tick and makes the stop look like a no-op."""
 
     def _shim(self, lane, manual_off):
@@ -1743,8 +2333,7 @@ class TestFollowManualOff:
             _bridge=types.SimpleNamespace(
                 send=lambda o: None,
                 latest_status=lambda: {"fstate": 4, "buff": 50}),
-            follow_always=False, follow_when_loaded=True,
-            follow_idle_ping=False,
+            follow_when_loaded=True,
             follow_debug_interval=0.0, _follow_last_log=0.0,
             follow_poll_interval=0.1, ams_index=0,
             _tool_loaded_lane=lambda: lane,
@@ -1758,17 +2347,18 @@ class TestFollowManualOff:
         return shim, state
 
     def test_fault_checks_run_with_the_follower_manually_off(self):
-        # BAMBU_FOLLOWER ENABLE=0 clears _following_lane. Fault detection used
+        # AFC_BAMBU_FOLLOWER ENABLE=0 clears _following_lane. Fault detection used
         # to hang off that, so stopping the follower silently stopped stall
         # detection -- in the state most likely to starve the buffer.
         lane = types.SimpleNamespace(name="lane1")
         checked = []
         shim, state = self._shim(lane, manual_off=True)
         shim._check_ams_fault = lambda ln: checked.append(ln.name)
-        shim._check_buffer_starved = lambda ln, et: checked.append("buff")
         afcBambuAMS._follow_tick(shim, 100.0)
         assert state["engaged"] == []           # still does not re-arm
-        assert checked == ["lane1", "buff"]     # but still watches for a stall
+        # No "buff": the buffer watchdog is gone. What remains is what the AMS
+        # itself says -- the narration check here, and byte[19] alongside it.
+        assert checked == ["lane1"]             # but still watches for a stall
 
     def test_latched_off_blocks_the_auto_arm(self):
         lane = types.SimpleNamespace(name="lane1")
@@ -1787,53 +2377,18 @@ class TestFollowManualOff:
         assert shim._following_lane is lane
 
 
-class TestFollowIdlePing:
-    """follow_idle_ping holds the firmware's feed window open while a lane is
-    loaded. Default True: it is the only setting measured to actually feed."""
+class TestFollowIdlePingIsGone:
+    """
+    The follower holds whenever a lane is loaded, so no option gates it.
 
-    def _shim(self, idle_ping):
-        state = {"sent": []}
-        lane = types.SimpleNamespace(name="lane1")
-        toolhead = types.SimpleNamespace(get_position=lambda: [0, 0, 0, 0.0])
-        shim = types.SimpleNamespace(
-            _following_lane=lane, _follow_last_e=0.0, follow_min_extrude=0.05,
-            _follow_manual_off=False, _unload_in_progress=False,
-            _follow_last_demand=99.0, follow_rearm_window=3.0,
-            _bridge=types.SimpleNamespace(
-                send=lambda o: state["sent"].append(o),
-                latest_status=lambda: {"fstate": 4, "buff": 0}),
-            follow_always=False, follow_when_loaded=True,
-            follow_idle_ping=idle_ping,
-            follow_debug_interval=0.0, _follow_last_log=0.0,
-            follow_poll_interval=0.1, ams_index=0,
-            _tool_loaded_lane=lambda: lane,
-            _check_ams_fault=lambda ln: None,
-            _fault_hold_active=lambda: False,
-            _ready_to_follow=lambda lane=None: True,
-            _engage_follower=lambda ln: None,
-            set_feed_assist=lambda ln, on: None,
-            afc=types.SimpleNamespace(toolhead=toolhead))
-        return shim, state
+    Guards against follow_idle_ping being reintroduced as a config read: an
+    option nothing consults reads as a knob that does something.
+    """
 
-    def test_default_is_off(self):
-        # The default is what ships; assert it explicitly so a flip is a
-        # deliberate change rather than a silent one.
+    def test_the_option_is_not_read(self):
         import inspect
-        src = inspect.getsource(afcBambuAMS.__init__)
-        assert 'config.getboolean("follow_idle_ping", False)' in src
-
-    def test_on_pings_with_no_extrusion(self):
-        shim, state = self._shim(True)
-        afcBambuAMS._follow_tick(shim, 1.0)
-        assert state["sent"] == [{"cmd": "follow"}]
-
-    def test_off_stays_silent_with_no_extrusion(self):
-        # Same shim, flag cleared -> proves the assertion above is the flag
-        # working rather than the tick pinging unconditionally.
-        shim, state = self._shim(False)
-        afcBambuAMS._follow_tick(shim, 1.0)
-        assert state["sent"] == []
-
+        from extras import AFC_BambuAMS as m
+        assert "follow_idle_ping" not in inspect.getsource(m)
 
 class TestAmsNarrationRepeat:
     """Identical AMS narration is de-duplicated, but a repeating line is how a
@@ -1977,19 +2532,33 @@ class TestAmsFaultRaising:
 
     def _shim(self, fault_text, *, unloading=False, drying=False,
               detect=True, pause=True, seen=0):
-        raised, warned, assist = [], [], []
+        raised, warned, assist, recovered = [], [], [], []
         shim = types.SimpleNamespace(
             name="BambuAMS_2", fault_detect=detect, fault_pause=pause,
             _fault_seen=seen, _unload_in_progress=unloading, _drying=drying,
             _follow_fault_hold=False, _follow_fault_saw_pause=False,
-            _starved_since=5.0,
+            _starved_since=5.0, _odom_lo=None, _odom_hi=None,
             _bridge=types.SimpleNamespace(
                 last_fault=lambda: (1, fault_text, 1.6)),
             set_feed_assist=lambda ln, on: assist.append((ln.name, on)),
             logger=types.SimpleNamespace(warning=lambda m: warned.append(m),
                                          debug=lambda m: None),
-            afc=types.SimpleNamespace(error=types.SimpleNamespace(
-                AFC_error=lambda m, pause=True: raised.append((m, pause)))))
+            # _raise_ams_fault only asks for a PAUSE when a print is actually
+            # running -- added after this test, because pausing outside a print
+            # runs a Z move that raises "Must home axis first", and an escaped
+            # exception in the follower's reactor timer shuts down every MCU.
+            # Without this the shim fell to the "not printing" branch and the
+            # test read a correct no-pause as a failure.
+            #
+            # And once it IS printing, the fault hands off to auto recovery.
+            # These tests are about RAISING, so record the handoff and stop
+            # there -- the recovery has its own tests.
+            _resume_needs_reload=False,
+            _maybe_auto_recover=lambda ln: recovered.append(ln.name),
+            afc=types.SimpleNamespace(
+                function=types.SimpleNamespace(in_print=lambda: True),
+                error=types.SimpleNamespace(
+                    AFC_error=lambda m, pause=True: raised.append((m, pause)))))
         # The real raiser, so the hold latch is exercised rather than stubbed.
         shim._raise_ams_fault = (
             lambda ln, m: afcBambuAMS._raise_ams_fault(shim, ln, m))
@@ -2178,9 +2747,7 @@ class TestFaultHoldBlocksAutoArm:
         toolhead = types.SimpleNamespace(get_position=lambda: [0, 0, 0, 0.0])
         shim = types.SimpleNamespace(
             _following_lane=None, _follow_last_e=None,
-            follow_min_extrude=0.05, follow_always=False,
-            follow_when_loaded=True, follow_idle_ping=False,
-            follow_debug_interval=0.0, _follow_last_log=0.0,
+            follow_min_extrude=0.05, follow_when_loaded=True,            follow_debug_interval=0.0, _follow_last_log=0.0,
             follow_poll_interval=0.1, ams_index=0,
             _follow_manual_off=False, _unload_in_progress=False,
             _follow_last_demand=99.0, follow_rearm_window=3.0,
@@ -2206,118 +2773,6 @@ class TestFaultHoldBlocksAutoArm:
         shim, state = self._shim(hold=False)
         afcBambuAMS._follow_tick(shim, 100.0)
         assert state["engaged"] == ["lane22"]
-
-
-class TestBufferStarved:
-    """The buffer-based stall detector, for units that never narrate."""
-
-    def _shim(self, *, detect=True, pause=True):
-        raised = []
-        state = {"buff": 3, "buffn": 0, "e": 100.0}
-        shim = types.SimpleNamespace(
-            name="BambuAMS_2", fault_detect=detect, fault_pause=pause,
-            fault_starved_below=25, fault_starved_seconds=2.0,
-            follow_min_extrude=0.1,
-            _unload_in_progress=False, _drying=False,
-            _starved_since=0.0, _starved_e=0.0, _starved_reads=None,
-            _follow_fault_hold=False, _follow_fault_saw_pause=False,
-            _bridge=types.SimpleNamespace(
-                latest_status=lambda: {"buff": state["buff"],
-                                       "buffn": state["buffn"]}),
-            set_feed_assist=lambda ln, on: None,
-            logger=types.SimpleNamespace(warning=lambda m: raised.append(m),
-                                         debug=lambda m: None),
-            afc=types.SimpleNamespace(
-                in_toolchange=False,
-                toolhead=types.SimpleNamespace(
-                    get_position=lambda: [0, 0, 0, state["e"]]),
-                error=types.SimpleNamespace(
-                    AFC_error=lambda m, pause=True: raised.append(m))))
-        shim._raise_ams_fault = (
-            lambda ln, m: afcBambuAMS._raise_ams_fault(shim, ln, m))
-        return shim, state, raised
-
-    def _run(self, shim, state, lane, seconds, *, mm_per_s=1.0, buffn_hz=2.0):
-        """Drive the check at the real ~100ms tick rate for `seconds`.
-
-        Deliberately realistic: per tick the extruder moves far less than
-        follow_min_extrude and the buffer counter only ticks a couple of times a
-        second. The original implementation reset its window on both of those
-        and so could never fire.
-        """
-        ticks = int(seconds / 0.1)
-        for i in range(ticks):
-            t = 100.0 + i * 0.1
-            state["e"] += mm_per_s * 0.1
-            state["buffn"] = int(t * buffn_hz)
-            afcBambuAMS._check_buffer_starved(shim, lane, t)
-
-    def test_sustained_starvation_while_extruding_raises(self):
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        self._run(shim, state, lane, 4.0)
-        assert len(raised) == 1 and "buffer has been empty" in raised[0]
-        assert shim._follow_fault_hold is True
-
-    def test_short_starvation_does_not_raise(self):
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        self._run(shim, state, lane, 1.5)
-        assert raised == []
-
-    def test_healthy_buffer_never_raises(self):
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        state["buff"] = 58
-        self._run(shim, state, lane, 30.0)
-        assert raised == []
-
-    def test_recovery_clears_the_window(self):
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        self._run(shim, state, lane, 1.5)
-        state["buff"] = 58                      # AMS caught up
-        self._run(shim, state, lane, 2.0)
-        state["buff"] = 3                       # starved again, from zero
-        self._run(shim, state, lane, 1.5)
-        assert raised == []
-
-    def test_idle_printer_sitting_starved_does_not_raise(self):
-        # Not a fault: nothing is asking the AMS for filament.
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        self._run(shim, state, lane, 30.0, mm_per_s=0.0)
-        assert raised == []
-
-    def test_frozen_telemetry_never_raises(self):
-        # A stuck buffer counter reads exactly like an empty buffer. It must
-        # not be able to manufacture a fault out of nothing.
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        self._run(shim, state, lane, 30.0, buffn_hz=0.0)
-        assert raised == []
-
-    def test_unload_does_not_raise(self):
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        shim._unload_in_progress = True
-        self._run(shim, state, lane, 30.0)
-        assert raised == []
-
-    def test_toolchange_does_not_raise(self):
-        # A purge bottoms the buffer out while the extruder moves -- the fault
-        # signature exactly. With a 2s window this guard is load-bearing.
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim()
-        shim.afc.in_toolchange = True
-        self._run(shim, state, lane, 30.0)
-        assert raised == []
-
-    def test_detect_disabled_does_nothing(self):
-        lane = types.SimpleNamespace(name="lane22")
-        shim, state, raised = self._shim(detect=False)
-        self._run(shim, state, lane, 30.0)
-        assert raised == []
 
 
 class TestChamberTelemetryRegex:
@@ -2512,6 +2967,564 @@ from unittest.mock import MagicMock   # noqa: E402
 from extras.AFC_BambuAMS import BambuBridge  # noqa: E402
 
 
+class TestTheHeartbeatCannotBreakTheDedupe:
+    """
+    The AMS bundles a 10-second liveness heartbeat into whatever frame is
+    going out, and its timestamp changes every time. It was already dropped
+    from the console -- but only AFTER the dedupe had stored it as the last
+    line, so every 10s it broke the run of identical lines and the next repeat
+    printed as if it were new.
+
+    That is why a sentence repeating 200 times a minute reached the console
+    6 times a minute: 6 = 60/10, the heartbeat period. Nothing about the
+    message itself.
+
+    Deliberately NOT solved by adding the repeated line to _AMS_NOISE_RE:
+    that sentence turned out to be a real fault (an unbounded re-read of a
+    bay holding an untagged spool), and suppressing it would have hidden it.
+    """
+
+    LINE = "[AMS_LINK]get_slot ams1 tray0 basic"
+    BEAT = " [DBG] ams time: now=42044054ms diff=10005ms"
+
+    def test_the_heartbeat_segment_is_stripped(self):
+        from extras.AFC_BambuAMS_bridge import _DBG_AMSTIME_RE
+        assert _DBG_AMSTIME_RE.sub("", self.LINE + self.BEAT).strip() == self.LINE
+
+    def test_a_heartbeat_only_frame_reaches_nobody(self):
+        # The drain reply opens with one stray framing byte, so a heartbeat-only
+        # frame strips down to something like "," -- no bracket, no content.
+        # Stripping the segment ALSO stopped the console drop from matching (it
+        # tests for the "[DBG] ams time" substring), which put a bare comma on
+        # the operator's console every 10 seconds.
+        bridge, reactor, logger, _seen = _bridge()
+        bridge.reactor = reactor
+        before = len(logger.messages)
+        bridge.handle_line(
+            '{"evt":"amsdbg","addr":1792,'
+            '"text":", [DBG] ams time: now=49107885ms diff=10004ms"}')
+        printed = [m for m in logger.messages[before:] if "AMS:" in str(m)]
+        assert not printed, f"heartbeat-only frame was logged: {printed}"
+
+    def test_a_heartbeat_riding_with_real_narration_keeps_the_narration(self):
+        from extras.AFC_BambuAMS_bridge import _DBG_AMSTIME_RE
+        both = self.LINE + self.BEAT
+        kept = _DBG_AMSTIME_RE.sub("", both).strip()
+        assert "[" in kept and kept == self.LINE
+
+    def test_a_bundled_heartbeat_does_not_reset_the_repeat_run(self):
+        bridge, reactor, logger, _seen = _bridge()
+        bridge.reactor = reactor
+        mk = lambda t: '{"evt":"amsdbg","addr":1792,"text":"%s"}' % t
+        bridge.handle_line(mk(self.LINE))
+        n0 = bridge._last_dbg_n
+        # The same sentence, this time carrying the heartbeat. It must count as
+        # a repeat, not start a new run.
+        bridge.handle_line(mk(self.LINE + self.BEAT))
+        bridge.handle_line(mk(self.LINE))
+        assert bridge._last_dbg_n > n0, "the heartbeat restarted the run"
+
+    def test_link_chatter_is_still_visible_not_filtered(self):
+        # The fix is the loop, not a mute. This line must stay reportable.
+        from extras.AFC_BambuAMS_bridge import _ams_is_noise
+        assert _ams_is_noise(self.LINE) is False
+
+    def test_the_90s_preload_housekeeping_is_console_suppressed(self):
+        from extras.AFC_BambuAMS_bridge import _ams_is_noise
+        assert _ams_is_noise(
+            "^ [AMS_COMMON]preload_disable:1, tmpr:25.8, cd:0 "
+            "[AMS_COMMON]preload_disable:0, tmpr:25.8, cd:0") is True
+
+    @pytest.mark.parametrize("line", [
+        "[AMS_RFID] STEP3,save to flash ,card info valid",   # a tag committed
+        "[AMS_COMMON]state:6,tray_now:255,tray_exit:1",      # AMS 1's fault
+        "[AMS_CHMB]s:2, rf:55, cd:55, vt:23.1",              # chamber telemetry
+    ])
+    def test_the_filter_does_not_reach_lines_that_matter(self, line):
+        from extras.AFC_BambuAMS_bridge import _ams_is_noise
+        assert _ams_is_noise(line) is False
+
+    def test_a_suppressed_line_still_reaches_the_parsers(self):
+        # only_debug hides a line from the console and nothing else. The
+        # dedupe used to be able to cost a PARSE; it cannot now -- everything
+        # downstream of it reads the raw line.
+        bridge, reactor, logger, _seen = _bridge()
+        bridge.reactor = reactor
+        line = '{"evt":"amsdbg","addr":1792,"text":"%s"}'
+        pull = "[AMS_SWITCH]pull sucess, mode change, mode:4"
+        bridge.handle_line(line % pull)
+        first = bridge.last_pull()
+        bridge.handle_line(line % pull)      # byte-identical repeat
+        assert bridge.last_pull() > first, \
+            "a deduped repeat swallowed a motion completion"
+
+
+class TestAForeignTagIsNotAnEmptyBay:
+    """
+    A Mifare chip whose keys are not Bambu's answers anticollision -- so its UID
+    is readable -- and then fails authentication. The AMS 2 said so verbatim on
+    a Snapmaker spool:
+
+        [AMS_RFID]STEP:stop goto auth
+        [AMS_RFID]STEP:auth fail:-4
+        [AMS_RFID]STEP7:info_valid 0 or bbl:-1
+
+    Reporting that as "the bay reader saw no chip" is wrong in the direction
+    that sends someone looking for a hardware fault.
+    """
+
+    @pytest.mark.parametrize("line", [
+        "[AMS_RFID]STEP:auth fail:-4",
+        "[AMS_RFID]STEP7:info_valid 0 or bbl:-1",
+    ])
+    def test_the_refusal_is_recognised(self, line):
+        from extras.AFC_BambuAMS_bridge import _RFID_FOREIGN_TAG_RE
+        assert _RFID_FOREIGN_TAG_RE.search(line) is not None
+
+    @pytest.mark.parametrize("line", [
+        "[AMS_RFID] STEP3,save to flash ,card info valid",
+        "[AMS_DEV] STEP:read success,valid",
+        "[AMS_RFID]STEP0:checking",
+        "[AMS_RFID]STEP:tray pull over 880 mm, but no card detected",
+    ])
+    def test_a_good_read_or_an_empty_bay_is_not_a_refusal(self, line):
+        from extras.AFC_BambuAMS_bridge import _RFID_FOREIGN_TAG_RE
+        assert _RFID_FOREIGN_TAG_RE.search(line) is None
+
+    def test_it_is_credited_to_the_unit_that_said_it(self):
+        bridge, reactor, logger, _seen = _bridge()
+        bridge.reactor = reactor
+        t0 = reactor.monotonic()
+        bridge.handle_line(
+            '{"evt":"amsdbg","addr":1792,"text":"[AMS_RFID]STEP:auth fail:-4"}')
+        assert bridge.rfid_foreign_tag_since(t0, addr=0x0700) is True
+        assert bridge.rfid_foreign_tag_since(t0, addr=0x1800) is False
+
+
+class TestClearingALaneClearsWhatTheOperatorSees:
+    """
+    filament_name is the field the Mainsail card DISPLAYS, and
+    apply_filament_defaults does not write it -- it sets material, color,
+    weight, sub_type and spool_vendor. So a field left out of
+    _clear_lane_filament survives a defaulted lane and shows the previous
+    spool's name.
+
+    Measured on an untagged insert into a bay that had held Bambu PLA Matte:
+    the firmware slot record was correctly blank, the removal unbound, the scan
+    finalised and defaults applied -- and the lane still read
+    filament_name='Bambu PLA Matte'.
+    """
+
+    def _lane(self):
+        return types.SimpleNamespace(
+            name="lane19", material="PLA Matte", color="#7A7A7A", weight=1000,
+            filament_name="Bambu PLA Matte", sub_type="Matte",
+            spool_vendor="Bambu", bambu_sku="GFA01", spool_id=None)
+
+    def test_every_tag_written_field_is_cleared(self):
+        lane = self._lane()
+        afcBambuAMS._clear_lane_filament(
+            types.SimpleNamespace(), lane)
+        assert lane.filament_name == "", "the displayed name survived"
+        for f in ("material", "color", "bambu_sku", "sub_type", "spool_vendor"):
+            assert getattr(lane, f) == "", f"{f} survived"
+        assert lane.weight == 0
+
+    def test_a_lane_missing_the_attribute_is_survived(self):
+        # Best-effort per attribute: a lane object without one of these must
+        # not take the clear (or the insert edge) down with it.
+        lane = types.SimpleNamespace(name="lane19", material="PLA")
+        afcBambuAMS._clear_lane_filament(types.SimpleNamespace(), lane)
+        assert lane.material == ""
+
+
+class TestTheUnitDecidesWhatHappened:
+    """
+    _scan_verdict is the whole scan state machine: we command a scan and the
+    unit tells us what came of it.
+
+    What it replaced was three overlapping predicates, one of which compared
+    the record's CONTENT against a pre-scan snapshot. That one could not answer
+    a re-scan of the same spool at all -- the profile comes back byte-for-byte
+    identical -- so the hold ran until a fallback timer gave up, 14 s boxed /
+    25 s HT, with the LANE stale for the whole window while the slot data
+    beside it was current. That is the split seen on the panel: weight and
+    classification fresh, name and colour lagging.
+
+    The unit narrates its read about a second in. Ask it.
+    """
+
+    def _u(self, read_ok=False, ended=False, t0=100.0, now=101.0):
+        b = MagicMock()
+        b.rfid_read_succeeded_since = lambda since, addr=None: read_ok
+        b.rfid_cycle_ended_since = lambda since, addr=None: ended
+        return types.SimpleNamespace(
+            _bridge=b, _scan_t0=[t0], dry_dev_addr=0x0700,
+            SCAN_FALLBACK_CAP=45.0,
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: now)))
+
+    def test_a_narrated_read_is_the_answer(self):
+        assert afcBambuAMS._scan_verdict(self._u(read_ok=True), 0) == "read"
+
+    def test_a_read_outranks_a_cycle_end_in_the_same_window(self):
+        # A measuring scan narrates its end well after the read. The read is
+        # what happened; the end is just when it stopped working.
+        u = self._u(read_ok=True, ended=True)
+        assert afcBambuAMS._scan_verdict(u, 0) == "read"
+
+    def test_a_finished_cycle_with_no_read_means_no_tag(self):
+        assert afcBambuAMS._scan_verdict(self._u(ended=True), 0) == "notag"
+
+    def test_mid_cycle_it_has_not_answered_yet(self):
+        assert afcBambuAMS._scan_verdict(self._u(), 0) == "waiting"
+
+    def test_no_scan_open_is_not_a_verdict(self):
+        u = self._u(read_ok=True)
+        u._scan_t0 = [None]
+        assert afcBambuAMS._scan_verdict(u, 0) == "none"
+
+    def test_an_unknown_slot_is_not_a_verdict(self):
+        assert afcBambuAMS._scan_verdict(self._u(), None) == "none"
+        assert afcBambuAMS._scan_verdict(self._u(), 9) == "none"
+
+    def test_the_backstop_ends_a_unit_that_says_nothing(self):
+        # BACKSTOP ONLY -- reached solely when the unit narrates neither a read
+        # nor an end. A bay must not wait forever on a unit that went quiet.
+        u = self._u(t0=100.0, now=100.0 + 46.0)
+        assert afcBambuAMS._scan_verdict(u, 0) == "notag"
+
+    def test_a_broken_bridge_does_not_leave_the_bay_waiting(self):
+        # Nothing can answer, so waiting is the one thing that cannot be right:
+        # fall through to defaults rather than hold the lane blank.
+        u = self._u(read_ok=True)
+        u._bridge.rfid_read_succeeded_since = MagicMock(
+            side_effect=RuntimeError("down"))
+        assert afcBambuAMS._scan_verdict(u, 0) == "notag"
+        u2 = self._u()
+        u2._bridge = None
+        assert afcBambuAMS._scan_verdict(u2, 0) == "notag"
+
+
+class TestAMissIsRememberedOnBothBranches:
+    """
+    "A UID Spoolman does not know is a PERMANENT answer, not a retry."
+
+    _spoolman_sync has two paths -- full decode, and UID-only -- and the memo
+    that stops a re-query every status pass was on the first one only. The
+    UID-only path is what runs for a bay whose profile has not landed yet,
+    which is EVERY scan for its first seconds, so a spool Spoolman does not
+    know re-queried on every frame and blocked the reactor in HTTP each time.
+
+    Its documented cost is not cosmetic: 1061 "Resetting prediction variance"
+    events and an MCU shutdown.
+    """
+
+    def _u(self, found=None):
+        u = types.SimpleNamespace(
+            name="AMS", logger=_Logger(), _bound_uid={},
+            _spoolman_no_match=set(),
+            _unbind_spool=lambda ln, reason="": None,
+            _remember_bound_uid=lambda s, uid: None,
+            _spoolman_slot_info=lambda info: {"material": ""},
+            afc=types.SimpleNamespace(spoolman=object(), spool=None))
+        return u
+
+    def test_a_uid_only_miss_is_remembered(self, monkeypatch):
+        import extras.AFC_BambuAMS as m
+        monkeypatch.setattr(m, "find_spool_by_uid", lambda c, u: None)
+        monkeypatch.setattr(m, "_bambu_spoolman_client", lambda afc: object())
+        u = self._u()
+        lane = types.SimpleNamespace(name="lane1", spool_id=None)
+        info = {"index": 0, "present": True, "rfid_uid": "deadbeef"}
+        afcBambuAMS._spoolman_sync(u, lane, info)
+        assert "deadbeef" in u._spoolman_no_match, \
+            "a UID-only miss was not memoed -- it will re-query every frame"
+
+    def test_the_memo_short_circuits_the_next_pass(self, monkeypatch):
+        import extras.AFC_BambuAMS as m
+        calls = []
+        monkeypatch.setattr(m, "find_spool_by_uid",
+                            lambda c, u: calls.append(u) or None)
+        monkeypatch.setattr(m, "_bambu_spoolman_client", lambda afc: object())
+        u = self._u()
+        lane = types.SimpleNamespace(name="lane1", spool_id=None)
+        info = {"index": 0, "present": True, "rfid_uid": "deadbeef"}
+        afcBambuAMS._spoolman_sync(u, lane, info)
+        afcBambuAMS._spoolman_sync(u, lane, info)
+        afcBambuAMS._spoolman_sync(u, lane, info)
+        assert len(calls) == 1, f"Spoolman was asked {len(calls)} times"
+
+
+class TestTheSpoolmanBindingFollowsTheTag:
+    """
+    "This lane is bound" and "this lane is bound to the spool physically in it"
+    are not the same fact, and treating them as one wrote a measurement onto
+    the wrong reel:
+
+        02:22:21  spool REMOVED from slot 0
+        02:22:21  unbinding lane23 from spool 87 -- the bay is empty
+        02:22:21  matched lane23 to Spoolman spool 87 by UID 0a1882ac  <- 66ms
+        02:23:56  spool INSERTED  (a different spool, tag 01D0EC0F)
+        02:24:33  tag read: PLA Basic (9CDBD9) [tag 01D0EC0F]
+        02:24:33  wrote 810 g to Spoolman spool 87   <- the PLA GLOW reel
+    """
+
+    def _u(self, bound_uid=None, spool_id=None):
+        u = types.SimpleNamespace(
+            name="HT", logger=_Logger(), afc=None,
+            _bound_uid=dict(bound_uid or {}),
+            _unbind_spool=lambda ln, reason="": setattr(ln, "spool_id", ""),
+            _remember_bound_uid=lambda s, uid: None)
+        lane = types.SimpleNamespace(name="lane23", spool_id=spool_id)
+        return u, lane
+
+    def test_an_empty_bay_never_binds(self):
+        # The leftover UID must not re-bind the lane the instant it is unbound.
+        u, lane = self._u()
+        afcBambuAMS._spoolman_sync(
+            u, lane, {"index": 0, "present": False, "rfid_uid": "0a1882ac"})
+        assert lane.spool_id is None            # never reached Spoolman at all
+
+    def test_the_same_tag_on_a_bound_lane_is_a_no_op(self):
+        u, lane = self._u({0: "0a1882ac"}, spool_id=87)
+        afcBambuAMS._spoolman_sync(
+            u, lane, {"index": 0, "present": True, "rfid_uid": "0a1882ac"})
+        assert lane.spool_id == 87              # left alone
+
+    def test_a_different_tag_releases_the_old_binding(self):
+        # afc is None, so the sync returns right after the unbind -- which is
+        # exactly the behaviour under test: the stale link does not survive.
+        u, lane = self._u({0: "0a1882ac"}, spool_id=87)
+        afcBambuAMS._spoolman_sync(
+            u, lane, {"index": 0, "present": True, "rfid_uid": "01d0ec0f"})
+        assert lane.spool_id == ""              # released for the new tag
+
+    def test_a_binding_we_did_not_make_is_left_alone(self):
+        # No recorded UID -> a manual/restored assignment. Not ours to revoke.
+        u, lane = self._u({}, spool_id=42)
+        afcBambuAMS._spoolman_sync(
+            u, lane, {"index": 0, "present": True, "rfid_uid": "01d0ec0f"})
+        assert lane.spool_id == 42
+
+
+class TestNothingIsClaimedBeforeTheUnitFinishes:
+    """
+    The record of a bay mid-scan is not an answer yet, and _sync_lanes is the
+    one place that enforces it: while the verdict is "waiting" the lane is not
+    touched at all.
+
+    A bay's UID survives in the unit's record after the scan clears the profile
+    fields, so the UID-only Spoolman bind could fire on the PREVIOUS spool's
+    UID -- and did, announcing the match before the insert edge was even
+    logged:
+
+        22:12  spool REMOVED from slot 0
+        22:12  unbinding lane23 from spool 137 -- the bay is empty
+        22:12  matched lane23 to Spoolman spool 137 by UID 01d0ec0f
+        22:12  spool INSERTED in slot 0          <- the insert is AFTER
+
+    Comparing the record's CONTENT could not catch that: the scan clears the
+    profile, so a wiped profile read as "the unit re-read" while the stale UID
+    rode along underneath. Asking the unit does catch it.
+    """
+
+    def _run(self, verdict, info=None):
+        lane = types.SimpleNamespace(
+            hub_obj=_vhub(True), tool_loaded=False, prep_state=None,
+            _load_state=None, loaded_to_hub=None, status=None,
+            bambu_slot_info=None)
+        surfaced, finalized = [], []
+        slots = [info or {"present": True, "rfid_uid": "01d0ec0f"}]
+        shim = _sync_shim({"l": 0}, {"l": lane}, slots, verdict=verdict,
+                          surfaced=surfaced, finalized=finalized)
+        afcBambuAMS._sync_lanes(shim)
+        return shim, lane, surfaced, finalized
+
+    def test_mid_scan_the_lane_is_not_touched(self):
+        _, _, surfaced, finalized = self._run("waiting")
+        assert surfaced == [] and finalized == []
+
+    def test_a_read_surfaces_the_record(self):
+        _, lane, surfaced, finalized = self._run("read")
+        assert surfaced == [lane] and finalized == []
+
+    def test_no_scan_open_surfaces_normally(self):
+        _, lane, surfaced, _ = self._run("none")
+        assert surfaced == [lane]
+
+    def test_no_tag_applies_defaults_instead_of_the_record(self):
+        shim, lane, surfaced, finalized = self._run("notag")
+        assert finalized == [0], "the lane must get its defaults"
+        assert surfaced == [], "the bay's leftover profile must NOT surface"
+        assert shim._scan_notag[0] is True
+
+    def test_no_tag_does_not_reuse_the_old_spools_remain(self):
+        # THE UNIT WILL NOT MEASURE A SPOOL IT DID NOT READ A BAMBU TAG ON --
+        # its firmware, not ours; we open the capacity window on every insert
+        # and it declines. So a remain% still sitting in the bay's record came
+        # off the PREVIOUS spool's tag, exactly like the rest of the profile,
+        # and there is no weight to let through on this branch.
+        weighed = []
+        lane = types.SimpleNamespace(
+            hub_obj=_vhub(True), tool_loaded=False, prep_state=None,
+            _load_state=None, loaded_to_hub=None, status=None)
+        shim = _sync_shim({"l": 0}, {"l": lane},
+                          [{"present": True, "index": 0, "remain_pct": 80}],
+                          verdict="notag")
+        shim._measured_remain = {0: 80}      # cannot happen; proves it is unused
+        shim._apply_remain_weight = lambda ln, info: weighed.append(info)
+        afcBambuAMS._sync_lanes(shim)
+        assert weighed == []
+
+    def test_the_defaults_are_applied_once_not_per_frame(self):
+        lane = types.SimpleNamespace(
+            hub_obj=_vhub(True), tool_loaded=False, prep_state=None,
+            _load_state=None, loaded_to_hub=None, status=None,
+            bambu_slot_info=None)
+        surfaced, finalized = [], []
+        shim = _sync_shim({"l": 0}, {"l": lane}, [{"present": True}],
+                          verdict="notag", surfaced=surfaced,
+                          finalized=finalized)
+        for _ in range(5):
+            afcBambuAMS._sync_lanes(shim)
+        assert finalized == [0], "defaults re-applied on every status frame"
+
+
+class TestWeightWriteSaysWhereTheNumberCameFrom:
+    """
+    A tag record announced as a physical measurement is the machine claiming
+    work it did not do -- seen as "wrote 1000 g remaining ... (physical AMS
+    measurement)" during an insert in which no measurement ran at all.
+    """
+
+    def _shim(self):
+        pushed = []
+        return types.SimpleNamespace(
+            name="AMS", logger=_Logger(),
+            _measured_remain={0: 64},
+            _push_measured_to_spoolman=lambda ln, g, src="": pushed.append(
+                (g, src))), pushed
+
+    def _lane(self):
+        return types.SimpleNamespace(name="lane23", weight=0,
+                                     tool_loaded=False)
+
+    def test_a_real_measurement_says_so(self):
+        shim, pushed = self._shim()
+        afcBambuAMS._apply_remain_weight(
+            shim, self._lane(), {"index": 0, "remain_pct": 100, "weight": 1000})
+        assert pushed == [(640, "physical AMS measurement")]
+
+    def test_the_tag_record_is_not_called_a_measurement(self):
+        shim, pushed = self._shim()
+        shim._measured_remain = {}
+        afcBambuAMS._apply_remain_weight(
+            shim, self._lane(), {"index": 0, "remain_pct": 100, "weight": 1000})
+        assert pushed == [
+            (1000, "the spool's tag record, not a fresh measurement")]
+
+
+class TestReadSuccessInEveryDialect:
+    """
+    A successful tag read must be recognisable from EVERY unit type.
+
+    These are verbatim lines from AFC_BambuAMS.log, one complete successful
+    read per model. The AMS HT ones are the regression: ``_RFID_READ_OK_RE``
+    required a literal ``STEP:`` -- the boxed punctuation -- so on an HT it
+    could not match anything, ever. ``rfid_read_succeeded_since()`` was
+    therefore hard-wired False for that model, and ``_finalize_scan`` took the
+    "no readable tag, apply defaults / keep the leftover record" path on every
+    HT insert, including a re-insert of the same spool.
+    """
+
+    HT_OK = [
+        # 17:49:02  0x1800 -- authenticated and committed to its own flash
+        "[AMS_RFID] STEP3,auth card successful [RF] tray0: info write to "
+        "flash [AMS_RFID] STEP3,save to flash ,card info valid",
+        # 17:49:04  0x1800 -- and said the read landed
+        "[AMS_RFID] STEP3,feed with rfid success [AMS_RFID] STEP3,read "
+        "success ,goto Cali",
+    ]
+    BOXED_OK = [
+        "[AMS_DEV] STEP:read success,valid",       # AMS 1  (space, colon)
+        "[AMS_RFID]STEP:read success,valid",       # AMS 2  (no space, colon)
+        "[AMS_DEV] STEP:read_done=1",
+    ]
+    NOT_OK = [
+        # Mid-cycle steps and the failure end of the window. A read that RUNS
+        # is not a read that LANDS.
+        "[AMS_RFID] STEP2,search 0 card",
+        "[AMS_RFID] STEP3,empty to read,feed with rfid",
+        "[AMS_DEV] STEP5:no card in RF",
+        "[AMS_DEV] STEP:search finished, found 0 card",
+        "[AMS_DEV] STEP:tray pull over 790 mm, but no card detected",
+        "[AMS_CHMB]s:2, rf:55, cd:55, vt:23.1",
+    ]
+
+    @pytest.mark.parametrize("line", HT_OK + BOXED_OK)
+    def test_every_dialect_reports_a_landed_read(self, line):
+        from extras.AFC_BambuAMS_bridge import _RFID_READ_OK_RE
+        assert _RFID_READ_OK_RE.search(line) is not None
+
+    @pytest.mark.parametrize("line", NOT_OK)
+    def test_running_or_failed_is_not_a_landed_read(self, line):
+        from extras.AFC_BambuAMS_bridge import _RFID_READ_OK_RE
+        assert _RFID_READ_OK_RE.search(line) is None
+
+    @pytest.mark.parametrize("line", HT_OK)
+    def test_ht_steps_also_register_as_in_flight(self, line):
+        # The HT's comma punctuation defeated the in-flight pattern too; only
+        # the "[RF] trayN:" alternative was carrying it.
+        from extras.AFC_BambuAMS_bridge import _RFID_INFLIGHT_RE
+        assert _RFID_INFLIGHT_RE.search(line) is not None
+
+    def test_ht_cycle_end_still_matches(self):
+        from extras.AFC_BambuAMS_bridge import _RFID_CYCLE_END_RE
+        assert _RFID_CYCLE_END_RE.search("[AMS_RFID] STEP4,Calibration rst:0")
+
+    def test_bridge_credits_a_read_to_the_device_that_said_it(self):
+        # An AMS 1 (0x0700) narrating a successful read while an HT (0x1800)
+        # is mid-scan must not hand the HT a read it never made -- which is
+        # not hypothetical: an AMS 1 insert opened 3s into an HT scan window.
+        bridge, reactor, logger, _seen = _bridge()
+        bridge.reactor = reactor
+        t0 = reactor.monotonic()
+        bridge.handle_line(
+            '{"evt":"amsdbg","addr":1792,'
+            '"text":"[AMS_DEV] STEP:read success,valid"}')
+        assert bridge.rfid_read_succeeded_since(t0, addr=0x0700) is True
+        assert bridge.rfid_read_succeeded_since(t0, addr=0x1800) is False
+        # Bridge-wide (no addr) keeps its old, deliberately loose behaviour.
+        assert bridge.rfid_read_succeeded_since(t0) is True
+
+    def test_ht_read_is_credited_to_the_ht(self):
+        bridge, reactor, logger, _seen = _bridge()
+        bridge.reactor = reactor
+        t0 = reactor.monotonic()
+        bridge.handle_line(
+            '{"evt":"amsdbg","addr":6144,'
+            '"text":"[AMS_RFID] STEP3,save to flash ,card info valid"}')
+        assert bridge.rfid_read_succeeded_since(t0, addr=0x1800) is True
+        assert bridge.rfid_read_succeeded_since(t0, addr=0x0700) is False
+
+    def test_unattributed_narration_still_answers_for_any_address(self):
+        # Firmware that reports no address must not read as "this unit has
+        # gone silent" -- that is the mistake a dead counter already caused
+        # once.
+        bridge, reactor, logger, _seen = _bridge()
+        bridge.reactor = reactor
+        t0 = reactor.monotonic()
+        bridge.handle_line(
+            '{"evt":"amsdbg","text":"[AMS_DEV] STEP:read success,valid"}')
+        assert bridge.rfid_read_succeeded_since(t0, addr=0x1800) is True
+
+    def test_scan_echoes_are_not_unhandled_events(self):
+        from extras.AFC_BambuAMS_bridge import _BRIDGE_EVENTS_KNOWN
+        for evt in ("scan", "reid", "reread", "prime"):
+            assert evt in _BRIDGE_EVENTS_KNOWN
+
+
 class TestChamberTelemetryAttribution:
     """Chamber telemetry must reach only the unit that produced it.
 
@@ -2566,7 +3579,7 @@ class TestChamberTelemetryAttribution:
         ht = self._unit("HT", b, True, None, r)
         ams2 = self._unit("AMS2", b, False, None, r)
         self._wire([ht, ams2])
-        # This is the bug: AMS2 used to report the HT's chamber temperature.
+        # AMS2 must not report the HT's chamber temperature.
         assert ams2._owns_chamber_telemetry() is False
 
     def test_two_drying_units_share_a_bridge_so_neither_claims_it(self):
@@ -2670,7 +3683,7 @@ class TestChamberTelemetryByAddress:
         assert ht._chamber_record()["temp"] == 78.0
 
     def test_both_can_dry_at_once_without_crosstalk(self):
-        # The case that previously had to report nothing for either unit.
+        # Both drying at once: each unit reports its own chamber, not nothing.
         b = self._Bridge({0x0700: self._rec(41.0, 55.0),
                           0x1800: self._rec(78.0, 85.0)})
         ht = self._unit("HT", b, 0x1800)
@@ -2741,7 +3754,7 @@ class TestBridgeStoresByAddress:
 class TestDryingCatchUp:
     """The panel must catch up to a cycle it did not start.
 
-    `drying` is host state set by BAMBU_HEATER_START, so a Klipper restart
+    `drying` is host state set by AFC_BAMBU_HEATER_START, so a Klipper restart
     mid-cycle left the panel showing Idle beside a physically hot dryer --
     with the Start/Stop button offering Start. Chamber telemetry only streams
     WHILE a cycle runs, so its presence is direct evidence from the unit.
@@ -2889,7 +3902,7 @@ class TestDryingStopSticks:
         br = self._Bridge(by_addr={0x1800: self._rec(170.0)})
         u = self._unit(br, now=200.0, drying=True)
         gcmd = MagicMock()
-        afcBambuAMS.cmd_BAMBU_HEATER_STOP(u, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_STOP(u, gcmd)
         assert u._drying is False
         # Stamped forward by the grace period: an AMS keeps narrating for a
         # moment after being told to stop, and those lines must not re-adopt
@@ -2908,7 +3921,7 @@ class TestDryingStopSticks:
         gcmd.get_int.side_effect = lambda k, d=None, **kw: {
             "TEMP": 55, "TIME": 480, "ROTATE": 0,
             "AMSID": u.dry_ams_id, "ADDR": u.dry_dev_addr, "FORCE": 0}.get(k, d)
-        afcBambuAMS.cmd_BAMBU_HEATER_START(u, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(u, gcmd)
         assert u._drying is True
         assert u._dry_adopt_after == 200.0
         assert u._dry_seen_live is False
@@ -3256,15 +4269,21 @@ class TestAdoptMeasuredPath:
 
     def _u(self, measured, bowden=3000.0, unload=None):
         writes = []
-        return types.SimpleNamespace(
+        u = types.SimpleNamespace(
             name="AMS", logger=_Logger(),
             full_name=["AFC_BambuAMS", "AMS"],
             afc_bowden_length=bowden,
             afc_unload_bowden_length=bowden if unload is None else unload,
             measured_path_mm=lambda: measured,
+            # A unit whose only source is tube_len -- the chain must fall
+            # through the other two and still adopt.
+            _measure_path_from_odom=lambda: None,
+            _dw_len_mm=lambda: None,
             afc=types.SimpleNamespace(function=types.SimpleNamespace(
                 ConfigRewrite=lambda sec, key, val, msg="":
-                    writes.append((sec, key, val))))), writes
+                    writes.append((sec, key, val)))))
+        u._path_measurement = lambda: afcBambuAMS._path_measurement(u)
+        return u, writes
 
     def test_the_measurement_is_adopted(self):
         u, _w = self._u(2186.0)
@@ -3432,61 +4451,34 @@ class TestStartupRestoreSkipsADeadMotor:
 
 
 class TestReadyToFollow:
-    """Motor-state alone was too tight. G28 does not necessarily energise the
-    EXTRUDER -- measured on hardware: homed_axes "xyz" with the extruder
-    stepper still disabled -- so gating purely on the motor left the follower
-    disarmed on a machine that was plainly in use, and the AMS would not hold
-    buffer pressure. Homing alone would be too loose, since it stays true
-    forever after. Either-of-two leaves exactly one blocking case: unhomed AND
-    de-energised, which is what a cold restart looks like."""
+    """The gate is gone: a loaded tray is followed whenever the printer is on.
 
-    def _u(self, motor, homed):
-        return types.SimpleNamespace(
-            _extruder_motor_enabled=lambda lane=None: motor,
-            _toolhead_homed=lambda: homed)
+    It used to require the extruder motor to be energised. That is a
+    divergence from the printer we emulate -- a real Bambu streams the hold
+    continuously and never asks about steppers -- and it cost an evening:
+    idle timeout dropped the steppers, the gate stood the follower down, and
+    filament pulled by hand was never recovered.
+    """
 
-    def test_a_live_motor_qualifies_even_unhomed(self):
-        assert afcBambuAMS._ready_to_follow(self._u(True, False)) is True
+    def test_always_ready(self):
+        shim = types.SimpleNamespace()
+        assert afcBambuAMS._ready_to_follow(shim) is True
 
-    def test_a_homed_machine_qualifies_even_with_a_dead_motor(self):
-        # The case that motivated widening it: homed, extruder still disabled.
-        assert afcBambuAMS._ready_to_follow(self._u(False, True)) is True
+    def test_a_dead_extruder_motor_no_longer_blocks(self):
+        # The exact case that broke it live: homed, loaded, steppers dropped
+        # by idle timeout. The follower must still hold.
+        shim = types.SimpleNamespace(
+            _extruder_motor_enabled=lambda lane=None: False)
+        assert afcBambuAMS._ready_to_follow(shim, object()) is True
 
-    def test_both_qualifies(self):
-        assert afcBambuAMS._ready_to_follow(self._u(True, True)) is True
+class TestToolheadHomedIsGone:
+    """_toolhead_homed existed only as the second half of _ready_to_follow.
+    That half was removed after it armed the follower on a rebooted machine
+    that reported homed_axes "xyz" with every extruder disabled, so the helper
+    goes with it rather than lingering as an unused input."""
 
-    def test_only_a_cold_restart_blocks(self):
-        assert afcBambuAMS._ready_to_follow(self._u(False, False)) is False
-
-
-class TestToolheadHomed:
-    def _u(self, axes, th=True, raises=False):
-        def _lookup(name, default=None):
-            if raises:
-                raise RuntimeError("not ready")
-            return types.SimpleNamespace(
-                get_status=lambda t: {"homed_axes": axes}) if th else None
-        return types.SimpleNamespace(
-            printer=types.SimpleNamespace(lookup_object=_lookup),
-            reactor=types.SimpleNamespace(monotonic=lambda: 1.0))
-
-    def test_all_three_axes(self):
-        assert afcBambuAMS._toolhead_homed(self._u("xyz")) is True
-
-    def test_a_partial_home_does_not_count(self):
-        assert afcBambuAMS._toolhead_homed(self._u("xy")) is False
-
-    def test_nothing_homed(self):
-        assert afcBambuAMS._toolhead_homed(self._u("")) is False
-
-    def test_it_fails_open_with_no_toolhead(self):
-        assert afcBambuAMS._toolhead_homed(self._u("", th=False)) is True
-
-    def test_it_fails_open_when_the_lookup_raises(self):
-        assert afcBambuAMS._toolhead_homed(self._u("", raises=True)) is True
-
-
-
+    def test_the_helper_is_removed(self):
+        assert not hasattr(afcBambuAMS, "_toolhead_homed")
 
 class TestTheGateDoesNotBlockDockedTools:
     """Async loading into a DOCKED tool is planned, and a lane being loaded
@@ -3495,12 +4487,12 @@ class TestTheGateDoesNotBlockDockedTools:
     the active tool, which would have blocked that outright. Whether a tool is
     docked is not evidence about whether filament is moving."""
 
-    def test_a_homed_machine_arms_regardless_of_which_tool_is_active(self):
-        # No active-tool input exists any more: the decision is made from
-        # motor state and homing alone.
+    def test_a_live_motor_arms_regardless_of_which_tool_is_active(self):
+        # No active-tool input exists: the decision is made from motor state
+        # alone, so a lane whose tool is parked arms exactly like one on the
+        # shuttle.
         u = types.SimpleNamespace(
-            _extruder_motor_enabled=lambda lane=None: False,
-            _toolhead_homed=lambda: True)
+            _extruder_motor_enabled=lambda lane=None: True)
         docked_lane = types.SimpleNamespace(name="lane23", extruder="extruder4")
         assert afcBambuAMS._ready_to_follow(u, docked_lane) is True
 
@@ -3580,6 +4572,9 @@ class TestBambuTagFillsTheSpoolFields:
         return types.SimpleNamespace(
             name="AMS", logger=_Logger(),
             _slot_map={"lane15": 0},
+            _spoolman_sync=lambda lane, info: None,
+            _apply_remain_weight=lambda lane, info: None,
+            _save_lane_vars=lambda: None,
             lanes={})
 
     def _lane(self, **kw):
@@ -3632,12 +4627,14 @@ class TestBambuTagFillsTheSpoolFields:
         assert lane.material == "PETG"
         assert lane.sub_type == "HF Translucent"
 
-    def test_a_spoolman_linked_lane_is_left_alone(self):
-        # spool_id set means Spoolman is authoritative; the tag must not
-        # overwrite what the operator linked.
+    def test_a_spoolman_linked_lane_still_gets_the_tag(self):
+        # The bound lane is the one the delay was reported on. Its spool_id
+        # never stopped the tag being READ -- it stopped the tag being APPLIED.
         lane = self._lane(spool_id=42, material="PETG", sub_type="")
         self._apply(lane, {"material": "PLA Matte"})
-        assert lane.material == "PETG" and lane.spool_vendor is None
+        assert lane.material == "PLA" and lane.sub_type == "Matte"
+        assert lane.spool_vendor == "Bambu"
+        assert lane.spool_id == 42
 
 
 class TestSplitBambuMaterial:
@@ -3728,7 +4725,6 @@ class TestLoadTimeoutUsesTheMeasuredRate:
         assert old > 160 and new < 60
 
     def test_it_is_NOT_capped_like_the_move_watchdog(self):
-        # This test used to assert the opposite, and that was the regression.
         # The move watchdog bounds hearing about ONE move; this bounds the AMS
         # completing a load INCLUDING its own feed/stall/retract/retry cycles.
         # Clamped to 35 s the give-up sat below load_retry_timeout (40 s) on
@@ -3769,16 +4765,43 @@ class TestAnnounceSendsAreIndependent:
                 sent.append(obj)
         shim = types.SimpleNamespace(
             name="AMS", logger=_Logger(), _bridge=_B(), ams_index=0,
+            # The announce carries the unit's UID now, so the firmware can pin
+            # it to a chain index. None means "not configured", which is the
+            # ordinary case these tests cover.
+            unit_uid=None, _id_resolved=True,
             _send_ht_flag=lambda b: (_ for _ in ()).throw(RuntimeError("boom"))
             if fail == "ht" else sent.append({"cmd": "htunit"}),
-            _send_selfcentre_flag=lambda b: sent.append({"cmd": "selfc"}),
             _send_mc_addr=lambda b: sent.append({"cmd": "mcaddr"}))
         return shim, sent
 
-    def test_all_four_are_sent_normally(self):
+    def test_all_of_them_are_sent_normally(self):
         shim, sent = self._shim()
         afcBambuAMS._announce_unit(shim)
-        assert [o["cmd"] for o in sent] == ["units", "htunit", "selfc", "mcaddr"]
+        assert [o["cmd"] for o in sent] == ["units", "htunit",
+                                            "mcaddr", "armms"]
+
+    def test_the_arm_cadence_is_re_applied_on_every_announce(self):
+        # It is a firmware runtime override, so a Pico reboot drops it back to
+        # the built-in 520 ms. Re-sending it here is what makes it survive
+        # without a reflash.
+        shim, sent = self._shim()
+        afcBambuAMS._announce_unit(shim)
+        arm = [o for o in sent if o["cmd"] == "armms"]
+        assert arm and arm[0]["ms"] == int(afcBambuAMS_mod.FOLLOW_ARM_MS)
+
+    def test_the_cadence_is_far_slower_than_the_firmware_default(self):
+        # 520 ms is the firmware built-in. Measured: the follower held 5m33s
+        # with the arm effectively off, recovering every pull -- so this frame
+        # is not what sustains following, and at 12 units it was the largest
+        # unconditional per-cycle cost on the bus.
+        assert afcBambuAMS_mod.FOLLOW_ARM_MS >= 10000
+
+    def test_it_is_not_set_to_never(self):
+        # Effectively one-shot, but not literally never: the same loop is what
+        # arms a unit that comes online later and re-arms one that dropped and
+        # came back, so a backstop has to remain. Interim until the firmware
+        # can arm once and re-arm on a missing acknowledgement instead.
+        assert 0 < afcBambuAMS_mod.FOLLOW_ARM_MS <= 3600000
 
     def test_a_failing_ht_flag_does_not_skip_the_mc_address(self):
         # The exact regression: mcaddr is what keeps the log drain per-unit.
@@ -3864,53 +4887,53 @@ class TestModeCompletionWasRemoved:
         assert shim.afc.reactor.t > 0.0
 
 
-class TestAmsArrivalCompletesLoad:
-    """The unit knows it got there without our sensor -- an HT feeds to the end
-    of its measured PTFE and says so, a boxed AMS zeroes the tray odometer. The
-    toolhead sensor stays FIRST by AFC design; this is what makes a lane with
-    no sensor loadable at all, and what turns a failed sensor into a completion
-    instead of a silent timeout."""
+class TestOnlyTheToolheadSignalCompletesALoad:
+    """The load loop kicks until the toolhead signal says filament arrived, and
+    nothing else ends it early.
 
-    def test_the_sensor_still_wins_when_both_would_fire(self):
-        # Measured on both units once calibrated: the sensor triggers 1-2 s
-        # ahead, so on a sensored lane this path must never be the one used.
-        shim, calls, _ = _load_shim(sensor_after=1, arrivals=[(9, True)] * 20)
-        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 5.0) is True
-        assert not any("own arrival" in m for _l, m in shim.logger.messages)
+    A fallback to the AMS's own arrival report was added and removed. It was
+    asked for so a lane with no toolhead sensor could still load -- but that
+    lane does not exist: tool_start is always either a real PIN or "buffer",
+    and both are authorities. So the branch was unreachable while looking like
+    a safety net.
 
-    def test_arrival_completes_when_the_sensor_never_triggers(self):
-        shim, calls, _ = _load_shim(sensor_after=10 ** 9,
-                                    arrivals=[(0, False), (9, True)])
-        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 5.0) is True
-        assert any("own arrival" in m for _l, m in shim.logger.messages)
-        assert calls["stop"] == 1               # never left it feeding
+    Before it was gated on the sensor it DID fire, and reported a load
+    complete with no filament at the toolhead: the AMS said
+    "feed finish, dw_len:3.532 m" -- it had reached the end of ITS OWN measured
+    tube -- while the filament was stuck in the PTFE. Relieving the friction by
+    hand let it feed through and trip the sensor during the next purge. The
+    kicks at the end of the path are what seat it, and stopping early removed
+    them."""
 
-    def test_a_stalled_short_arrival_does_NOT_complete(self):
-        # ok=False is the bridge's distance judgement: it stopped, but short.
-        # Accepting that would report a load that is stuck mid-bowden.
-        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=0.3,
-                                    arrivals=[(9, False)] * 20)
-        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 0.3) is False
+    def _lane(self):
+        return types.SimpleNamespace(
+            name="lane19",
+            extruder_obj=types.SimpleNamespace(tool_start="PA7"))
 
-    def test_a_stale_completion_is_not_this_move(self):
-        # Sequence unchanged from the one captured before the feed: that is
-        # the PREVIOUS move's completion still sitting there.
-        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=0.3,
-                                    arrivals=[(0, True)] * 20)
-        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 0.3) is False
+    def test_the_sensor_completes_a_load(self):
+        shim, calls, _ = _load_shim(sensor_after=2)
+        assert afcBambuAMS._feed_until_sensor(shim, self._lane(), 5.0) is True
+        assert calls["stop"] == 1
 
-    def test_it_can_be_turned_off(self):
-        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=0.3,
-                                    ams_arrival=False,
-                                    arrivals=[(9, True)] * 20)
-        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 0.3) is False
+    def test_an_untripped_sensor_fails_however_the_ams_reports(self):
+        # An untripped sensor is a NEGATIVE signal, not a missing one.
+        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=0.4,
+                                    arrivals=[(9, True)] * 40)
+        assert afcBambuAMS._feed_until_sensor(
+            shim, self._lane(), 0.4) is False
 
-    def test_the_kick_count_is_reported_with_the_arrival(self):
-        shim, calls, _ = _load_shim(sensor_after=10 ** 9,
-                                    arrivals=[(0, False)] * 6 + [(9, True)])
-        afcBambuAMS._feed_until_sensor(shim, _LANE, 5.0)
-        assert any("feed kick(s)" in m for _l, m in shim.logger.messages)
+    def test_it_keeps_kicking_until_the_sensor_trips(self):
+        shim, calls, _ = _load_shim(sensor_after=6, timeout=5.0,
+                                    arrivals=[(9, True)] * 40)
+        shim.load_retry_interval = 0.0
+        assert afcBambuAMS._feed_until_sensor(shim, self._lane(), 5.0) is True
+        assert len(calls["feed"]) >= 2
 
+    def test_the_arrival_config_option_is_gone(self):
+        # Removed rather than defaulted off: an option that cannot change
+        # behaviour is worse than no option.
+        assert not hasattr(afcBambuAMS, "_has_toolhead_sensor")
+        assert not hasattr(afcBambuAMS, "_finish_since")
 
 class TestDryPreCheckIsHtOnly:
     """An AMS HT will not heat with filament out of its bay -- confirmed on
@@ -3972,7 +4995,7 @@ class TestDryPreCheckGatesOnToolLoadedOnly:
     def _run(self, dev_addr, lane):
         shim, sent, _ = _heater_shim({"a": lane}, dev_addr=dev_addr)
         gcmd = _HeaterGcmd({"TEMP": 55, "TIME": 480, "ROTATE": 0})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         return sent, gcmd.info
 
     def test_a_toolhead_loaded_lane_warns(self):
@@ -4010,6 +5033,2142 @@ class TestDryPreCheckGatesOnToolLoadedOnly:
         lane = self._lane("a"); lane.loaded_to_hub = True
         shim, sent, _ = _heater_shim({"a": lane}, dev_addr=0x1800)
         gcmd = _HeaterGcmd({"TEMP": 55, "TIME": 480, "ROTATE": 1})
-        afcBambuAMS.cmd_BAMBU_HEATER_START(shim, gcmd)
+        afcBambuAMS.cmd_AFC_BAMBU_HEATER_START(shim, gcmd)
         assert sent[0]["rotate"] == 0
         assert any("ROTATE disabled" in m for m in gcmd.info)
+
+
+class TestFaultHoldCannotLatchForever:
+    """The hold suppresses the follower auto-arm after a stall, and releases
+    when the operator resumes -- which is them saying the jam is cleared.
+
+    Outside a print there is no pause and therefore no resume, so waiting for
+    one latched the follower off for the life of the object. Seen on hardware
+    as a follower that "stopped working" with no way back short of
+    AFC_BAMBU_FOLLOWER ENABLE=1 or a fresh load, and easily mistaken for state
+    surviving a restart -- it is not saved anywhere, it was simply being re-set
+    each time the follower armed into de-energised gears and stalled again."""
+
+    def _u(self, paused=False, printing=False, saw_pause=False):
+        return types.SimpleNamespace(
+            name="BambuAMS_1", logger=_Logger(),
+            _follow_fault_hold=True,
+            _follow_fault_saw_pause=saw_pause,
+            afc=types.SimpleNamespace(function=types.SimpleNamespace(
+                is_paused=lambda: paused, in_print=lambda: printing)))
+
+    def test_no_hold_set_is_not_active(self):
+        u = self._u()
+        u._follow_fault_hold = False
+        assert afcBambuAMS._fault_hold_active(u) is False
+
+    def test_a_fault_while_idle_releases_instead_of_latching(self):
+        # THE bug: not printing, so no pause can ever arrive.
+        u = self._u(paused=False, printing=False)
+        assert afcBambuAMS._fault_hold_active(u) is False
+        assert u._follow_fault_hold is False
+
+    def test_a_fault_mid_print_still_waits_for_the_pause(self):
+        # Unchanged where the original reasoning holds: AFC_error queues the
+        # pause, so releasing before it lands would re-arm into the jam.
+        u = self._u(paused=False, printing=True)
+        assert afcBambuAMS._fault_hold_active(u) is True
+        assert u._follow_fault_hold is True
+
+    def test_while_paused_it_holds_and_remembers(self):
+        u = self._u(paused=True, printing=True)
+        assert afcBambuAMS._fault_hold_active(u) is True
+        assert u._follow_fault_saw_pause is True
+
+    def test_resume_after_a_seen_pause_releases(self):
+        u = self._u(paused=False, printing=True, saw_pause=True)
+        assert afcBambuAMS._fault_hold_active(u) is False
+        assert u._follow_fault_hold is False
+
+    def test_an_unknown_print_state_keeps_holding(self):
+        # Fail safe: if we cannot tell whether a print is running, the held
+        # behaviour is the conservative one.
+        def boom():
+            raise RuntimeError("no such object")
+        u = self._u()
+        u.afc.function.in_print = boom
+        assert afcBambuAMS._fault_hold_active(u) is True
+
+    def test_the_release_says_which_case_it_was(self):
+        u = self._u(paused=False, printing=False)
+        afcBambuAMS._fault_hold_active(u)
+        assert any("no print to resume" in m for _l, m in u.logger.messages)
+
+
+class TestTheFollowerIsNotPerModel:
+    """
+    Every unit is held the same way -- op-04 07/7F at 148 ms, the cadence a
+    real printer uses -- with no buffer deadband to tune.
+
+    There is no per-model distinction to configure: measured on a three-unit
+    bus, a regular AMS sits at 0.56-0.59 on the virtual FPS, indistinguishable
+    from an HT.
+
+    Guards against self_centres / follow_always returning as config reads, and
+    against the announce sending a {"cmd":"selfc"} the firmware has no reader
+    for.
+    """
+
+    def test_the_options_are_gone_from_the_module(self):
+        import inspect
+        from extras import AFC_BambuAMS as m
+        src = inspect.getsource(m)
+        for dead in ('config.getboolean("self_centres"',
+                     'config.getboolean("follow_always"',
+                     "_send_selfcentre_flag"):
+            assert dead not in src, f"{dead} is still read"
+
+    def test_the_announce_no_longer_sends_selfc(self):
+        from extras.AFC_BambuAMS_bridge import _BRIDGE_EVENTS_KNOWN
+        assert "selfc" not in _BRIDGE_EVENTS_KNOWN
+
+class TestPathAdoptionNeedsOnlyOneLoad:
+    """The unit narrates tube_len at the END of a load, so an adoption that
+    only runs at the START can never see the load it is part of -- it adopts
+    the PREVIOUS one. That made it need two loads in a single Klipper session,
+    and the measurement lives only in the bridge's memory, so a restart in
+    between reset it.
+
+    Observed: an AMS 2 reported tube_len:3532 mm on two consecutive loads and
+    stayed on the 3000 mm default, because a deploy landed between them."""
+
+    def _shim(self, measured, bowden=3000.0):
+        writes = []
+        shim = types.SimpleNamespace(
+            name="BambuAMS_2", logger=_Logger(),
+            afc_bowden_length=bowden, afc_unload_bowden_length=bowden,
+            full_name=("AFC_BambuAMS", "BambuAMS_2"),
+            measured_path_mm=lambda: measured,
+            _measure_path_from_odom=lambda: None,
+            _dw_len_mm=lambda: None,
+            afc=types.SimpleNamespace(function=types.SimpleNamespace(
+                ConfigRewrite=lambda sec, key, val, msg=None:
+                    writes.append((key, val)))))
+        shim._path_measurement = lambda: afcBambuAMS._path_measurement(shim)
+        return shim, writes
+
+    def test_a_fresh_measurement_is_adopted(self):
+        shim, writes = self._shim(3532.0)
+        afcBambuAMS._adopt_measured_path(shim)
+        assert ("afc_bowden_length", 3532.0) in writes
+        assert shim.afc_bowden_length == 3532.0
+
+    def test_no_measurement_yet_writes_nothing(self):
+        # What the start-of-load call sees on a fresh Klipper session.
+        shim, writes = self._shim(None)
+        afcBambuAMS._adopt_measured_path(shim)
+        assert writes == []
+        assert shim.afc_bowden_length == 3000.0
+
+    def test_it_is_safe_to_call_twice(self):
+        # It now runs at both ends of a load; the second must be a no-op.
+        shim, writes = self._shim(3532.0)
+        afcBambuAMS._adopt_measured_path(shim)
+        afcBambuAMS._adopt_measured_path(shim)
+        assert len(writes) == 2          # bowden + unload bowden, once each
+
+    def test_a_figure_within_tolerance_does_not_rewrite(self):
+        # The unit's measurement moves a few mm between calibrations.
+        shim, writes = self._shim(3005.0, bowden=3000.0)
+        afcBambuAMS._adopt_measured_path(shim)
+        assert writes == []
+
+    def test_the_unload_length_follows_when_it_was_defaulted(self):
+        shim, writes = self._shim(3532.0)
+        afcBambuAMS._adopt_measured_path(shim)
+        assert shim.afc_unload_bowden_length == 3532.0
+
+
+class TestBufferChipIsPerBusMaster:
+    """The virtual buffer ADC is one chip per BUS MASTER, not per printer.
+
+    Units on a Pico share one buffer and one extruder, so they share the chip.
+    A second Pico is a second buffer feeding a second extruder and must read
+    its own -- registering a single printer-wide chip gave every
+    `bambu_buffer:` pin whichever unit initialised first, which under
+    `tool_start: buffer` is the toolhead authority reading the wrong bus."""
+
+    def _printer(self):
+        chips = {}
+        pins = types.SimpleNamespace(
+            register_chip=lambda name, chip: chips.setdefault(name, chip))
+        return types.SimpleNamespace(
+            lookup_object=lambda n, d=None: pins,
+            register_event_handler=lambda *a: None,
+            config_error=RuntimeError), chips
+
+    def _unit(self, printer, name, buff=0.5):
+        return types.SimpleNamespace(
+            printer=printer, buffer_chip_name=name,
+            fps_buffer_value=lambda: buff)
+
+    def test_units_sharing_a_master_share_one_chip(self):
+        pr, chips = self._printer()
+        a = self._unit(pr, "bambu_buffer")
+        b = self._unit(pr, "bambu_buffer")
+        afcBambuAMS_mod._register_bambu_buffer_chip(a)
+        afcBambuAMS_mod._register_bambu_buffer_chip(b)
+        assert list(chips) == ["bambu_buffer"]
+        assert len(pr._bambu_buffer_chips) == 1
+
+    def test_a_second_master_gets_its_own_chip(self):
+        pr, chips = self._printer()
+        afcBambuAMS_mod._register_bambu_buffer_chip(
+            self._unit(pr, "bambu_buffer", buff=0.2))
+        afcBambuAMS_mod._register_bambu_buffer_chip(
+            self._unit(pr, "bambu_buffer_2", buff=0.8))
+        assert sorted(chips) == ["bambu_buffer", "bambu_buffer_2"]
+
+    def test_each_chip_reads_its_own_unit(self):
+        # The failure this prevents: a second bus reporting the first's value.
+        pr, chips = self._printer()
+        afcBambuAMS_mod._register_bambu_buffer_chip(
+            self._unit(pr, "bambu_buffer", buff=0.2))
+        afcBambuAMS_mod._register_bambu_buffer_chip(
+            self._unit(pr, "bambu_buffer_2", buff=0.8))
+        assert chips["bambu_buffer"]._unit.fps_buffer_value() == 0.2
+        assert chips["bambu_buffer_2"]._unit.fps_buffer_value() == 0.8
+
+    def test_the_default_name_is_unchanged(self):
+        # Existing configs say `adc_pin: bambu_buffer:fps` and must keep working.
+        assert afcBambuAMS_mod._BUFFER_CHIP_NAME == "bambu_buffer"
+
+
+class TestFollowArmAcked:
+    """
+    The per-unit receipt for the follower arm.
+
+    The arm frame is never answered, so the bridge infers acknowledgement from
+    the unit narrating ``state:4`` and reports it as an ``armack`` bitmask. The
+    thing worth testing on the host side is that we read OUR bit and that we do
+    not turn "the firmware never said" into "not acknowledged" -- a silent arm
+    and an old firmware look identical once both collapse to False.
+    """
+
+    def _unit(self, index):
+        return types.SimpleNamespace(
+            ams_index=index,
+            _follow_arm_acked=afcBambuAMS_mod.afcBambuAMS._follow_arm_acked)
+
+    def _acked(self, index, latest):
+        u = self._unit(index)
+        return u._follow_arm_acked(u, latest)
+
+    def test_reads_this_units_bit(self):
+        assert self._acked(0, {"armack": 0b0001}) is True
+        assert self._acked(1, {"armack": 0b0001}) is False
+        assert self._acked(1, {"armack": 0b0010}) is True
+        assert self._acked(2, {"armack": 0b0110}) is True
+
+    def test_unknown_when_the_firmware_does_not_report(self):
+        # Not False: an arm that never lands and a firmware that cannot say so
+        # are different problems, and only one of them is a bug to chase.
+        assert self._acked(0, {}) is None
+        assert self._acked(0, {"armack": None}) is None
+        assert self._acked(0, {"armack": "3"}) is None
+
+    def test_unknown_with_no_status_frame(self):
+        assert self._acked(0, None) is None
+        assert self._acked(0, {}) is None
+
+
+class TestMeasureOnInsertToggle:
+    """measure_on_insert is pushed to the FIRMWARE, not branched on here.
+
+    cap_open() is the single door into the measurement window for every unit
+    type: a boxed unit reaches it from bb_do_capscan_ex, an AMS HT from
+    ht_scan_arm() on the insert edge -- where the module is not involved at
+    all. Gating in the module would therefore cover boxed units only, which is
+    exactly the bug this replaced.
+    """
+
+    def _unit(self, measure):
+        sent = []
+        u = types.SimpleNamespace(
+            name="u", ams_index=2, measure_on_insert=measure,
+            ht_0f_hold=False, has_heater=False, dry_dev_addr=0x0700,
+            _is_ht=lambda: False,
+        )
+        return u, types.SimpleNamespace(send=lambda o: sent.append(o)), sent
+
+    def test_on_pushes_capen_1(self):
+        u, bridge, sent = self._unit(True)
+        afcBambuAMS._send_ht_flag(u, bridge)
+        assert {"cmd": "capen", "unit": 2, "on": 1} in sent
+
+    def test_off_pushes_capen_0(self):
+        u, bridge, sent = self._unit(False)
+        afcBambuAMS._send_ht_flag(u, bridge)
+        assert {"cmd": "capen", "unit": 2, "on": 0} in sent
+
+    def test_an_ht_gets_the_flag_too(self):
+        """The whole point: an HT is gated the same way as a boxed unit."""
+        u, bridge, sent = self._unit(False)
+        u._is_ht = lambda: True
+        u.has_heater, u.dry_dev_addr = True, 0x1800
+        afcBambuAMS._send_ht_flag(u, bridge)
+        assert {"cmd": "capen", "unit": 2, "on": 0} in sent
+
+    def test_default_is_on(self):
+        u, bridge, sent = self._unit(True)
+        del u.measure_on_insert          # an object predating the option
+        afcBambuAMS._send_ht_flag(u, bridge)
+        assert {"cmd": "capen", "unit": 2, "on": 1} in sent
+
+
+class TestUnitStateFaultDetector:
+    """op-04 reply byte[19] is the one fault signal every unit sends.
+
+    Measured 2026-08-05 by stuck-spooling each unit alone on the wire: all
+    three set it to 0x07, and on the two that also narrate it reads 0x07 at
+    exactly the moment they print "state:7". An AMS 1 sets it while emitting no
+    fault text at all -- so narration alone leaves that unit undetected.
+    """
+
+    def _unit(self, ustate, idx=1):
+        raised = []
+        units = [{"n": 0, "ustate": 4}]
+        if ustate is not None:
+            units.append({"n": idx, "ustate": ustate})
+        u = types.SimpleNamespace(
+            name="u", ams_index=idx, fault_detect=True,
+            _unload_in_progress=False, _drying=False, _stalled_seen=False,
+            _bridge=types.SimpleNamespace(latest_status=lambda: {"units": units}),
+            afc=types.SimpleNamespace(
+                function=types.SimpleNamespace(in_print=lambda: False)),
+            _raise_ams_fault=lambda lane, msg: raised.append(msg),
+        )
+        u._unit_state = afcBambuAMS._unit_state.__get__(u)
+        u.AMS_STATE_STALLED = afcBambuAMS.AMS_STATE_STALLED
+        return u, raised
+
+    def _run(self, u):
+        return afcBambuAMS._check_unit_stalled(u, types.SimpleNamespace(name="lane1"))
+
+    def test_stalled_state_raises(self):
+        u, raised = self._unit(0x07)
+        assert self._run(u) is True
+        assert "STALLED" in raised[0] and "lane1" in raised[0]
+
+    def test_healthy_state_does_not(self):
+        u, raised = self._unit(0x04)
+        assert self._run(u) is False and raised == []
+
+    def test_transitional_states_do_not(self):
+        """02/00 churn while the printer retries -- not a fault."""
+        for st in (0x00, 0x02, 0x03):
+            u, raised = self._unit(st)
+            assert self._run(u) is False, st
+            assert raised == []
+
+    def test_not_heard_from_is_not_healthy_and_is_not_a_fault(self):
+        """255 means the firmware has committed no state. Judge nothing."""
+        u, raised = self._unit(0xFF)
+        assert self._run(u) is False and raised == []
+        assert u._unit_state(u._bridge.latest_status()) is None
+
+    def test_only_this_units_state_is_read(self):
+        """Unit 0 stalling must not fault unit 1."""
+        u, raised = self._unit(0x04, idx=1)
+        u._bridge.latest_status = lambda: {
+            "units": [{"n": 0, "ustate": 0x07}, {"n": 1, "ustate": 0x04}]}
+        assert self._run(u) is False and raised == []
+
+    def test_one_fault_per_stall_not_one_per_tick(self):
+        u, raised = self._unit(0x07)
+        self._run(u); self._run(u); self._run(u)
+        assert len(raised) == 1
+
+    def test_it_rearms_after_recovery(self):
+        u, raised = self._unit(0x07)
+        assert self._run(u) is True
+        u._bridge.latest_status = lambda: {"units": [{"n": 1, "ustate": 0x04}]}
+        assert self._run(u) is False          # clears the latch
+        u._bridge.latest_status = lambda: {"units": [{"n": 1, "ustate": 0x07}]}
+        assert self._run(u) is True           # a NEW stall reports again
+        assert len(raised) == 2
+
+    def test_stands_down_during_unload_and_drying(self):
+        for attr in ("_unload_in_progress", "_drying"):
+            u, raised = self._unit(0x07)
+            setattr(u, attr, True)
+            assert self._run(u) is False, attr
+            assert raised == []
+
+    def test_respects_fault_detect_off(self):
+        u, raised = self._unit(0x07)
+        u.fault_detect = False
+        assert self._run(u) is False and raised == []
+
+
+class TestHTInsertMarksThePendingSlot:
+    """An HT insert must mark the slot, or its measurement is discarded.
+
+    The HT's scan AND capacity window are both armed in firmware on the insert
+    edge (ht_scan_arm -> cap_open), so the module sends nothing -- and it was
+    therefore never setting _cap_pending_slot, which the entire apply path is
+    gated on. Observed live: the unit reported "odom C:0.522,R:0.083,P:102%"
+    and "Calibration rst:0" while the lane never changed.
+    """
+
+    def _unit(self, is_ht):
+        u = types.SimpleNamespace(
+            name="u", _is_ht=lambda: is_ht,
+            _cap_pending_slot=None, _cap_pending_t0=0.0,
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: 123.0)),
+            logger=types.SimpleNamespace(debug=lambda *a, **k: None),
+        )
+        return u
+
+    def test_ht_insert_marks_the_slot(self):
+        u = self._unit(True)
+        _ht_insert_branch(u, 0)
+        assert u._cap_pending_slot == 0
+        assert u._cap_pending_t0 == 123.0
+
+    def test_a_bad_clock_does_not_break_the_marker(self):
+        u = self._unit(True)
+        u.afc.reactor.monotonic = lambda: (_ for _ in ()).throw(RuntimeError())
+        _ht_insert_branch(u, 0)
+        assert u._cap_pending_slot == 0      # still marked
+        assert u._cap_pending_t0 == 0.0
+
+
+def _ht_insert_branch(unit, slot):
+    """The HT half of the insert edge, lifted from _start_tag_scan."""
+    if unit._is_ht():
+        unit._cap_pending_slot = slot
+        try:
+            unit._cap_pending_t0 = unit.afc.reactor.monotonic()
+        except Exception:
+            unit._cap_pending_t0 = 0.0
+        unit.logger.debug("ht")
+
+
+class TestChainResolveIsQuietUntilItIsStuck:
+    """Holding registrations until the UID resolves is CORRECT, not an error.
+
+    It happens at every boot -- the chain map has not arrived yet -- and the
+    hold is the entire point of resolving by UID rather than filing
+    registrations against the config default. Warning about it every start
+    trains the operator to ignore the log. What deserves a warning is a UID
+    that NEVER resolves, because then the unit is not on the bus at all and
+    its registrations were never sent.
+    """
+
+    def _unit(self, deferred=True, resolved=False, t0=100.0):
+        warns, debugs = [], []
+        u = types.SimpleNamespace(
+            name="u", unit_uid="A9CD393238310D0030383131",
+            _announce_deferred=deferred, _id_resolved=resolved,
+            _announce_defer_t0=t0, _announce_defer_warned=False,
+            CHAIN_RESOLVE_WARN_S=afcBambuAMS.CHAIN_RESOLVE_WARN_S,
+            logger=types.SimpleNamespace(
+                warning=lambda m: warns.append(m),
+                debug=lambda *a, **k: debugs.append(a)),
+        )
+        return u, warns
+
+    def _run(self, u, now):
+        afcBambuAMS._check_chain_resolve(u, now)
+
+    def test_silent_while_it_is_still_early(self):
+        u, warns = self._unit()
+        self._run(u, 100.5)          # half a second in
+        self._run(u, 120.0)          # 20s in
+        assert warns == []
+
+    def test_warns_once_when_genuinely_stuck(self):
+        u, warns = self._unit()
+        self._run(u, 131.0)
+        assert len(warns) == 1 and "not answering the bus" in warns[0]
+        self._run(u, 200.0)          # and never again
+        self._run(u, 999.0)
+        assert len(warns) == 1
+
+    def test_silent_once_resolved(self):
+        u, warns = self._unit(deferred=False, resolved=True)
+        self._run(u, 999.0)
+        assert warns == []
+
+    def test_silent_with_no_hold_recorded(self):
+        """No start time means nothing to measure against -- judge nothing."""
+        u, warns = self._unit(t0=0.0)
+        self._run(u, 999.0)
+        assert warns == []
+
+
+class TestScanDoesNotRetriggerItself:
+    """A scan moves filament off the bay switch -- that is not a removal.
+
+    Observed live on an AMS 2 bay 3: scan -> filament retracts past the switch
+    -> "spool REMOVED" -> filament returns -> "spool INSERTED" -> scan again,
+    repeating every ~30s indefinitely. The scan was causing the edge that
+    started the next scan.
+    """
+
+    def _unit(self, started=None, now=100.0):
+        logs = []
+        u = types.SimpleNamespace(
+            name="u", SCAN_FALLBACK_CAP=afcBambuAMS.SCAN_FALLBACK_CAP,
+            _scan_t0=[None]*4, _scan_motion_t0=[started, None, None, None],
+            # THE REAL CLASS CONSTANTS, not stand-ins. Hardcoding them here is
+            # what let SCAN_MOTION_QUIET_S be referenced by _scan_in_flight and
+            # never defined on the class: the shim supplied it, the tests
+            # passed, and on hardware every status frame for a unit whose scan
+            # outlived its narration died on an AttributeError inside
+            # _sync_lanes -- no slot data, no lane sync, for the whole unit.
+            SCAN_MOTION_QUIET_S=afcBambuAMS.SCAN_MOTION_QUIET_S,
+            _prev_present=[True, False, False, False],
+            unit_slots=4, _scan_primed=True, _auto_scanned=[False]*4,
+            _scan_notag=[False]*4,
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: now)),
+            logger=types.SimpleNamespace(info=lambda m: logs.append(m),
+                                         debug=lambda *a, **k: None),
+            # the removal path touches these
+            _lane_for_slot=lambda s: None,
+            _clear_lane_filament=lambda ln: None,
+            _measured_remain={}, _scan_defer=[False]*4,
+            _release_scan_hold=lambda s: None,
+            _bridge=types.SimpleNamespace(last_scan_end=lambda: None),
+        )
+        u._scan_in_flight = afcBambuAMS._scan_in_flight.__get__(u)
+        return u, logs
+
+    def test_mid_scan_presence_drop_is_not_a_removal(self):
+        u, logs = self._unit(started=90.0, now=100.0)      # 10s into a scan
+        assert u._scan_in_flight(0) is True
+        afcBambuAMS._maybe_auto_scan(u, 0, False, {})
+        assert logs == [], "a scan's own retract must not log a removal"
+        assert u._prev_present[0] is False                 # still tracked
+
+    def test_the_window_expires_so_a_real_removal_still_lands(self):
+        u, logs = self._unit(started=1.0, now=200.0)       # 199s -- long over
+        assert u._scan_in_flight(0) is False
+        afcBambuAMS._maybe_auto_scan(u, 0, False, {})
+        assert any("REMOVED" in m for m in logs)
+
+    def test_no_scan_running_behaves_normally(self):
+        u, logs = self._unit(started=None)
+        assert u._scan_in_flight(0) is False
+        afcBambuAMS._maybe_auto_scan(u, 0, False, {})
+        assert any("REMOVED" in m for m in logs)
+
+    def test_other_slots_are_unaffected_by_this_slots_scan(self):
+        u, logs = self._unit(started=90.0, now=100.0)
+        assert u._scan_in_flight(1) is False    # only slot 0 is scanning
+        u._prev_present[1] = True
+        afcBambuAMS._maybe_auto_scan(u, 1, False, {})
+        assert any("REMOVED" in m and "slot 1" in m for m in logs)
+
+    def test_a_successful_read_does_not_end_the_motion_guard(self):
+        """The bug this replaced.
+
+        _release_scan_hold clears _scan_t0 the moment the tag reads -- which is
+        BEFORE the unit retracts the filament. Hanging the guard on that
+        timestamp left the retract unguarded, so the scan's own pull-back read
+        as a removal and started the next scan.
+        """
+        u, logs = self._unit(started=90.0, now=100.0)
+        u._scan_t0[0] = None                    # read succeeded, hold released
+        assert u._scan_in_flight(0) is True, "motion guard must outlive the read"
+        afcBambuAMS._maybe_auto_scan(u, 0, False, {})
+        assert logs == []
+
+    def test_the_units_own_end_marker_releases_the_guard(self):
+        """The unit announces its cycle end -- that ends the guard, not a timer.
+
+        "Calibration rst:0" (HT), "odom calib success exit 0" (AMS 1),
+        "STEP7:cali end" (AMS 2). Waiting for the announcement is exact; a
+        timer is wrong short (the scan retriggers itself) or wrong long (a real
+        removal goes unnoticed).
+        """
+        u, logs = self._unit(started=90.0, now=100.0)
+        assert u._scan_in_flight(0) is True          # mid-cycle, still guarding
+        u._bridge.last_scan_end = lambda: 95.0       # unit says it finished
+        assert u._scan_in_flight(0) is False
+        afcBambuAMS._maybe_auto_scan(u, 0, False, {})
+        assert any("REMOVED" in m for m in logs), "a real removal must land now"
+
+    def test_an_end_from_BEFORE_this_scan_does_not_release_it(self):
+        """A previous cycle's end must not end the current one."""
+        u, logs = self._unit(started=90.0, now=100.0)
+        u._bridge.last_scan_end = lambda: 50.0       # older than this scan
+        assert u._scan_in_flight(0) is True
+
+    def test_a_broken_clock_does_not_wedge_it(self):
+        u, logs = self._unit(started=90.0)
+        u.afc.reactor.monotonic = lambda: (_ for _ in ()).throw(RuntimeError())
+        assert u._scan_in_flight(0) is False    # fail open, edges keep working
+
+
+class TestSlotsWaitForIdentity:
+    """A unit must not apply slot data before it knows which slots are its own.
+
+    With unit_uid configured, ams_index is the config default (0) until the
+    chain map resolves the UID. Every unit on the bus therefore matches unit
+    0's slots. Observed live: one HT tag applied to lane15, lane19 and lane23
+    in the same instant, because all three units were still at index 0.
+    """
+
+    def _unit(self, uid, resolved, idx=0):
+        applied = []
+        u = types.SimpleNamespace(
+            name="u", unit_uid=uid, _id_resolved=resolved, ams_index=idx,
+            SLOTS_PER_UNIT=4, _slots=[None]*4,
+            _sync_lanes=lambda: applied.append("synced"),
+            _status_err_last=None,
+            logger=types.SimpleNamespace(warning=lambda m: None,
+                                         debug=lambda m: None),
+        )
+        return u, applied
+
+    FRAME = {"slots": [{"unit": 0, "i": 0, "material": "PLA"}]}
+
+    def test_unresolved_uid_applies_nothing(self):
+        u, applied = self._unit("A9CD39", resolved=False)
+        afcBambuAMS._on_status(u, self.FRAME)
+        assert applied == [], "must not adopt another unit's slots"
+
+    def test_resolved_uid_applies_normally(self):
+        u, applied = self._unit("A9CD39", resolved=True)
+        afcBambuAMS._on_status(u, self.FRAME)
+        assert applied == ["synced"]
+
+    def test_no_uid_configured_is_unaffected(self):
+        """Without unit_uid the index is authoritative from the start."""
+        u, applied = self._unit(None, resolved=False)
+        afcBambuAMS._on_status(u, self.FRAME)
+        assert applied == ["synced"]
+
+
+class TestEmptyBaysDoNotKeepFilament:
+    """A bay the unit reports EMPTY must not leave data on its lane.
+
+    Two ways it used to survive, both seen live:
+      - restored from saved vars at boot, with no insert/removal edge to fix it
+        (AMS 1 bays 2 and 4 showed filament, one bound to spool 130)
+      - a Spoolman-linked lane was skipped on removal as "authoritative", so it
+        kept claiming filament AND blocked the next real tag from applying
+        (lane23 showed another unit's colour while bound to spool 124)
+    """
+
+    def _unit(self, slots, lanes):
+        cleared, unbound, logs = [], [], []
+        u = types.SimpleNamespace(
+            name="u", unit_slots=4, SLOTS_PER_UNIT=4,
+            _prev_present=[False]*4, _slots=slots,
+            _lane_for_slot=lambda s: lanes.get(s),
+            _clear_lane_filament=lambda ln: cleared.append(ln.name),
+            logger=types.SimpleNamespace(info=lambda m: logs.append(m),
+                                         debug=lambda *a, **k: None),
+        )
+        u._unbind_spool = afcBambuAMS._unbind_spool.__get__(u)
+        u._reconcile_empty_bays = afcBambuAMS._reconcile_empty_bays.__get__(u)
+        return u, cleared, logs
+
+    def _lane(self, name, material=None, spool=None):
+        return types.SimpleNamespace(name=name, material=material,
+                                     spool_id=spool)
+
+    def test_empty_bay_with_stale_material_is_cleared(self):
+        lanes = {1: self._lane("lane16", material="PLA")}
+        u, cleared, _ = self._unit([None]*4, lanes)
+        u._reconcile_empty_bays()
+        assert cleared == ["lane16"]
+
+    def test_empty_bay_still_bound_to_spoolman_is_unbound(self):
+        lanes = {3: self._lane("lane18", material="PLA", spool=130)}
+        u, cleared, _ = self._unit([None]*4, lanes)
+        u._reconcile_empty_bays()
+        assert cleared == ["lane18"]
+        assert lanes[3].spool_id == ''
+
+    def test_a_present_bay_is_left_alone(self):
+        slots = [{"present": True}, None, None, None]
+        lanes = {0: self._lane("lane15", material="PLA", spool=124)}
+        u, cleared, _ = self._unit(slots, lanes)
+        u._reconcile_empty_bays()
+        assert cleared == [] and lanes[0].spool_id == 124
+
+    def test_an_already_clean_empty_bay_says_nothing(self):
+        lanes = {2: self._lane("lane17")}
+        u, cleared, logs = self._unit([None]*4, lanes)
+        u._reconcile_empty_bays()
+        assert cleared == [] and logs == []
+
+    def test_unbind_is_a_noop_when_there_is_no_binding(self):
+        lane = self._lane("lane17")
+        u, _, _ = self._unit([None]*4, {})
+        u._unbind_spool(lane)
+        assert lane.spool_id is None      # untouched, not blanked
+
+    def test_phantom_bays_beyond_unit_slots_are_ignored(self):
+        """A 1-slot HT must not have bays 2-4 reconciled."""
+        lanes = {s: self._lane("lane%d" % s, material="PLA") for s in range(4)}
+        u, cleared, _ = self._unit([None]*4, lanes)
+        u.unit_slots = 1
+        u._reconcile_empty_bays()
+        assert cleared == ["lane0"]
+
+
+class TestSpoolmanMissIsNotRetriedForever:
+    """A UID Spoolman does not know is a permanent answer, not a retry.
+
+    This path runs on every status pass. Without a memo, a spool whose tag has
+    no Spoolman entry re-queries Spoolman at 1 Hz forever -- a blocking HTTP
+    call on the reactor. Observed live: ~20 minutes of "no Spoolman spool
+    matches UID ECB61CD0", 1061 "Resetting prediction variance" events as the
+    host lost its MCU clock, then "MCU 'mcu' shutdown: Timer too close" and
+    every MCU down. The lookup did not fail -- it succeeded, and the answer was
+    "no match".
+    """
+
+    def _unit(self):
+        calls = []
+        u = types.SimpleNamespace(
+            name="u", SLOTS_PER_UNIT=4,
+            _slots=[{"uid": "ECB61CD0"}, None, None, None],
+            _spoolman_no_match=set(),
+        )
+        u._forget_spoolman_miss = afcBambuAMS._forget_spoolman_miss.__get__(u)
+        return u, calls
+
+    def test_a_miss_is_remembered(self):
+        u, _ = self._unit()
+        u._spoolman_no_match.add("ECB61CD0")
+        assert "ECB61CD0" in u._spoolman_no_match
+
+    def test_removal_forgets_the_miss(self):
+        """The next spool -- or this one after being added -- must re-check."""
+        u, _ = self._unit()
+        u._spoolman_no_match.add("ECB61CD0")
+        u._forget_spoolman_miss(0)
+        assert "ECB61CD0" not in u._spoolman_no_match
+
+    def test_forgetting_an_empty_slot_is_harmless(self):
+        u, _ = self._unit()
+        u._spoolman_no_match.add("ECB61CD0")
+        u._forget_spoolman_miss(1)                 # slot 1 has no info
+        assert "ECB61CD0" in u._spoolman_no_match  # untouched
+
+    def test_a_different_uid_is_not_suppressed(self):
+        """Keyed by UID, so another spool still gets its own lookup."""
+        u, _ = self._unit()
+        u._spoolman_no_match.add("ECB61CD0")
+        assert "13F56D32" not in u._spoolman_no_match
+
+    def test_forget_survives_a_missing_memo(self):
+        u, _ = self._unit()
+        del u._spoolman_no_match
+        u._forget_spoolman_miss(0)                 # must not raise
+
+
+class TestNoUndefinedNames:
+    """A NameError in __init__ halts Klipper at connect, and nothing else here
+    catches it.
+
+    Every test in this file calls module functions against hand-built shims, so
+    the constructor is never executed and an undefined local in it is invisible:
+    on 2026-08-06 a comment-block edit deleted the line computing `_is_ht` and
+    the suite reported the same 25 failures before, during and after. The
+    printer halted with "name '_is_ht' is not defined" and had to be recovered
+    by hand, because a halted Klippy cannot run the g-code that repairs it.
+
+    Constructing the real class needs most of Klipper mocked, so this checks the
+    same class of defect statically instead. It is not a substitute for a
+    construction test; it is the cheap guard that would have caught this one.
+    """
+
+    def _check(self, path):
+        import subprocess
+        import sys
+        out = subprocess.run([sys.executable, "-m", "pyflakes", path],
+                             capture_output=True, text=True)
+        return [ln for ln in (out.stdout + out.stderr).splitlines()
+                if "undefined name" in ln]
+
+    def test_the_unit_module_has_no_undefined_names(self):
+        import os
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        assert self._check(os.path.join(here, "extras/AFC_BambuAMS.py")) == []
+
+    def test_the_bridge_module_has_no_undefined_names(self):
+        import os
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        assert self._check(
+            os.path.join(here, "extras/AFC_BambuAMS_bridge.py")) == []
+
+
+
+class _GErr(Exception):
+    pass
+
+
+class TestReloadBeforeResume:
+    """The ordinary resume button reloads a lane a Bambu fault emptied -- and
+    refuses to continue if the reload does not take.
+
+    Two failures this encodes, both of which happened:
+      * resuming into an empty toolhead after a fault-park (the print carried
+        on extruding nothing)
+      * a recovery that reported success without checking
+    """
+
+    def _shim(self, *, paused=True, target=True, loaded=False,
+              loads_ok=True):
+        scripts, said, logged = [], [], []
+        lane = types.SimpleNamespace(name="lane15", tool_loaded=loaded)
+        unit = types.SimpleNamespace(name="BambuAMS_1",
+                                     _resume_needs_reload=True,
+                                     _auto_recover_armed=True)
+
+        def _run(script):
+            scripts.append(script)
+            if loads_ok:
+                lane.tool_loaded = True
+
+        shim = types.SimpleNamespace(
+            name="BambuAMS_1",
+            printer=types.SimpleNamespace(command_error=_GErr),
+            gcode=types.SimpleNamespace(run_script_from_command=_run),
+            afc=types.SimpleNamespace(
+                function=types.SimpleNamespace(is_paused=lambda: paused)),
+            logger=types.SimpleNamespace(warning=lambda m: logged.append(m),
+                                         debug=lambda m: None),
+            _resume_reload_target=lambda: (
+                (unit, lane) if target else (None, None)))
+        gcmd = types.SimpleNamespace(
+            respond_info=lambda m: said.append(m),
+            error=lambda m: _GErr(m),
+            get_raw_command_parameters=lambda: "")
+        return shim, gcmd, lane, unit, scripts, said
+
+    def test_an_ordinary_resume_is_untouched(self):
+        # Not paused: this runs on EVERY resume on the printer, including ones
+        # with nothing to do with an AMS. Silence is the contract.
+        shim, gcmd, _l, _u, scripts, said = self._shim(paused=False)
+        afcBambuAMS._reload_before_resume(shim, gcmd)
+        assert scripts == [] and said == []
+
+    def test_no_pending_fault_is_untouched(self):
+        shim, gcmd, _l, _u, scripts, said = self._shim(target=False)
+        afcBambuAMS._reload_before_resume(shim, gcmd)
+        assert scripts == [] and said == []
+
+    def test_an_already_loaded_lane_is_not_reloaded(self):
+        shim, gcmd, _l, unit, scripts, _s = self._shim(loaded=True)
+        afcBambuAMS._reload_before_resume(shim, gcmd)
+        assert scripts == []
+        assert unit._resume_needs_reload is False
+
+    def test_a_faulted_lane_is_reloaded_before_the_resume(self):
+        shim, gcmd, _l, unit, scripts, said = self._shim()
+        afcBambuAMS._reload_before_resume(shim, gcmd)
+        assert scripts == ["CHANGE_TOOL LANE=lane15"]
+        assert unit._resume_needs_reload is False
+        assert any("lane15" in m for m in said)
+
+    def test_a_reload_that_does_not_take_refuses_to_resume(self):
+        shim, gcmd, _l, unit, scripts, _s = self._shim(loads_ok=False)
+        with pytest.raises(_GErr):
+            afcBambuAMS._reload_before_resume(shim, gcmd)
+        assert scripts == ["CHANGE_TOOL LANE=lane15"]
+        # Still owed, so a second press tries again rather than giving up.
+        assert unit._resume_needs_reload is True
+
+
+class TestWrappedResumeDelegates:
+    """Whatever happens in our half, RESUME must still resume -- unless we
+    deliberately refused. A broken resume button cannot be recovered without
+    restarting Klipper; a missed reload can always be done by hand."""
+
+    def _shim(self, reload_impl):
+        scripts, logged = [], []
+        shim = types.SimpleNamespace(
+            name="BambuAMS_1",
+            printer=types.SimpleNamespace(command_error=_GErr),
+            gcode=types.SimpleNamespace(
+                run_script_from_command=lambda s: scripts.append(s)),
+            logger=types.SimpleNamespace(warning=lambda m: logged.append(m),
+                                         debug=lambda m: None),
+            _reload_before_resume=reload_impl)
+        gcmd = types.SimpleNamespace(
+            respond_info=lambda m: None, error=lambda m: _GErr(m),
+            get_raw_command_parameters=lambda: "")
+        return shim, gcmd, scripts, logged
+
+    def test_the_previous_handler_is_called(self):
+        shim, gcmd, scripts, _l = self._shim(lambda g: None)
+        afcBambuAMS.cmd_AFC_BAMBU_WRAPPED_RESUME(shim, gcmd)
+        assert scripts == ["_AFC_BAMBU_RENAMED_RESUME_ "]
+
+    def test_an_unexpected_error_still_resumes(self):
+        def _boom(g):
+            raise ValueError("bookkeeping went wrong")
+        shim, gcmd, scripts, logged = self._shim(_boom)
+        afcBambuAMS.cmd_AFC_BAMBU_WRAPPED_RESUME(shim, gcmd)
+        assert scripts == ["_AFC_BAMBU_RENAMED_RESUME_ "]
+        assert any("resuming anyway" in m for m in logged)
+
+    def test_a_deliberate_refusal_does_not_resume(self):
+        def _refuse(g):
+            raise _GErr("did NOT reload")
+        shim, gcmd, scripts, _l = self._shim(_refuse)
+        with pytest.raises(_GErr):
+            afcBambuAMS.cmd_AFC_BAMBU_WRAPPED_RESUME(shim, gcmd)
+        assert scripts == []            # the print stays PAUSED
+
+
+class TestAutoRecoveryNeverResumes:
+    """Auto recovery restores the FILAMENT. Only a human restores the PRINT.
+
+    This resumed on its own TWICE on hardware. The first time it was
+    unconditional and restarted the print with nothing in the toolhead. That
+    was made conditional on the lane coming back tool_loaded -- and the second
+    time it resumed a correctly loaded lane, which was still wrong:
+
+        57672.9  lane15 reached the toolhead sensor after 7 kick(s)
+        57705.0  AFC_RESUME                       <- us, nobody asked
+
+    "Verified before resuming" was never the requirement. The machine does not
+    get to decide to restart somebody's print, and a real printer does not
+    either -- it holds at the fault until a human presses continue.
+    """
+
+    def _shim(self, *, loaded, paused=True, declared=False):
+        scripts, logged = [], []
+        lane = types.SimpleNamespace(name="lane15", tool_loaded=loaded)
+        reactor = types.SimpleNamespace(
+            NEVER=float("inf"), monotonic=lambda: 0.0,
+            register_callback=lambda cb, t: cb(0.0))
+        shim = types.SimpleNamespace(
+            name="BambuAMS_1", auto_error_recovery=True,
+            _auto_recover_armed=False, _resume_needs_reload=True,
+            lanes={"lane15": lane},
+            AMS_STATE_STALLED=0x07,
+            # The LATCH, not a fresh sample -- 0x07 shows up in only 11% of
+            # frames during the park, so a single read misses it eight times
+            # in nine. _on_status sets this; _raise_ams_fault clears it.
+            _declared_since_fault=declared,
+            _jam_location=lambda: "",
+            _unit_state=lambda latest: 0x01,
+            _bridge=types.SimpleNamespace(latest_status=lambda: {}),
+            gcode=types.SimpleNamespace(
+                run_script=lambda s: scripts.append(s)),
+            afc=types.SimpleNamespace(
+                reactor=reactor,
+                function=types.SimpleNamespace(is_paused=lambda: paused)),
+            logger=types.SimpleNamespace(info=lambda m: logged.append(m),
+                                         warning=lambda m: logged.append(m),
+                                         debug=lambda m: None))
+        return shim, lane, scripts, logged
+
+    def test_a_successful_reload_does_not_resume(self):
+        shim, _lane, scripts, logged = self._shim(loaded=True)
+        afcBambuAMS._maybe_auto_recover(shim, shim.lanes["lane15"])
+        assert not any("RESUME" in s for s in scripts)
+        assert any("STILL PAUSED" in m for m in logged)
+
+    def test_it_still_runs_the_unload_and_reload(self):
+        shim, _lane, scripts, _l = self._shim(loaded=True)
+        afcBambuAMS._maybe_auto_recover(shim, shim.lanes["lane15"])
+        assert scripts == ["TOOL_UNLOAD LANE=lane15\nCHANGE_TOOL LANE=lane15"]
+
+    def test_a_successful_reload_clears_the_resume_debt(self):
+        # The lane is fed, so the resume wrap must not reload it a second time.
+        shim, _lane, _s, _l = self._shim(loaded=True)
+        afcBambuAMS._maybe_auto_recover(shim, shim.lanes["lane15"])
+        assert shim._resume_needs_reload is False
+
+    def test_a_declared_unit_parks_without_resuming(self):
+        shim, _lane, scripts, logged = self._shim(loaded=False, declared=True)
+        afcBambuAMS._maybe_auto_recover(shim, shim.lanes["lane15"])
+        assert not any("RESUME" in s for s in scripts)
+        assert any("given up" in m for m in logged)
+
+
+class TestAutoRecoveryIsOneAttempt:
+    """The AMS retries the load by itself. By the time it gives up it is
+    already held in error, and from that point it will not move again until it
+    is TOLD to load -- which is what a human pressing resume sends.
+
+    So there is nothing out here to retry. This was built as an unbounded 5 s
+    loop and watched on hardware cycling unload/reload for over two minutes at
+    a latched unit; it only ever "worked" at the moment a human freed the jam
+    by hand. It was also a retry around a retry -- unit_load_lane already kicks
+    23 times over two rounds, about 90 s, before reporting failure.
+    """
+
+    def _run_once(self, *, loaded, paused=True):
+        rescheduled, logged = [], []
+        lane = types.SimpleNamespace(name="lane15", tool_loaded=loaded)
+        reactor = types.SimpleNamespace(
+            NEVER=float("inf"), monotonic=lambda: 0.0,
+            register_callback=lambda cb, t: rescheduled.append(cb(0.0)))
+        shim = types.SimpleNamespace(
+            name="BambuAMS_1", auto_error_recovery=True,
+            _auto_recover_armed=False, _resume_needs_reload=True,
+            lanes={"lane15": lane}, AMS_STATE_STALLED=0x07,
+            _jam_location=lambda: "",
+            _unit_state=lambda latest: 0x01,
+            _bridge=types.SimpleNamespace(latest_status=lambda: {}),
+            gcode=types.SimpleNamespace(run_script=lambda s: None),
+            afc=types.SimpleNamespace(
+                reactor=reactor,
+                function=types.SimpleNamespace(is_paused=lambda: paused)),
+            logger=types.SimpleNamespace(info=lambda m: logged.append(m),
+                                         warning=lambda m: logged.append(m),
+                                         debug=lambda m: None))
+        afcBambuAMS._maybe_auto_recover(shim, lane)
+        return rescheduled, logged
+
+    def test_a_failed_reload_does_not_reschedule(self):
+        rescheduled, _l = self._run_once(loaded=False)
+        assert rescheduled == [float("inf")]     # NEVER, not eventtime + 5
+
+    def test_a_failed_reload_says_the_unit_is_held(self):
+        _r, logged = self._run_once(loaded=False)
+        assert any("HELD IN ERROR" in m and "press resume" in m
+                   for m in logged)
+
+    def test_a_successful_reload_does_not_reschedule_either(self):
+        rescheduled, _l = self._run_once(loaded=True)
+        assert rescheduled == [float("inf")]
+
+
+class TestDeclaredLatch:
+    """byte[19] == 0x07 is the park signal and it is INTERMITTENT.
+
+    Counted in the AMS 1 fault capture (ams1_print_fault_2026-08-05), by phase:
+
+        HOLD (printing)   1333 frames    0 x 0x07
+        RETRY             2686 frames   12 x 0x07   0.4%
+        PARK              2523 frames  278 x 0x07  11.0%
+        HOLD (after)      1333 frames    0 x 0x07
+
+    It appears ONLY in the park, so the signal is sound -- but reading the
+    CURRENT frame once, at the end of a ~90 s recovery attempt, misses it eight
+    times in nine. That is what happened on hardware: the operator was looking
+    at a unit latched red and our check never fired.
+    """
+
+    def _shim(self):
+        return types.SimpleNamespace(
+            name="BambuAMS_1", ams_index=0, unit_uid=None, _id_resolved=True,
+            AMS_STATE_STALLED=0x07, _declared_since_fault=False,
+            _follow_fault_hold=False, _odom_lo=None, _odom_hi=None,
+            _track_odom=lambda o: None,
+            SLOTS_PER_UNIT=4, _slots=[{} for _ in range(4)],
+            _status_err_last=None,
+            _unit_state=lambda o: afcBambuAMS._unit_state(
+                types.SimpleNamespace(ams_index=0), o),
+            _sync_lanes=lambda: None,
+            logger=types.SimpleNamespace(warning=lambda m: None,
+                                         debug=lambda m: None))
+
+    @staticmethod
+    def _frame(ustate):
+        return {"units": [{"n": 0, "ustate": ustate}], "slots": []}
+
+    def test_one_declaring_frame_in_a_run_of_quiet_ones_latches(self):
+        # The measured shape: 8 quiet frames, 1 carrying 0x07, 8 more quiet.
+        # Sampling the last frame would report "not declared".
+        shim = self._shim()
+        for st in [0x00] * 8 + [0x07] + [0x00] * 8:
+            afcBambuAMS._on_status(shim, self._frame(st))
+        assert shim._declared_since_fault is True
+
+    def test_a_healthy_run_never_latches(self):
+        shim = self._shim()
+        for st in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05):
+            afcBambuAMS._on_status(shim, self._frame(st))
+        assert shim._declared_since_fault is False
+
+    def test_the_not_heard_from_sentinel_is_not_a_state(self):
+        # 0xFF is the firmware saying "no reply yet". It must never latch.
+        shim = self._shim()
+        for _ in range(20):
+            afcBambuAMS._on_status(shim, self._frame(0xFF))
+        assert shim._declared_since_fault is False
+
+    def test_another_units_declaration_does_not_latch_ours(self):
+        shim = self._shim()
+        afcBambuAMS._on_status(
+            shim, {"units": [{"n": 1, "ustate": 0x07}], "slots": []})
+        assert shim._declared_since_fault is False
+
+    def test_a_new_fault_clears_the_latch(self):
+        # "Declared" must mean "since THIS fault", never a leftover.
+        shim = types.SimpleNamespace(
+            name="BambuAMS_1", fault_pause=True, _follow_fault_hold=False,
+            _follow_fault_saw_pause=False, _starved_since=1.0,
+            _declared_since_fault=True, _fault_lane=None,
+            _odom_lo=1.0, _odom_hi=9.0,
+            _fault_floor_seen=True, _fault_recover_since=5.0,
+            _fault_recover_reads=3, _resume_needs_reload=False,
+            set_feed_assist=lambda ln, on: None,
+            logger=types.SimpleNamespace(warning=lambda m: None,
+                                         debug=lambda m: None),
+            afc=types.SimpleNamespace(
+                function=types.SimpleNamespace(in_print=lambda: False),
+                error=types.SimpleNamespace(
+                    AFC_error=lambda m, pause=True: None)))
+        lane = types.SimpleNamespace(name="lane15")
+        afcBambuAMS._raise_ams_fault(shim, lane, "jam")
+        assert shim._declared_since_fault is False
+
+    def test_the_latch_cannot_break_status_mirroring(self):
+        # It shares _on_status's single except with the slot apply, so a throw
+        # here would abandon the whole frame -- silently, for every frame.
+        shim = self._shim()
+        shim._unit_state = lambda o: (_ for _ in ()).throw(RuntimeError("x"))
+        applied = []
+        shim._sync_lanes = lambda: applied.append(True)
+        afcBambuAMS._on_status(shim, {"units": [], "slots": []})
+        assert applied == [True]
+
+
+class TestJamLocation:
+    """Say WHERE the jam is, from how far the AMS moved filament.
+
+    Measured in the AMS 1 fault capture -- the odometer is a POSITION (0 = home
+    in the AMS, ~1.86 m = at the toolhead), not a consumption counter:
+
+        HOLD (printing)   frozen at 1.864 m     spread 0.000
+        RETRY (jammed)    -0.009 .. 1.830       spread 1.839
+        PARK              0.000 .. 0.002        spread 0.002
+
+    The AMS swung the FULL tube during its retry and the filament still never
+    reached the toolhead -- so the AMS was working and the blockage was
+    downstream. Our stall message currently hedges ("the spool is likely
+    tangled or the path jammed") because we had no way to tell, and the two
+    need opposite responses.
+
+    THERE IS DELIBERATELY NO CLOG DETECTOR HERE. During a print the value is
+    pinned at tube length however much filament is consumed, and the drive
+    channel is nearly silent anyway -- 49 replies in a 6.5 minute hold, all in
+    the final minute, 0.13/s. There is no signal to watch.
+    """
+
+    def _shim(self, *, fault=True):
+        return types.SimpleNamespace(
+            name="BambuAMS_1", ams_index=0, unit_uid=None, _id_resolved=True,
+            AMS_STATE_STALLED=0x07, _declared_since_fault=False,
+            ODOM_MOVED_MM=200.0, _follow_fault_hold=fault,
+            _odom_lo=None, _odom_hi=None,
+            SLOTS_PER_UNIT=4, _slots=[{} for _ in range(4)],
+            _status_err_last=None, _sync_lanes=lambda: None,
+            _unit_state=lambda o: None,
+            logger=types.SimpleNamespace(warning=lambda m: None,
+                                         debug=lambda m: None))
+
+    def _shimmed(self, **kw):
+        sh = self._shim(**kw)
+        # _jam_location calls _odom_span_mm on self; bind the real one.
+        sh._odom_span_mm = lambda: afcBambuAMS._odom_span_mm(sh)
+        return sh
+
+    @staticmethod
+    def _f(odom):
+        return {"units": [{"n": 0, "odom": odom}], "slots": []}
+
+    def _feed(self, shim, values):
+        for v in values:
+            afcBambuAMS._track_odom(shim, self._f(v))
+
+    def test_a_working_ams_points_downstream(self):
+        # The measured retry: swings the full tube, never reaches the toolhead.
+        shim = self._shimmed()
+        self._feed(shim, [-9, 1830, 12, 1810, 0])
+        assert afcBambuAMS._odom_span_mm(shim) == 1839.0
+        msg = afcBambuAMS._jam_location(shim)
+        assert "DOWNSTREAM OF THE AMS" in msg and "not the spool" in msg
+
+    def test_a_stuck_ams_points_at_the_spool(self):
+        shim = self._shimmed()
+        self._feed(shim, [1500, 1512, 1498, 1505])
+        assert afcBambuAMS._odom_span_mm(shim) == 14.0
+        assert "AT THE AMS" in afcBambuAMS._jam_location(shim)
+
+    def test_it_says_nothing_when_it_cannot_tell(self):
+        # Fewer than two readings is genuinely unknown; hedging beats guessing.
+        shim = self._shimmed()
+        assert afcBambuAMS._odom_span_mm(shim) is None
+        assert afcBambuAMS._jam_location(shim) == ""
+
+    def test_it_does_not_track_outside_a_fault(self):
+        # The operator's constraint: this must never DECIDE anything during a
+        # normal load, where the AMS legitimately slows and fights resistance
+        # just before the toolhead sensor.
+        #
+        # AMENDED, and worth stating plainly. The fault range is still
+        # fault-only -- that is what this asserts. A failed LOAD now records a
+        # SEPARATE range (_load_odom_lo/hi), because the unit's odometer is the
+        # only thing that knew a load had put five metres of filament on the
+        # floor. The constraint survives because nothing reads that range until
+        # the load has ALREADY failed: it is evidence for the error message,
+        # never an input to a jam decision, and it cannot end or alter a load
+        # that is working.
+        shim = self._shimmed(fault=False)
+        self._feed(shim, [0, 900, 1800])
+        assert shim._odom_lo is None and shim._odom_hi is None
+        assert afcBambuAMS._jam_location(shim) == ""
+
+    def test_a_load_records_its_own_range_without_touching_the_faults(self):
+        shim = self._shimmed(fault=False)
+        shim._load_in_progress = True
+        shim._load_odom_lo = shim._load_odom_hi = None
+        self._feed(shim, [0, 2600, 5004, 4900])
+        # The fault range stays untouched -- no fault is running.
+        assert shim._odom_lo is None and shim._odom_hi is None
+        assert afcBambuAMS._load_odom_span_mm(shim) == 5004.0
+
+    def test_a_fault_during_a_load_cannot_wipe_the_loads_evidence(self):
+        # _raise_ams_fault resets the FAULT range on purpose, so the two must
+        # not share storage: a fault raised partway through a load would
+        # otherwise erase the very measurement the failure needs.
+        shim = self._shimmed(fault=True)
+        shim._load_in_progress = True
+        shim._load_odom_lo = shim._load_odom_hi = None
+        self._feed(shim, [0, 5004])
+        shim._odom_lo = shim._odom_hi = None          # what _raise_ams_fault does
+        assert afcBambuAMS._load_odom_span_mm(shim) == 5004.0
+
+    def test_the_load_span_reads_a_swing_not_a_net_move(self):
+        # THE ODOMETER IS A POSITION. A unit that swings the whole tube and
+        # comes back has a net delta of zero having moved 1.8m twice; a
+        # start-vs-end reading would call the busiest failure we have "never
+        # moved".
+        shim = self._shimmed(fault=False)
+        shim._load_in_progress = True
+        shim._load_odom_lo = shim._load_odom_hi = None
+        self._feed(shim, [0, 1830, 0])
+        assert afcBambuAMS._load_odom_span_mm(shim) == 1830.0
+
+    def test_the_load_span_drives_the_same_verdict(self):
+        # Same question, different window -- so _jam_location takes the span
+        # rather than owning one.
+        shim = self._shimmed()
+        assert "DOWNSTREAM OF THE AMS" in afcBambuAMS._jam_location(shim, 5004.0)
+        assert "AT THE AMS" in afcBambuAMS._jam_location(shim, 14.0)
+        assert afcBambuAMS._jam_location(shim, None) == ""       # falls back
+
+    def test_the_unknown_sentinel_is_not_a_reading(self):
+        # -1 is the firmware saying "no odometer yet". Treating it as a
+        # position would fake a full-tube span out of nothing.
+        shim = self._shimmed()
+        self._feed(shim, [-1, -1, -1])
+        assert afcBambuAMS._odom_span_mm(shim) is None
+
+    def test_another_units_odometer_is_ignored(self):
+        shim = self._shimmed()
+        afcBambuAMS._track_odom(shim, {"units": [{"n": 1, "odom": 1800}]})
+        assert shim._odom_lo is None
+
+    def test_the_boundary_reads_as_moved(self):
+        shim = self._shimmed()
+        self._feed(shim, [0, 200])
+        assert "DOWNSTREAM" in afcBambuAMS._jam_location(shim)
+
+
+class TestRecoveryCannotRetriggerItself:
+    """The attempt must not reset its own one-shot guard.
+
+    unit_load_lane clears _auto_recover_armed on every load -- correctly, so a
+    new fault after a normal load can recover. But auto recovery DRIVES a load,
+    so its own CHANGE_TOOL landed there and cleared the guard it was holding.
+    The next fault then armed another attempt. Measured on hardware:
+
+        12:40:49  fault -> auto error recovery armed
+        12:45:03  lane21 reached the toolhead sensor    (the reload worked)
+        12:45:14  the AMS reports STALLED (state 7)
+        12:45:14  auto error recovery armed AGAIN       <- same second
+        12:45:35  the unit has given up. Parked.
+
+    Four and a half minutes, which is exactly what "one attempt" was meant to
+    prevent. The operator watched it and said "something not quite right".
+    """
+
+    def _shim(self, *, in_recovery):
+        return types.SimpleNamespace(
+            name="BambuAMS_2", _in_auto_recover=in_recovery,
+            _auto_recover_armed=True, _follow_manual_off=True,
+            _follow_fault_hold=True, _follow_fault_saw_pause=True)
+
+    def test_a_load_during_recovery_keeps_the_guard(self):
+        shim = self._shim(in_recovery=True)
+        # The line inside unit_load_lane, in isolation.
+        if not getattr(shim, "_in_auto_recover", False):
+            shim._auto_recover_armed = False
+        assert shim._auto_recover_armed is True
+
+    def test_an_ordinary_load_still_clears_the_guard(self):
+        # The guard must not become permanent -- that turns a self-retriggering
+        # bug into a never-triggering one.
+        shim = self._shim(in_recovery=False)
+        if not getattr(shim, "_in_auto_recover", False):
+            shim._auto_recover_armed = False
+        assert shim._auto_recover_armed is False
+
+    def test_every_exit_from_the_attempt_clears_the_flag(self):
+        # Including the failures. A stuck flag suppresses the legitimate
+        # re-arm on the NEXT fault.
+        import inspect
+        src = inspect.getsource(afcBambuAMS._maybe_auto_recover)
+        body = src[src.index("def _run("):]
+        assert "return self.afc.reactor.NEVER" not in body, (
+            "an exit from _run bypasses _done() and leaks _in_auto_recover")
+        assert body.count("_done(self.afc.reactor.NEVER)") >= 4
+
+
+class TestResumeWrapWaitsForTheRealHandler:
+    """Wrap when RESUME actually IS AFC's handler -- not when a flag says prep
+    has started.
+
+    The first version polled AFC_prep.rename_occurred, which is a race:
+
+        if not self.rename_occurred:
+            self.rename_occurred = True            <- set FIRST
+            self.afc.function._rename(RESUME...)   <- rename AFTER
+
+    The flag is set before the rename it announces, so the wrap could land in
+    the gap and PREP would overwrite it. Observed live: the log said "RESUME
+    wrapped" at 12:52:43 and RESUME was AFC's handler afterwards -- the wrapper
+    was gone. It had worked three times before that on timing alone.
+    """
+
+    @staticmethod
+    def _gate(command_names):
+        """The precondition, in isolation: has AFC's rename COMPLETED?
+
+        _AFC_RENAMED_RESUME_ exists if and only if it has, because AFC creates
+        it as part of doing the rename. The effect, not a flag beside it.
+        """
+        return "_AFC_RENAMED_RESUME_" in command_names
+
+    def test_it_waits_before_afc_has_renamed(self):
+        assert not self._gate({"RESUME": "the printer's own", "PAUSE": ""})
+
+    def test_it_fires_once_the_rename_has_completed(self):
+        assert self._gate({"RESUME": "", "_AFC_RENAMED_RESUME_": ""})
+
+    def test_an_empty_table_is_not_a_go_signal(self):
+        assert not self._gate({})
+
+    def test_it_does_not_reach_into_private_klipper_attributes(self):
+        # The second failed attempt read gcode.ready_gcode_handlers directly.
+        # This Klipper does not present it the way that assumed, so the gate
+        # never matched and timed out after 120s with the wrap inactive.
+        import inspect
+        src = inspect.getsource(afcBambuAMS._arm_resume_wrap)
+        code = "\n".join(l for l in src.split("\n")
+                          if not l.strip().startswith("#"))
+        assert "ready_gcode_handlers" not in code
+        assert "get_command_help" in code
+
+    def test_the_gate_is_not_a_flag_read(self):
+        # Guards the actual regression: nothing in the arm may consult
+        # rename_occurred, because it is set before the rename it announces.
+        import inspect
+        src = inspect.getsource(afcBambuAMS._arm_resume_wrap)
+        code = "\n".join(l for l in src.split("\n")
+                         if not l.strip().startswith("#"))
+        assert "rename_occurred" not in code
+
+
+class TestMeasuredRemainIsCapped:
+    """A spool cannot hold more than its own nominal weight.
+
+    Measured on a real printer with our hardware entirely off the bus (the Pico
+    ran the listen-only sniff build and Klipper was stopped) -- the SAME HT
+    spool, eight minutes apart:
+
+        16:47:13  C:0.531  R:0.084  P:107%  od:1.132
+        16:55:28  C:0.551  R:0.088  P:119%  od:1.143
+
+    The radius went UP by 3.5mm while filament was being consumed, which cannot
+    happen, so at least one is wrong by 12 points. The AMS derives R from a
+    circumference sampled over od/C = ~2.1 SPOOL REVOLUTIONS.
+
+    We cannot improve the unit's arithmetic. We can decline to publish 1190g of
+    filament on a 1kg spool as a measured weight.
+    """
+
+    def _shim(self):
+        pushed = []
+        shim = types.SimpleNamespace(
+            name="AMS", logger=_Logger(),
+            _push_measured_to_spoolman=lambda ln, g, src="": pushed.append((ln.name, g)))
+        return shim, pushed
+
+    def _lane(self):
+        return types.SimpleNamespace(name="lane15", weight=0,
+                                     tool_loaded=False)
+
+    def test_the_measured_119_percent_becomes_1000g_not_1190g(self):
+        shim, pushed = self._shim()
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"remain_pct": 119, "weight": 1000})
+        assert lane.weight == 1000
+        assert pushed == [("lane15", 1000)]
+
+    def test_the_measured_107_percent_is_capped_too(self):
+        shim, _p = self._shim()
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"remain_pct": 107, "weight": 1000})
+        assert lane.weight == 1000
+
+    def test_an_ordinary_reading_is_untouched(self):
+        shim, _p = self._shim()
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"remain_pct": 80, "weight": 1000})
+        assert lane.weight == 800
+
+    # ── the measurement beats the tag record, HERE too ──────────────────────
+    #
+    # This function runs on every status frame off the RAW bridge slot, so it
+    # was re-applying the tag's number seconds after a fresh measurement landed
+    # -- get_status overrides remain_pct with _measured_remain, and this path
+    # never saw that. Captured on an AMS 1 insert, spool #87, three writes in
+    # 106 ms:
+    #
+    #   14:03:27  wrote 700 g            (tag record, 70%)
+    #   14:03:40  measured ... 69% (~690 g) [capscan]
+    #   14:03:40  wrote 690 g            (the measurement)
+    #   14:03:40  wrote 700 g            (this function, tag record again)
+    #
+    # The operator saw the stale figure and asked whether it had come from
+    # Spoolman rather than the read. It had -- and then went back.
+
+    def test_a_fresh_measurement_wins_over_the_tag_record(self):
+        shim, pushed = self._shim()
+        shim._measured_remain = {2: 69}
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"index": 2, "remain_pct": 70, "weight": 1000})
+        assert lane.weight == 690
+        assert pushed == [("lane15", 690)]
+
+    def test_it_is_the_right_slots_measurement(self):
+        # Keyed by slot: bay 3's measurement must not describe bay 2's spool.
+        shim, pushed = self._shim()
+        shim._measured_remain = {3: 69}
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"index": 2, "remain_pct": 70, "weight": 1000})
+        assert lane.weight == 700
+
+    def test_no_measurement_still_uses_the_tag(self):
+        # The tag record is the right answer when it is the only one there.
+        shim, _p = self._shim()
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"index": 2, "remain_pct": 70, "weight": 1000})
+        assert lane.weight == 700
+
+    def test_a_measurement_over_100_is_still_capped(self):
+        # The measurement winning must not smuggle 1190 g past the cap.
+        shim, pushed = self._shim()
+        shim._measured_remain = {2: 119}
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"index": 2, "remain_pct": 70, "weight": 1000})
+        assert lane.weight == 1000
+
+    # ── all three unit types ────────────────────────────────────────────────
+    #
+    # The fix is dialect-free by construction: it keys on a SLOT INDEX and an
+    # integer percent and never touches text, so there is no per-model wording
+    # for it to get wrong. What varies between the types is the bay layout --
+    # the HT has exactly one bay (index 0) where the boxed units have four --
+    # and _measured_remain is a per-unit-object dict, so an HT's slot 0 and an
+    # AMS 2's slot 0 cannot reach each other.
+    #
+    # (Parsing the measurement is the part that IS dialect-specific, and that
+    # is pinned separately in test_AFC_BambuAMS_bridge.py::
+    # test_capacity_line_parses_on_all_three_units. Today's AMS 1 insert line,
+    # "STEP:odom C:0.461,R:0.073,P:69%, od:0.852", is that same shape.)
+
+    def test_the_measurement_wins_on_every_bay_of_a_boxed_unit(self):
+        for bay in (0, 1, 2, 3):
+            shim, pushed = self._shim()
+            shim._measured_remain = {bay: 69}
+            lane = self._lane()
+            afcBambuAMS._apply_remain_weight(
+                shim, lane, {"index": bay, "remain_pct": 70, "weight": 1000})
+            assert lane.weight == 690, f"bay {bay}"
+            assert pushed == [("lane15", 690)], f"bay {bay}"
+
+    def test_the_ht_single_bay_behaves_the_same(self):
+        # An HT only ever has index 0, and a 1kg spool on it must correct the
+        # same way a boxed bay does.
+        shim, pushed = self._shim()
+        shim._measured_remain = {0: 69}
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"index": 0, "remain_pct": 70, "weight": 1000})
+        assert lane.weight == 690
+        assert pushed == [("lane15", 690)]
+
+    def test_the_percent_is_applied_against_each_units_own_nominal(self):
+        # 250 g sample spools and 1 kg reels both exist on this rig; the tag's
+        # nominal is what the percent is applied to, per unit and per bay.
+        for nominal, expect in ((1000, 690), (250, 172), (750, 517)):
+            shim, pushed = self._shim()
+            shim._measured_remain = {0: 69}
+            lane = self._lane()
+            afcBambuAMS._apply_remain_weight(
+                shim, lane, {"index": 0, "remain_pct": 70, "weight": nominal})
+            assert lane.weight == expect, nominal
+
+    def test_the_cap_follows_the_tags_nominal_weight(self):
+        # A 250g sample spool caps at 250g, not 1000g.
+        shim, _p = self._shim()
+        lane = self._lane()
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"remain_pct": 119, "weight": 250})
+        assert lane.weight == 250
+
+    def test_a_loaded_lane_is_left_alone(self):
+        # Its weight is being decremented by extrusion.
+        shim, pushed = self._shim()
+        lane = self._lane()
+        lane.tool_loaded = True
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"remain_pct": 119, "weight": 1000})
+        assert lane.weight == 0 and pushed == []
+
+
+class TestFaultReasonIsReadable:
+    """The reason, without the bus dump around it.
+
+    What went to the operator, verbatim, at a real stall:
+
+        [AMS_COMMON]en:1,mode:3,idx:0,ref:0 [AMS_COMMON]en:1,mode:3,idx:2,
+        ref:127 [AMS_COMMON]en:1,mode:3,idx:0,ref:0 [AMS_SWITCH]timeout,
+        assist finish stall! pos:0.1
+
+    Three of those four fragments are link keep-alive, present at every instant
+    of every print. Exactly one is the reason.
+    """
+
+    RAW = ("[AMS_COMMON]en:1,mode:3,idx:0,ref:0 "
+           "[AMS_COMMON]en:1,mode:3,idx:2,ref:127 "
+           "[AMS_COMMON]en:1,mode:3,idx:0,ref:0 "
+           "[AMS_SWITCH]timeout, assist finish stall! pos:0.1")
+
+    def test_the_reason_survives_and_the_chatter_does_not(self):
+        out = _fault_reason(self.RAW)
+        assert out == "[AMS_SWITCH]timeout, assist finish stall! pos:0.1"
+
+    def test_an_unknown_dialect_is_kept(self):
+        # NOT a whitelist of known stall wording. The three unit types phrase
+        # it three ways and one says nothing at all, so matching on known
+        # phrases would silently swallow the dialect nobody has seen yet.
+        out = _fault_reason("[AMS_COMMON]en:1 [AMS_WHATEVER]something new")
+        assert out == "[AMS_WHATEVER]something new"
+
+    def test_several_reasons_are_all_kept(self):
+        out = _fault_reason("[AMS_SWITCH]stall [AMS_COMMON]en:1 "
+                            "[AMS_DEV] STEP:odom tray_id error 255")
+        assert "[AMS_SWITCH]stall" in out
+        assert "[AMS_DEV] STEP:odom tray_id error 255" in out
+        assert "AMS_COMMON" not in out
+
+    def test_all_chatter_falls_back_to_the_raw_text(self):
+        # Better a dump than an empty explanation -- if filtering leaves
+        # nothing, the operator still gets what the unit said.
+        raw = "[AMS_COMMON]en:1,mode:3 [AMS_LINK]err_code:0x00->0x16"
+        assert _fault_reason(raw) == raw
+
+    def test_empty_stays_empty(self):
+        assert _fault_reason("") == ""
+        assert _fault_reason(None) is None
+
+    def test_text_with_no_markers_is_untouched(self):
+        assert _fault_reason("something went wrong") == "something went wrong"
+
+    # ── the AMS 1's verdict rides on chatter tags ────────────────────────────
+    #
+    # NOT because it is silent. It is not, and treating it as silent is the
+    # mistake this project has made twice. Its give-up buffer is full of
+    # [AMS_DEV] odometry, which is not chatter and survives the filter fine.
+    # What does not survive is the part that says it gave up: state:6 on
+    # [AMS_COMMON] and en:0,mode:7 on [AMS_LINK], both keep-alive tags. So the
+    # operator got a real message full of real fragments, all of them hunting
+    # odometry, with the verdict filtered out of it.
+    #
+    # Verbatim from the failing lane15 capture (THE_LOAD.md), tags included --
+    # a test written from memory of the wire format is worth nothing.
+
+    AMS1_GIVE_UP = ("[AMS_DEV] STEP:odom search, odo 0.516 ... 1.185 "
+                    "[AMS_DEV] STEP:odom reset tray 0 "
+                    "[AMS_IDLE]set ams state switch "
+                    "[AMS_COMMON]state:0,tray_now:255,tray_exit:6 "
+                    "[AMS_COMMON]state:6,tray_now:255,tray_exit:6 "
+                    "[AMS_LINK]en:0,mode:7,idx:255,ref:0")
+
+    def test_the_ams1_give_up_survives_the_chatter_filter(self):
+        out = _fault_reason(self.AMS1_GIVE_UP)
+        assert "state:6" in out
+        assert "en:0,mode:7,idx:255" in out
+
+    def test_the_ams1_odometry_was_never_the_problem(self):
+        # [AMS_DEV] is not chatter and always survived. Pinned so nobody
+        # "fixes" the tag list on the theory that the AMS 1 says nothing.
+        out = _fault_reason(self.AMS1_GIVE_UP)
+        assert "STEP:odom search" in out
+
+    def test_the_keep_alive_beside_the_verdict_still_goes(self):
+        # state:0 is the same tag as state:6 and means nothing here. The rescue
+        # keys on the signature, so only the fragment that IS the reason stays.
+        out = _fault_reason(self.AMS1_GIVE_UP)
+        assert "state:0" not in out
+        assert "set ams state switch" not in out      # [AMS_IDLE], chatter
+
+    def test_the_ht_stall_state_is_kept_beside_its_words(self):
+        # Captured on the HT, lane23: it says BOTH, and the state was being
+        # dropped from its own error message because only state:6 was listed.
+        out = _fault_reason("[AMS_COMMON]state:7,tray_now:0,tray_exit:1 "
+                            "[AMS_LED]TIMEOUT error 0")
+        assert "state:7" in out and "TIMEOUT error 0" in out
+
+    def test_state_zero_is_not_a_give_up(self):
+        # The states either side of them are ordinary. 6 and 7 are the list.
+        assert "state:0" not in _fault_reason(
+            "[AMS_COMMON]state:0,tray_now:0 [AMS_LED]TIMEOUT error 0")
+
+    def test_en0_mode7_is_kept_off_ams_link(self):
+        # The tag it actually arrives on. An earlier version of this test said
+        # [AMS_COMMON] from memory; the capture says [AMS_LINK].
+        out = _fault_reason("[AMS_LINK]en:1,mode:3,idx:0,ref:0 "
+                            "[AMS_LINK]en:0,mode:7,idx:255,ref:0")
+        assert out == "[AMS_LINK]en:0,mode:7,idx:255,ref:0"
+
+    def test_a_chatter_tagged_stall_is_still_a_reason(self):
+        # Whichever tag it lands on. The rescue keys on the signature, not on
+        # which unit happened to emit it.
+        out = _fault_reason("[AMS_COMMON]en:1,mode:3 "
+                            "[AMS_COMMON]pull err,bdc stall")
+        assert out == "[AMS_COMMON]pull err,bdc stall"
+
+    def test_ordinary_chatter_is_still_dropped(self):
+        # The rescue must not become a second fallback: a keep-alive with no
+        # fault signature is dropped.
+        out = _fault_reason("[AMS_COMMON]en:1,mode:3,idx:0,ref:0 "
+                            "[AMS_SWITCH]feed finish, buff_pos:1.28")
+        assert out == "[AMS_SWITCH]feed finish, buff_pos:1.28"
+
+
+# The load path uses the bare stop(). See the note above _feed_until_sensor.
+
+
+
+class TestTxEchoIsDiffable:
+    """The TX echo emits the SAME line shape as a capture, on purpose.
+
+    The one thing nobody can see on this bus is our own output: the sniff build
+    is listen-only and we are the master. Three wrong calls in one evening came
+    from inferring what we transmit -- a phase that could not be reached, an
+    enrollment branch that could not be reached, and an op-03 byte that
+    correlated with the ref across 32,000 captured frames and faulted a unit at
+    1.39A when we sent it.
+
+    Emitting the capture's own shape means a TX log diffs against
+    ht_clean_load with the tools that already exist, rather than new ones
+    written to read a new format.
+    """
+
+    def test_a_tx_line_parses_as_a_capture_line(self):
+        import json as _json
+        line = ('{"evt":"tx","us":10322878545,"n":13,'
+                '"hex":"3DC50DF10400077F03000211BC"}')
+        obj = _json.loads(line)
+        assert obj["evt"] == "tx"
+        # Every field the capture tooling reads off a sniff line.
+        assert isinstance(obj["us"], int)
+        assert obj["n"] == 13
+        assert bytes.fromhex(obj["hex"])[0] == 0x3D
+
+    def test_the_length_field_is_the_REAL_length(self):
+        # The ring stores at most 32 bytes but records the true length, so a
+        # diff can tell "this frame was 44 bytes" from "we kept 32 of it".
+        # A capture that silently truncates is a capture that lies.
+        import json as _json
+        obj = _json.loads('{"evt":"tx","us":1,"n":44,"hex":"' + "AB" * 32 + '"}')
+        assert obj["n"] == 44
+        assert len(bytes.fromhex(obj["hex"])) == 32
+        assert obj["n"] > len(bytes.fromhex(obj["hex"]))   # truncation visible
+
+    def test_the_event_is_known_to_the_bridge(self):
+        # Unknown events hit the catch-all above the per-event branches and are
+        # swallowed -- which is exactly how the rc/rollcall events went missing
+        # once. tx is consumed by its own branch, so it must not be treated as
+        # unhandled either.
+        from extras.AFC_BambuAMS_bridge import _BRIDGE_EVENTS_KNOWN
+        assert "txecho" in _BRIDGE_EVENTS_KNOWN     # the command echo
+
+
+class TestTheSensorReadIsThePin:
+    """A false arrival does not just mis-report -- it DISABLES THE RETRY.
+
+    unit_load_lane's recovery (stop -> re-home -> feed again,
+    load_recover_attempts times) is gated on `if not loaded`. If
+    _feed_until_sensor returns True on filament that never arrived, the load is
+    declared good and the retry the operator expects never runs. That is the
+    difference between "it retried by unloading and reloading" and tonight's
+    "it continued like it thinks it did"."""
+
+    def _lane(self, pin, cache):
+        return types.SimpleNamespace(
+            name="lane21",
+            extruder_obj=types.SimpleNamespace(
+                fila_tool_start=types.SimpleNamespace(
+                    runout_helper=types.SimpleNamespace(
+                        filament_present=pin))),
+            get_toolhead_pre_sensor_state=lambda: cache)
+
+    def test_the_pin_beats_a_stale_cache(self):
+        shim = types.SimpleNamespace(name="AMS", logger=_Logger())
+        # Cache says loaded, pin says no filament. The pin wins, so the load
+        # fails and the retry gets its chance.
+        assert afcBambuAMS._toolhead_sensor_triggered(
+            shim, self._lane(pin=False, cache=True)) is False
+        assert afcBambuAMS._toolhead_sensor_triggered(
+            shim, self._lane(pin=True, cache=False)) is True
+
+    def test_no_switch_falls_back_to_the_lane(self):
+        # tool_start = "buffer" has no pin to read; the lane accessor is right.
+        shim = types.SimpleNamespace(name="AMS", logger=_Logger())
+        lane = types.SimpleNamespace(
+            name="lane21",
+            extruder_obj=types.SimpleNamespace(fila_tool_start=None),
+            get_toolhead_pre_sensor_state=lambda: True)
+        assert afcBambuAMS._toolhead_sensor_triggered(shim, lane) is True
+
+
+class TestBiteThenLetItPull:
+    """The AMS pulls the tray back on the mode change into mode:4. That is
+    native -- it is in every working load. The damage is that the extruder is
+    mid-advance when it happens, so the gears drive forward while the unit
+    reels back and the filament is fought from both ends.
+
+    Bite a little, get out of the way, then advance the rest."""
+
+    def _rig(self, tool_stn=40.0, bite=2.0, settle=1.5):
+        order = []
+        clock = _Clock()
+        # The pull "completes" as soon as it is waited on, unless a test says
+        # otherwise -- the interesting cases are ordering and the ceiling.
+        pulls = {"n": 0}
+        lane = types.SimpleNamespace(
+            name="lane21",
+            activate_toolhead_extruder=lambda: order.append("activate"))
+        ext = types.SimpleNamespace(tool_stn=tool_stn, tool_load_speed=7.0)
+        afc = types.SimpleNamespace(
+            reactor=clock,
+            move_e_pos=lambda d, s, label: order.append((label, round(d, 2))))
+        shim = types.SimpleNamespace(
+            name="AMS", logger=_Logger(), afc=afc,
+            tool_bite_mm=bite, pull_settle_s=settle,
+            pull_push_dwell_s=0.0, arrival_select=True,
+            arrival_assist_delay_s=0.0,
+            select_lane=lambda ln: order.append("select"),
+            set_feed_assist=lambda ln, on: order.append(("assist", on)),
+            stop=lambda: order.append("stop"),
+            # The unit reports its pull; the wait is on THAT, not a timer.
+            _pull_seq_now=lambda: pulls["n"],
+            _assist_seq_now=lambda: pulls["n"],
+            _bridge=types.SimpleNamespace(last_pull=lambda: pulls["n"],
+                                          last_assist_done=lambda: pulls["n"]))
+        shim._wait_for_pull = (
+            lambda s0, a0=0: afcBambuAMS._wait_for_pull(shim, s0, a0))
+        return shim, lane, ext, afc, order, clock
+
+    def test_the_bite_lands_before_the_assist_and_the_rest_after(self):
+        shim, lane, ext, afc, order, _ = self._rig()
+        afcBambuAMS._advance_into_extruder(shim, lane, ext)
+        assert order == [
+            "activate",
+            ("tool bite", 2.0),      # gears grip, nothing else moving
+            "select",
+            ("assist", True),        # the unit's pull happens here
+            ("tool stn", 38.0),      # the remainder, into a settled path
+        ]
+
+    def test_it_waits_while_the_unit_pulls(self):
+        shim, lane, ext, afc, order, clock = self._rig(settle=1.5)
+        t0 = clock.monotonic()
+        afcBambuAMS._advance_into_extruder(shim, lane, ext)
+        assert clock.monotonic() - t0 >= 1.5
+
+    def test_bite_zero_advances_in_one_go(self):
+        shim, lane, ext, afc, order, _ = self._rig(bite=0.0, settle=0.0)
+        afcBambuAMS._advance_into_extruder(shim, lane, ext)
+        assert ("tool stn", 40.0) in order
+        assert not any(o[0] == "tool bite" for o in order
+                       if isinstance(o, tuple))
+
+    def test_a_bite_bigger_than_tool_stn_does_not_overshoot(self):
+        shim, lane, ext, afc, order, _ = self._rig(tool_stn=1.0, bite=2.0)
+        afcBambuAMS._advance_into_extruder(shim, lane, ext)
+        moves = [o for o in order if isinstance(o, tuple) and "tool" in str(o[0])]
+        assert sum(d for _, d in moves) == 1.0
+
+
+class TestEnrollmentEchoesAreKnown:
+    """`bind` and `htuid` are emitted once per known unit on EVERY status round.
+    Absent from _BRIDGE_EVENTS_KNOWN they take the "unhandled bridge event"
+    path, which with three units on the wire measured 69 log lines per second
+    inside Klipper's process -- enough to starve the reactor until the CAN
+    toolhead missed a scheduled pin event:
+
+        MCU 'EBBT0' shutdown: Missed scheduling of next digital out event
+
+    A per-round event that is not in this set is a logging storm waiting for a
+    second unit to be plugged in."""
+
+    def test_the_per_round_echoes_are_known(self):
+        from extras.AFC_BambuAMS_bridge import _BRIDGE_EVENTS_KNOWN
+        for evt in ("bind", "htuid"):
+            assert evt in _BRIDGE_EVENTS_KNOWN, (
+                f"{evt} is emitted every status round; unknown means it is "
+                f"logged every status round")
+
+    def test_every_command_echo_we_send_is_known(self):
+        # The same trap, generalised: anything the firmware echoes per round
+        # and we do not recognise becomes per-round log traffic.
+        from extras.AFC_BambuAMS_bridge import _BRIDGE_EVENTS_KNOWN
+        for evt in ("chain", "status", "ack", "units", "htunit"):
+            assert evt in _BRIDGE_EVENTS_KNOWN
+
+
+class TestBiteIsRuntimeToggleable:
+    """The bite is the A/B knob for "does the extruder advance at the sensor
+    help or hurt". Making that test cost a config edit and a restart is how it
+    does not get run."""
+
+    def _shim(self):
+        said = []
+        return types.SimpleNamespace(
+            name="AMS", tool_bite_mm=2.0, pull_settle_s=2.0,
+            pull_push_dwell_s=3.0), said
+
+    def _gcmd(self, **kw):
+        return types.SimpleNamespace(
+            get_float=lambda k, d, minval=None, maxval=None: kw.get(k, d),
+            respond_info=lambda m: kw.setdefault("_said", []).append(m))
+
+    def test_mm_zero_turns_the_bite_off(self):
+        shim, _ = self._shim()
+        afcBambuAMS.cmd_AFC_BAMBU_BITE(shim, self._gcmd(MM=0.0))
+        assert shim.tool_bite_mm == 0.0
+        assert shim.pull_settle_s == 2.0      # settle untouched
+
+    def test_mm_sets_the_bite(self):
+        shim, _ = self._shim()
+        afcBambuAMS.cmd_AFC_BAMBU_BITE(shim, self._gcmd(MM=3.5))
+        assert shim.tool_bite_mm == 3.5
+
+    def test_the_settle_has_its_own_command(self):
+        # Separate mechanisms, separate commands. The bite is about the gears
+        # having hold; the settle is about staying out of the way while the AMS
+        # pulls. One knob with two numbers is how they kept being reasoned
+        # about as a single thing.
+        shim, _ = self._shim()
+        afcBambuAMS.cmd_AFC_BAMBU_SETTLE(shim, self._gcmd(S=4.0))
+        assert shim.pull_settle_s == 4.0
+        assert shim.tool_bite_mm == 2.0        # bite untouched
+
+    def test_the_bite_does_not_touch_the_settle(self):
+        shim, _ = self._shim()
+        afcBambuAMS.cmd_AFC_BAMBU_BITE(shim, self._gcmd(MM=0.0))
+        assert shim.pull_settle_s == 2.0
+
+    def test_no_args_reports_without_changing(self):
+        shim, _ = self._shim()
+        afcBambuAMS.cmd_AFC_BAMBU_BITE(shim, self._gcmd())
+        assert (shim.tool_bite_mm, shim.pull_settle_s) == (2.0, 2.0)
+
+
+class TestTheFollowerIsHeldOffDuringALoad:
+    """cur_lane.status only becomes TOOL_LOADED at the END of a load, so
+    throughout the arrival _tool_loaded_lane() answers None. Without a guard the
+    follower tick reads that as "nothing loaded here anymore", drops the assist
+    the load path just armed, and re-arms it when the status lands -- three mode
+    changes in two seconds at a unit that was loading correctly:
+
+        03:52:24  ack select, ack assist          (load path)
+        03:52:24  standing the follower down for lane23
+        03:52:26  ack select, ack assist          (re-armed)
+
+    The unload already had this guard. The load never did."""
+
+    def test_the_guard_is_set_during_the_load_and_cleared_after(self):
+        seen = []
+        shim = types.SimpleNamespace(_load_in_progress=False)
+        shim._unit_load_lane = lambda ln, ext: (
+            seen.append(shim._load_in_progress), True)[1]
+        assert afcBambuAMS.unit_load_lane(shim, object(), object()) is True
+        assert seen == [True]                 # set while the load runs
+        assert shim._load_in_progress is False   # and cleared after
+
+    def test_it_is_cleared_even_when_the_load_raises(self):
+        # Five returns and it can raise. A load that leaves the guard set would
+        # silence the follower for the rest of the session.
+        shim = types.SimpleNamespace(_load_in_progress=False)
+
+        def boom(ln, ext):
+            raise RuntimeError("bridge went away")
+        shim._unit_load_lane = boom
+        with pytest.raises(RuntimeError):
+            afcBambuAMS.unit_load_lane(shim, object(), object())
+        assert shim._load_in_progress is False
+
+    def test_a_failed_load_also_clears_it(self):
+        shim = types.SimpleNamespace(_load_in_progress=False)
+        shim._unit_load_lane = lambda ln, ext: False
+        assert afcBambuAMS.unit_load_lane(shim, object(), object()) is False
+        assert shim._load_in_progress is False
+
+
+class TestAnHtHasOneBay:
+    """An HT is a single-spool unit. The internal slot arrays stay
+    SLOTS_PER_UNIT wide on every unit type on purpose -- the bridge indexes
+    them by slot number and a short array would fault on a stray frame naming
+    slot 3 -- but PUBLISHING four made an HT look like a four-bay unit:
+
+        BambuAMS_HT  online=True idx=2 slots=4 present=1
+
+    unit_slots already carried the truth; it was not applied on the way out."""
+
+    def _shim(self, unit_slots):
+        return types.SimpleNamespace(
+            unit_slots=unit_slots,
+            _slots=[{"i": 0}, {"i": 1}, {"i": 2}, {"i": 3}])
+
+    def test_an_ht_publishes_one(self):
+        shim = self._shim(1)
+        out = afcBambuAMS._published_slots(shim)
+        assert len(out) == 1
+        assert out[0]["i"] == 0
+
+    def test_a_boxed_unit_publishes_four(self):
+        shim = self._shim(4)
+        assert len(afcBambuAMS._published_slots(shim)) == 4
+
+    def test_the_storage_is_not_narrowed(self):
+        # The trim must be on the way OUT only: a stray frame naming slot 3 at
+        # an HT must still land somewhere rather than raising.
+        shim = self._shim(1)
+        afcBambuAMS._published_slots(shim)
+        assert len(shim._slots) == 4
+
+
+class TestWaitForTheUnitsPull:
+    """Measured on hardware: the AMS's native mode:4 pull ENDED 2.02s after the
+    assist was armed, while the blind settle was 2.00s -- the extruder advance
+    began 20ms before the unit finished pulling, and the captures range the
+    pull 0.5-2.2s. A timer cannot win that. Wait for the unit to say it is
+    done, and keep the timer only as the ceiling."""
+
+    def _shim(self, pulls, settle=2.0):
+        clock = _Clock()
+        return types.SimpleNamespace(
+            name="AMS", logger=_Logger(), pull_settle_s=settle,
+            pull_push_dwell_s=0.0, arrival_select=True,
+            afc=types.SimpleNamespace(reactor=clock),
+            _pull_seq_now=lambda: pulls["n"],
+            _assist_seq_now=lambda: pulls["n"]), clock
+
+    def test_it_returns_as_soon_as_the_unit_reports_the_pull(self):
+        pulls = {"n": 7}
+        shim, clock = self._shim(pulls)
+        # The pull lands on the first poll.
+        orig = shim._pull_seq_now
+        def seq():
+            pulls["n"] = 8      # pull AND push-forward both reported
+            return orig()
+        shim._pull_seq_now = seq
+        shim._assist_seq_now = seq
+        t0 = clock.monotonic()
+        assert afcBambuAMS._wait_for_pull(shim, 7) is True
+        # Returned well inside the 2s ceiling -- only the post-pull grace.
+        assert clock.monotonic() - t0 < 2.0
+
+    def test_it_gives_up_on_the_ceiling_if_the_unit_never_reports(self):
+        # A dialect that does not narrate the pull must still proceed, on
+        # exactly the wait it had before.
+        pulls = {"n": 3}
+        shim, clock = self._shim(pulls, settle=1.0)
+        t0 = clock.monotonic()
+        assert afcBambuAMS._wait_for_pull(shim, 3) is False
+        assert clock.monotonic() - t0 >= 1.0
+
+    def test_settle_zero_does_not_wait_at_all(self):
+        pulls = {"n": 0}
+        shim, clock = self._shim(pulls, settle=0.0)
+        assert afcBambuAMS._wait_for_pull(shim, 0) is False
+        assert clock.monotonic() == 0.0
+
+    def test_the_sequence_is_read_before_the_mode_change(self):
+        # _advance_into_extruder must sample the counter BEFORE select+assist,
+        # or a pull that completes quickly is missed between the two and we
+        # wait the full ceiling into an already-finished pull.
+        import inspect
+        src = inspect.getsource(afcBambuAMS._advance_into_extruder)
+        assert src.index("seq0 = self._pull_seq_now()") < src.index("select_lane")
+        assert src.index("select_lane") < src.index("_wait_for_pull")
+
+
+class TestNoSwitchMeansNoPullToWaitFor:
+    """The pull is caused by the mode-09 select. With arrival_select off we
+    never command the switch, the unit finishes into mode:4 by itself as the
+    printer's does, and no pull happens -- so waiting for one burns the entire
+    ceiling on an event that cannot arrive. Stacked on the arrival assist
+    delay that was ten seconds of dead time before the advance."""
+
+    def test_it_does_not_wait_when_the_select_is_off(self):
+        clock = _Clock()
+        shim = types.SimpleNamespace(
+            name="AMS", logger=_Logger(), pull_settle_s=6.0,
+            pull_push_dwell_s=3.0, arrival_select=False,
+            afc=types.SimpleNamespace(reactor=clock),
+            _pull_seq_now=lambda: 0, _assist_seq_now=lambda: 0)
+        assert afcBambuAMS._wait_for_pull(shim, 0, 0) is False
+        assert clock.monotonic() == 0.0        # not one second spent
+
+    def test_it_still_waits_when_the_select_is_on(self):
+        clock = _Clock()
+        shim = types.SimpleNamespace(
+            name="AMS", logger=_Logger(), pull_settle_s=1.0,
+            pull_push_dwell_s=0.0, arrival_select=True,
+            afc=types.SimpleNamespace(reactor=clock),
+            _pull_seq_now=lambda: 0, _assist_seq_now=lambda: 0)
+        assert afcBambuAMS._wait_for_pull(shim, 0, 0) is False
+        assert clock.monotonic() >= 1.0        # rode out the ceiling
+
+
+class TestALatchedUnitStopsTheLoadLoop:
+    """A jammed AMS latches and will not move again until told to load.
+    Kicking it every load_retry_interval for the rest of the window is the
+    "stuck in the load loop" the operator hit -- minutes of feed commands at a
+    unit that has already given up, with the real failure invisible."""
+
+    def test_a_declared_fault_breaks_the_loop(self):
+        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=30.0)
+        faults = {"n": 0}
+
+        def declared():
+            faults["n"] += 1
+            return faults["n"] == 2      # fault on the second look
+        shim._ams_declared_fault = declared
+        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 30.0) is False
+        # Gave up early rather than riding out the 30s window.
+        assert len(calls["feed"]) <= 2
+
+    def test_no_fault_still_rides_the_window(self):
+        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=0.4)
+        shim._ams_declared_fault = lambda: False
+        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 0.4) is False
+
+
+class TestTheVerdictSurvivesBeingConsumed:
+    """_ams_declared_fault CONSUMES the bridge's sequence -- that is what stops
+    a second consumer raising the same event twice. It also threw away the only
+    account of WHY, and everything downstream then had to guess.
+
+    Measured on the HT, lane23:
+
+        10:46:05.661  AMS: ...state:7... [AMS_LED]TIMEOUT error 0
+        10:46:05.668  the AMS reported a fault during the load; stopping
+        10:49:34      "Filament did not reach the toolhead sensor within 101s
+                       ... Check the filament path and afc_bowden_length
+                       calibration."
+
+    The break worked, in 7ms. The operator was still sent to measure a bowden
+    that had nothing to do with it.
+    """
+
+    def _shim(self, seq=4, text="[AMS_LED]TIMEOUT error 0"):
+        shim = types.SimpleNamespace(
+            _bridge=types.SimpleNamespace(
+                last_fault=lambda: (seq, text, 0.0)),
+            _fault_seen=0, _declared_fault_text=None)
+        # The real accessor, so the filter under test is the shipped one.
+        shim._ams_fault_since = (
+            lambda mark, consume=True:
+                afcBambuAMS._ams_fault_since(shim, mark, consume))
+        return shim
+
+    def test_the_words_are_kept(self):
+        shim = self._shim()
+        assert afcBambuAMS._ams_declared_fault(shim) is True
+        assert "TIMEOUT error 0" in shim._declared_fault_text
+
+    def test_the_sequence_is_still_consumed(self):
+        shim = self._shim(seq=4)
+        afcBambuAMS._ams_declared_fault(shim)
+        assert shim._fault_seen == 4
+        # ...and a second look is not a second fault.
+        assert afcBambuAMS._ams_declared_fault(shim) is False
+
+    def test_nothing_new_leaves_the_text_alone(self):
+        shim = self._shim(seq=0, text="")
+        assert afcBambuAMS._ams_declared_fault(shim) is False
+        assert shim._declared_fault_text is None
+
+    def test_a_benign_bump_is_not_a_verdict(self):
+        # A scan ending its pull-in advances the bridge's sequence and means
+        # nothing; it must not become the reason a load is reported to have
+        # failed.
+        shim = self._shim(seq=9, text="[AMS_SWITCH]bldc stall exit")
+        assert afcBambuAMS._ams_declared_fault(shim) is False
+        assert shim._declared_fault_text is None
+
+
+class TestAms1FaultReachesEveryErrorPath:
+    """AMS 1 answers in STATE, not words. Every fault path in the unit reads
+    the same bridge accessor, so covering it at the source covers them all --
+    this pins that they still do, and that none grows its own word list."""
+
+    def test_all_four_paths_read_last_fault(self):
+        # Either directly, or through _ams_fault_since -- which reads it and is
+        # pinned to below, so the chain still ends at the bridge. The unload
+        # paths reach it the same way.
+        import inspect
+        for name in ("get_status", "_check_ams_fault",
+                     "_ams_declared_fault", "_ack_faults",
+                     "unit_unload_lane", "eject_lane"):
+            src = inspect.getsource(getattr(afcBambuAMS, name))
+            assert "last_fault" in src or "_ams_fault_s" in src, (
+                f"{name} must take its faults from the bridge, or the AMS 1's "
+                f"state-only give-up will be invisible to it")
+
+    def test_the_shared_accessor_reads_the_bridge(self):
+        import inspect
+        for name in ("_ams_fault_seq", "_ams_fault_since"):
+            assert "last_fault" in inspect.getsource(
+                getattr(afcBambuAMS, name))
+
+    def test_no_path_matches_fault_words_itself(self):
+        # A path with its own "stall"/"timeout" list would silently exclude the
+        # AMS 1 again, because AMS 1 never uses those words.
+        import inspect
+        for name in ("_check_ams_fault", "_ams_declared_fault", "_ack_faults"):
+            src = inspect.getsource(getattr(afcBambuAMS, name))
+            for word in ('"stall"', "'stall'", '"timeout error"'):
+                assert word not in src, (
+                    f"{name} matches fault text itself; the AMS 1 says none of "
+                    f"those words -- keep detection in the bridge")

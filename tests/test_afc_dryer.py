@@ -295,7 +295,7 @@ class TestRequestDry:
     def test_bambu_start_builds_its_gcode(self):
         panel, printer = _panel([FakeBambu("AMS_2")])
         script = panel.request_dry("AMS_2", "start", 55, 480, 1)
-        assert script == "BAMBU_HEATER_START UNIT=AMS_2 TEMP=55 TIME=480 ROTATE=1"
+        assert script == "AFC_BAMBU_HEATER_START UNIT=AMS_2 TEMP=55 TIME=480 ROTATE=1"
 
     def test_ace_start_uses_duration_not_time(self):
         panel, _ = _panel([FakeAce("Ace2_1")])
@@ -305,7 +305,7 @@ class TestRequestDry:
     def test_stop_is_per_vendor(self):
         panel, _ = _panel([FakeBambu("AMS_2"), FakeAce("Ace2_1")])
         assert panel.request_dry("AMS_2", "stop", 0, 0, 0) == \
-            "BAMBU_HEATER_STOP UNIT=AMS_2"
+            "AFC_BAMBU_HEATER_STOP UNIT=AMS_2"
         assert panel.request_dry("Ace2_1", "stop", 0, 0, 0) == \
             "ACE_DRY_STOP UNIT=Ace2_1"
 
@@ -368,7 +368,7 @@ class TestRequestDry:
         assert len(printer.reactor.async_calls) == 1
         printer.reactor.async_calls[0](0.0)         # reactor runs it
         assert printer.gcode.scripts == [
-            "BAMBU_HEATER_START UNIT=AMS_2 TEMP=55 TIME=480 ROTATE=0"]
+            "AFC_BAMBU_HEATER_START UNIT=AMS_2 TEMP=55 TIME=480 ROTATE=0"]
 
     def test_a_failing_script_does_not_escape(self):
         panel, printer = _panel([FakeBambu("AMS_2")])
@@ -797,11 +797,10 @@ class TestGenericBackendEnvironmentReadings:
 
 
 class TestArtworkLaysBaysOutInOneRow:
-    """The ACE used to be drawn as a 2-over-2 grid. No real unit is stacked
-    that way -- an ACE stands its four spools side by side exactly as an AMS
-    does -- so every unit except the single-bay HT shares one wide-row
-    renderer. These assert on the shipped page source, which is the only place
-    the artwork exists."""
+    """No real unit is stacked as a 2-over-2 grid -- an ACE stands its four
+    spools side by side exactly as an AMS does -- so every unit except the
+    single-bay HT shares one wide-row renderer. These assert on the shipped
+    page source, which is the only place the artwork exists."""
 
     def _art(self):
         from extras.afc_dryer import PAGE
@@ -1053,11 +1052,11 @@ class TestDryRefusalReachesTheCard:
     """Reported from the machine: the card said nothing when a dry was refused
     with a lane at the toolhead. Two layers hid it, and both were host state
     standing in for machine state -- the backend suppressed the reason while
-    self._drying was set (which BAMBU_HEATER_START sets whether or not the AMS
+    self._drying was set (which AFC_BAMBU_HEATER_START sets whether or not the AMS
     accepted), and the page returned 'Idle' before ever consulting it."""
 
     """An AMS that refuses to dry echoes our temp/time back first, so the
-    command IS delivered and BAMBU_HEATER_START reports success. Without the
+    command IS delivered and AFC_BAMBU_HEATER_START reports success. Without the
     reason on the card, the unit just sits at "not drying" and nothing says
     why."""
 

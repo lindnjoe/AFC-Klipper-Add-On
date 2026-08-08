@@ -29,7 +29,7 @@ from extras.AFC_RFID import (
     map_tag_to_slot_info,
     sync_rfid_to_spoolman,
 )
-import extras.AFC_ACE2_rfid as ace2
+import extras.AFC_rfid_readers as readers
 
 
 def _ns(**kw):
@@ -571,26 +571,26 @@ def _bambu_image(nozzle=0.4, spool_width=6620, length=330):
 
 class TestDecodeBambuRich:
     def test_nozzle_spool_width_length_parsed(self):
-        f = ace2.decode_bambu(_bambu_image())
+        f = readers.decode_bambu(_bambu_image())
         assert f["nozzle_diameter"] == 0.4
         assert f["spool_width_mm"] == 6620 / 100.0
         assert f["length_m"] == 330
 
     def test_nozzle_zero_is_none(self):
-        f = ace2.decode_bambu(_bambu_image(nozzle=0.0))
+        f = readers.decode_bambu(_bambu_image(nozzle=0.0))
         assert f["nozzle_diameter"] is None
 
     def test_nozzle_out_of_range_is_none(self):
         # garbage float in an unwritten block must not surface as a nozzle
-        f = ace2.decode_bambu(_bambu_image(nozzle=87.0))
+        f = readers.decode_bambu(_bambu_image(nozzle=87.0))
         assert f["nozzle_diameter"] is None
 
     def test_spool_width_zero_is_none(self):
-        f = ace2.decode_bambu(_bambu_image(spool_width=0))
+        f = readers.decode_bambu(_bambu_image(spool_width=0))
         assert f["spool_width_mm"] is None
 
     def test_length_zero_is_none(self):
-        f = ace2.decode_bambu(_bambu_image(length=0))
+        f = readers.decode_bambu(_bambu_image(length=0))
         assert f["length_m"] is None
 
 
@@ -598,7 +598,7 @@ class TestDecodeBambuRich:
 
 def _anycubic_image(length=330):
     d = bytearray(0x80)
-    d[0x10:0x14] = ace2.ANYCUBIC_MAGIC
+    d[0x10:0x14] = readers.ANYCUBIC_MAGIC
     d[0x3C:0x3F] = b"PLA"
     d[0x7A:0x7C] = struct.pack("<H", length)
     return bytes(d)
@@ -606,12 +606,12 @@ def _anycubic_image(length=330):
 
 class TestDecodeAnycubicLength:
     def test_length_kept(self):
-        f = ace2.decode_anycubic(_anycubic_image(length=330))
+        f = readers.decode_anycubic(_anycubic_image(length=330))
         assert f["length_m"] == 330
         assert f["weight_g"] == 1000                  # 330 -> 1000g per table
 
     def test_length_zero_is_none(self):
-        f = ace2.decode_anycubic(_anycubic_image(length=0))
+        f = readers.decode_anycubic(_anycubic_image(length=0))
         assert f["length_m"] is None
 
 
@@ -624,12 +624,12 @@ def _creality_payload(length_hex=b"0165"):
 
 class TestDecodeCrealityLength:
     def test_length_kept(self):
-        f = ace2.decode_creality(_creality_payload(b"0165"))
+        f = readers.decode_creality(_creality_payload(b"0165"))
         assert f["length_m"] == 0x165                 # 357 m
         assert f["weight_g"] == 500
 
     def test_length_zero_is_none(self):
-        f = ace2.decode_creality(_creality_payload(b"0000"))
+        f = readers.decode_creality(_creality_payload(b"0000"))
         assert f["length_m"] is None
         assert f["weight_g"] is None
 

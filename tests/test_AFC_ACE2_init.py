@@ -1,6 +1,6 @@
 # Construction tests for extras/AFC_ACE2.py.
 #
-# The ACE Pro 2 inherits nearly everything from the V1 ACE and overrides a
+# The ACE 2 Pro inherits nearly everything from the V1 ACE and overrides a
 # handful of values that are wrong for the newer hardware. Those overrides are
 # the whole point of the subclass, and each one is a field failure if it
 # regresses:

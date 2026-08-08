@@ -8,7 +8,7 @@
 #
 # The ViViD carries two MFRC522 (MIFARE Classic 1K, 13.56 MHz) readers on a
 # shared Klipper SPI bus, distinguished only by their CS pin — each reader serves
-# a PAIR of slots. Unlike the ACE Pro 2 there is no coil-enable / antenna-mux
+# a PAIR of slots. Unlike the ACE 2 Pro there is no coil-enable / antenna-mux
 # GPIO: the selector stepper mechanically positions the chosen slot's filament
 # tip in front of its reader's fixed antenna, so a read targets whichever slot is
 # currently selected. The RF field is toggled per-read via the MFRC522
@@ -34,14 +34,14 @@ from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 # defers `import mcu` — so this module imports without the full Klipper tree
 # (e.g. in unit tests, where no SPI hardware is built).
 
-# Reuse the ACE2's transport-agnostic MFRC522 + MIFARE + multi-manufacturer decode
+# The shared transport-agnostic MFRC522 + MIFARE + multi-manufacturer decode
 # stack. read_tag() only needs an object exposing reg_read(reg)/reg_write(reg,val).
 # Mfrc522/MifareClassic give a FAST UID-only detect (activate) for the stage poll.
 try: from extras.AFC_utils import ERROR_STR
 except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
 
-try: from extras.AFC_ACE2_rfid import read_tag, Mfrc522, MifareClassic
-except: raise error(ERROR_STR.format(import_lib="AFC_ACE2_rfid", trace=traceback.format_exc()))
+try: from extras.AFC_rfid_readers import read_tag, Mfrc522, MifareClassic
+except: raise error(ERROR_STR.format(import_lib="AFC_rfid_readers", trace=traceback.format_exc()))
 
 try: from extras.AFC_RFID import (format_tag_summary, AFCUnitRFID,
     map_tag_to_slot_info,

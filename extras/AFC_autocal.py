@@ -804,7 +804,7 @@ class AFC_autocal:
         cleanup timer (extruder_move_cb) that calls flush_step_generation(); if a
         calibration's homing/drip move overlaps that cleanup, the flush raises
         DripModeEndSignal and shuts Klipper down. Non-U1 loads don't set this
-        flag, so they calibrate immediately as before.
+        flag, so they calibrate immediately.
 
         :param lane: The lane whose extruder to check
         :return bool: True if an extruder load is in flight

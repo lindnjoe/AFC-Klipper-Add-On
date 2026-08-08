@@ -1,5 +1,5 @@
 """
-Branch-coverage tests for extras/AFC_ACE2.py (the ACE Pro 2 V2 serial
+Branch-coverage tests for extras/AFC_ACE2.py (the ACE 2 Pro V2 serial
 transport/protocol), covering the paths the other ACE2 test files leave
 untested:
 

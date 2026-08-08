@@ -21,7 +21,7 @@ import extras.afc_dryer as dryer
 class _Panel:
     """Stand-in for AFCDryer: records what the handler asked it to do."""
 
-    def __init__(self, state=None, raises=None, script="BAMBU_HEATER_START X"):
+    def __init__(self, state=None, raises=None, script="AFC_BAMBU_HEATER_START X"):
         self.logger = types.SimpleNamespace(debug=lambda *a, **k: None)
         self._state = state if state is not None else {"units": []}
         self._raises = raises
@@ -144,7 +144,7 @@ class TestPost:
         h = self._post(panel, {"unit": "AMS_HT", "action": "start",
                                "temp": 55, "minutes": 480, "rotate": 1})
         assert h.status == 200
-        assert _body_json(h) == {"ok": True, "queued": "BAMBU_HEATER_START X"}
+        assert _body_json(h) == {"ok": True, "queued": "AFC_BAMBU_HEATER_START X"}
         assert panel.calls == [{"name": "AMS_HT", "action": "start",
                                 "temp": 55, "minutes": 480, "rotate": 1}]
 

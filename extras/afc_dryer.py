@@ -2,7 +2,7 @@
 #
 # Bambu AMS 2 Pro / AMS HT and Anycubic ACE units all have drying heaters, and
 # all of them are otherwise driven by typed G-code with different names, units
-# and argument spellings (BAMBU_HEATER_START ... TIME=minutes vs
+# and argument spellings (AFC_BAMBU_HEATER_START ... TIME=minutes vs
 # ACE_DRY ... DURATION=minutes). This serves a single control panel for all of
 # them, discovered from the printer config at startup: whatever dryers exist in
 # AFC.cfg appear here, drawn to match their hardware.
@@ -56,7 +56,7 @@ from typing import Any, Dict, List, Optional
 # default) and an AMS HT (85 C) share one list without either being wrong.
 TEMP_CHOICES = (40, 45, 50, 55, 60, 65, 70, 75, 80, 85)
 # Minutes, 1..12 h in whole hours. Sent as minutes because that is what both
-# vendors' commands take (BAMBU_HEATER_START TIME= / ACE_DRY DURATION=); the
+# vendors' commands take (AFC_BAMBU_HEATER_START TIME= / ACE_DRY DURATION=); the
 # labels are hours because that is how dry cycles are quoted.
 TIME_CHOICES = tuple((h * 60, "%d h" % h) for h in range(1, 13))
 
@@ -319,11 +319,11 @@ class _BambuBackend(_Backend):
         return out
 
     def start_script(self, name, temp, minutes, rotate):
-        return ("BAMBU_HEATER_START UNIT=%s TEMP=%d TIME=%d ROTATE=%d"
+        return ("AFC_BAMBU_HEATER_START UNIT=%s TEMP=%d TIME=%d ROTATE=%d"
                 % (name, temp, minutes, rotate))
 
     def stop_script(self, name):
-        return "BAMBU_HEATER_STOP UNIT=%s" % (name,)
+        return "AFC_BAMBU_HEATER_STOP UNIT=%s" % (name,)
 
 
 class _AceBackend(_Backend):
@@ -1003,9 +1003,9 @@ function art(u){
       bay(43, 52, 27, bays[0] || {}, 9) +
       '<rect x="20" y="88" width="46" height="8" rx="4" fill="var(--line)" opacity=".6"/></svg>';
   }
-  // One wide row of bays for everything except the HT. The ACE used to be
-  // drawn as a 2-over-2 grid, which no real unit is: an ACE stands its four
-  // spools side by side exactly as an AMS does. Sharing the renderer also
+  // One wide row of bays for everything except the HT. No real unit is a
+  // 2-over-2 grid: an ACE stands its four spools side by side exactly as an
+  // AMS does. Sharing the renderer also
   // means a unit with any bay count -- a 5-lane BoxTurtle listed read-only,
   // say -- draws correctly without another special case.
   var b = '';

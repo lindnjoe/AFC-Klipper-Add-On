@@ -5,7 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
 # Shared RFID decode keys, configured ONCE and used by every host-side AFC RFID
-# reader on this printer (ACE Pro 2, ViViD/BTT MMS). A reader's own section can
+# reader on this printer (ACE 2 Pro, ViViD/BTT MMS). A reader's own section can
 # still override any key; anything it leaves unset falls back to here.
 #
 #   [AFC_rfid_keys]

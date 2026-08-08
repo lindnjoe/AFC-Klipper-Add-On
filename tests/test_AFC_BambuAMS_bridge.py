@@ -1,10 +1,9 @@
 # Tests for extras/AFC_BambuAMS_bridge.py — the serial transport.
 #
 # This module imports only the standard library, so it can be driven end to end
-# with a fake serial port. That is the whole reason it was split out of the
-# unit driver: the reader thread, the reconnect path and the event dispatch are
-# where a fault is invisible (the bridge keeps reporting the last thing it
-# knew), and none of it needs a printer to exercise.
+# with a fake serial port and no printer. That matters because the reader
+# thread, the reconnect path and the event dispatch are where a fault is
+# invisible — the bridge keeps reporting the last thing it knew.
 from __future__ import annotations
 
 import json
@@ -106,7 +105,7 @@ class TestEventDispatch:
     def test_routine_command_echoes_are_not_surfaced(self):
         # These arrive on every prep; they would be console noise at startup.
         b, r, lg = _bridge()
-        for e in ("mcaddr", "selfc", "armms", "hb", "mute", "units"):
+        for e in ("mcaddr", "armms", "hb", "mute", "units"):
             _feed(b, '{"evt":"%s"}' % e)
         assert not any("unhandled" in m for m in lg.file_only)
 
@@ -186,16 +185,29 @@ class TestNarrationToConsole:
         b.name = "BambuAMS_1"
         return b, r, lg
 
+    # One dialect-agnostic rule, so one message. Splitting it per prefix
+    # ([AMS_DEV] vs [AMS_RFID]) gives the same event two phrasings and still
+    # misses the third unit's punctuation.
     def test_a_matched_line_is_rendered_in_english(self):
         b, r, lg = self._b()
         b._narrate_human("[AMS_DEV] STEP:read success", 100.0)
-        assert any("tag read OK" in m for m in lg.texts("info"))
+        assert any("read the spool tag" in m for m in lg.texts("info"))
+
+    def test_every_dialect_renders_the_SAME_message(self):
+        """One event, one sentence -- whichever unit said it."""
+        for line in ("[AMS_DEV] STEP:read success",
+                     "[AMS_RFID]STEP:read success",
+                     "[AMS_RFID] STEP3,read success ,goto Cali"):
+            b, r, lg = self._b()
+            b._narrate_human(line, 100.0)
+            assert any("read the spool tag" in m for m in lg.texts("info")), line
 
     def test_the_same_line_twice_is_said_once(self):
         b, r, lg = self._b()
         b._narrate_human("[AMS_DEV] STEP:read success", 100.0)
         b._narrate_human("[AMS_DEV] STEP:read success", 200.0)
-        assert len([m for m in lg.texts("info") if "tag read OK" in m]) == 1
+        assert len([m for m in lg.texts("info")
+                    if "read the spool tag" in m]) == 1
 
     def test_a_burst_is_rate_limited_to_one_a_second(self):
         b, r, lg = self._b()
@@ -864,7 +876,7 @@ class TestFinishJudgementDoesNotDeadlock:
 
 class TestOdometerCompletions:
     """A boxed AMS narrates in the [AMS_DEV] dialect and NEVER says "finish",
-    so every one of its moves used to run the full 35 s watchdog. It does say
+    so without these its moves each run the full 35 s watchdog. It does say
     when a tray engages and when one leaves -- in odometer terms. Lines and
     order verbatim from one load and one unload of lane15."""
 
@@ -990,14 +1002,27 @@ class TestAms2ProVocabulary:
                "idx_set:3, idx_ref:3")
         assert seq == before + 1 and ok is True
 
-    def test_e_in_is_an_arrival(self):
-        # Fires BEFORE the feed completes and says where the filament is --
-        # the unit's own toolhead-sensor equivalent.
+    def test_e_in_does_NOT_complete_a_move(self):
+        # Read as "extruder in" and treated as an arrival at first. Probably
+        # wrong: in BOTH captures containing it, an err_code transition
+        # follows within a second, and neither capture is of a healthy load.
+        # Nothing on hardware has emitted it in a full day of cycles, which
+        # fits an error that has not happened rather than an arrival that
+        # should occur every load. Completing a move on what may be an error
+        # report is the outcome worth ruling out while the meaning is unknown.
         b, r, lg = _bridge()
         before = b.last_finish()[0]
-        seq, ok, _t = self._say(
+        self._say(
             b, "[AMS_SWITCH]e_in tray:0,buff_pos:-0.34,i:0.566A,len:1.670m")
-        assert seq == before + 1 and ok is True
+        assert b.last_finish()[0] == before
+
+    def test_e_in_still_yields_its_buffer_reading(self):
+        # The pattern is kept: the line reaches the log and its buff_pos is
+        # still read. Only the completion effect is removed.
+        b, r, lg = _bridge()
+        self._say(
+            b, "[AMS_SWITCH]e_in tray:0,buff_pos:-0.34,i:0.566A,len:1.670m")
+        assert b.last_buff_pos() == pytest.approx(-0.34)
 
     def test_e_in_records_the_buffer_position(self):
         b, r, lg = _bridge()
@@ -1143,3 +1168,397 @@ class TestDryRefusal:
         b.handle_line(json.dumps({"evt": "amsdbg",
                                   "text": "[AMS_CHMB]err, filament hub load!"}))
         assert b.last_dry_error(0x1800) is None
+
+
+class TestTrayNowIsNotACompletion:
+    """tray_now:255 looked like the AMS 2 Pro's wording for "the tray has
+    left". On one unload it tracked perfectly -- retract at 13:42:27,
+    tray_now:255 from 13:42:43, 19 s before AFC gave up on its watchdog.
+
+    It is not that. The same line appears while the unit is LOADED and
+    FOLLOWING:
+
+        [AMS_COMMON]state:4,tray_now:255,tray_exit:1
+        [AMS_SWITCH]tray:0, bldc slip, dw_pos:-0.000 m
+
+    Used as a completion it ends a move early on a unit merely sitting between
+    trays, which is the failure the completion path exists to prevent."""
+
+    def _say(self, b, text, addr=0x0700):
+        b.handle_line(json.dumps({"evt": "amsdbg", "text": text, "addr": addr}))
+
+    def test_the_state_line_does_NOT_complete_a_retract(self):
+        b, r, lg = _bridge()
+        before = b.last_finish()[0]
+        self._say(b, "[AMS_COMMON]state:2,tray_now:255,tray_exit:1")
+        assert b.last_finish()[0] == before
+
+    def test_it_does_not_complete_while_following_either(self):
+        # The verbatim line that disproved the reading.
+        b, r, lg = _bridge()
+        before = b.last_finish()[0]
+        self._say(b, "[AMS_COMMON]state:4,tray_now:255,tray_exit:1")
+        self._say(b, "[AMS_SWITCH]tray:0, bldc slip, dw_pos:-0.000 m")
+        assert b.last_finish()[0] == before
+
+    def test_the_odometer_form_still_completes_one(self):
+        # A boxed AMS's own marker is unaffected and still works.
+        b, r, lg = _bridge()
+        before = b.last_finish()[0]
+        self._say(b, "[AMS_DEV] STEP:odom tray_id error 255")
+        assert b.last_finish()[0] == before + 1
+
+class TestTubeLenPerUnit:
+    """An AMS 1 and an AMS 2 Pro both narrate as 0x0700, so the device address
+    cannot say which measured a path. Live risk on hardware: AMS 2 measured
+    3532 mm while AMS 1 was still on the 3000 mm default, and address-keyed
+    lookup would have adopted one into the other's config."""
+
+    def _say(self, b, text, addr=0x0700):
+        b.handle_line(json.dumps({"evt": "amsdbg", "text": text, "addr": addr}))
+
+    def test_address_keying_still_works_with_no_active_unit(self):
+        b, r, lg = _bridge()
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        assert b.tube_len(0x0700) == pytest.approx(3532.0)
+
+    def test_two_units_on_one_address_do_not_collide(self):
+        b, r, lg = _bridge()
+        b.set_active_unit(1)
+        self._say(b, "[AMS_SWITCH]new tube_len:3000 mm, list:3000,3000,0 mm")
+        b.set_active_unit(2)
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        assert b.tube_len(0x0700, unit=1) == pytest.approx(3000.0)
+        assert b.tube_len(0x0700, unit=2) == pytest.approx(3532.0)
+
+    def test_a_unit_that_never_measured_reads_nothing(self):
+        # No falling back to the address: on a bus with two boxed units that
+        # hands unit 1 whatever unit 2 last measured.
+        b, r, lg = _bridge()
+        b.set_active_unit(2)
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        assert b.tube_len(0x0700, unit=1) is None
+
+    def test_clearing_the_active_unit_stops_attributing(self):
+        b, r, lg = _bridge()
+        b.set_active_unit(2)
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        b.set_active_unit(None)
+        self._say(b, "[AMS_SWITCH]new tube_len:9999 mm, list:9999,9999,0 mm")
+        assert b.tube_len(0x0700, unit=2) == pytest.approx(3532.0)
+        assert b.tube_len(0x0700) == pytest.approx(9999.0)
+
+    def test_an_uncalibrated_zero_is_still_dropped(self):
+        b, r, lg = _bridge()
+        b.set_active_unit(2)
+        self._say(b, "[AMS_SWITCH]old tube_len:0 mm, list:3534,0,0 mm")
+        assert b.tube_len(0x0700, unit=2) is None
+
+
+class TestTubeLenDoesNotLeakBetweenUnits:
+    """Two units of the same class share a device address, so the address map
+    holds whichever measured last. Falling back to it for a unit that has not
+    measured hands one unit the other's path.
+
+    Observed on hardware with both boxed units present: AMS 2 measured 3532 mm
+    and AMS 1, which had never measured, read 3532 mm through the address --
+    and would have adopted it as its own bowden length on its next load."""
+
+    def _say(self, b, text, addr=0x0700):
+        b.handle_line(json.dumps({"evt": "amsdbg", "text": text, "addr": addr}))
+
+    def test_a_unit_that_never_measured_reads_nothing(self):
+        b, r, lg = _bridge()
+        b.set_active_unit(2)
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        assert b.tube_len(0x0700, unit=2) == pytest.approx(3532.0)
+        assert b.tube_len(0x0700, unit=1) is None      # NOT 3532
+
+    def test_the_address_fallback_still_works_before_any_attribution(self):
+        # Single-unit bus, or anything that never set an active unit.
+        b, r, lg = _bridge()
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        assert b.tube_len(0x0700, unit=1) == pytest.approx(3532.0)
+        assert b.tube_len(0x0700) == pytest.approx(3532.0)
+
+    def test_each_unit_keeps_its_own_once_both_have_measured(self):
+        b, r, lg = _bridge()
+        b.set_active_unit(1)
+        self._say(b, "[AMS_SWITCH]new tube_len:2900 mm, list:2900,2900,0 mm")
+        b.set_active_unit(2)
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        assert b.tube_len(0x0700, unit=1) == pytest.approx(2900.0)
+        assert b.tube_len(0x0700, unit=2) == pytest.approx(3532.0)
+
+    def test_an_unmeasured_unit_keeps_its_configured_value(self):
+        # None is the correct answer: _adopt_measured_path leaves the
+        # configured length alone rather than adopting a neighbour's.
+        b, r, lg = _bridge()
+        b.set_active_unit(2)
+        self._say(b, "[AMS_SWITCH]new tube_len:3532 mm, list:3534,3531,0 mm")
+        assert b.tube_len(0x1800, unit=0) is None
+
+
+class TestNarrationLogPerMaster:
+    """One narration log per BUS MASTER. Two Picos writing one file cannot be
+    untangled afterwards: the only per-line attribution is the device address,
+    and two boxed units on different buses both narrate as 0x0700."""
+
+    def _clear(self, *names):
+        for n in names:
+            lg = logging.getLogger(n)
+            for h in list(lg.handlers):
+                h.close()
+                lg.removeHandler(h)
+
+    def setup_method(self):
+        self._clear("AFC_BambuAMS_file", "AFC_BambuAMS_file_ttyACM1")
+
+    teardown_method = setup_method
+
+    def test_no_tag_keeps_the_original_filename(self):
+        # A single-Pico printer must be completely unchanged.
+        b, r, lg = _bridge()
+        assert b.set_narration_log(str(pytest.importorskip("tempfile") and
+                                        __import__("tempfile").mkdtemp())) is True
+
+    def test_a_tagged_master_writes_its_own_file(self, tmp_path):
+        b, r, lg = _bridge()
+        b.set_narration_log(str(tmp_path), "ttyACM1")
+        b.handle_line(json.dumps({"evt": "amsdbg", "addr": 0x0700,
+                                  "text": "[AMS_DEV] STEP:odom reset tray 0"}))
+        for h in logging.getLogger("AFC_BambuAMS_file_ttyACM1").handlers:
+            h.flush()
+        assert (tmp_path / "AFC_BambuAMS_ttyACM1.log").exists()
+        assert not (tmp_path / "AFC_BambuAMS.log").exists()
+
+    def test_two_masters_do_not_share_a_file(self, tmp_path):
+        a, _r, _l = _bridge()
+        b, _r2, _l2 = _bridge()
+        a.set_narration_log(str(tmp_path))
+        b.set_narration_log(str(tmp_path), "ttyACM1")
+        a.handle_line(json.dumps({"evt": "amsdbg", "addr": 0x0700,
+                                  "text": "bus one speaking"}))
+        b.handle_line(json.dumps({"evt": "amsdbg", "addr": 0x0700,
+                                  "text": "bus two speaking"}))
+        for n in ("AFC_BambuAMS_file", "AFC_BambuAMS_file_ttyACM1"):
+            for h in logging.getLogger(n).handlers:
+                h.flush()
+        one = (tmp_path / "AFC_BambuAMS.log").read_text()
+        two = (tmp_path / "AFC_BambuAMS_ttyACM1.log").read_text()
+        assert "bus one speaking" in one and "bus two speaking" not in one
+        assert "bus two speaking" in two and "bus one speaking" not in two
+
+
+# ── capacity narration: three units, four forms ─────────────────────────────
+# Captured 2026-08-05 with each unit ALONE on the wire, so every string below
+# is provably that unit's. The units disagree about the prefix, the separator,
+# the spacing AND the spelling, and a pattern anchored on any one of them
+# silently matches nothing on the other two -- which is exactly how the
+# "measured weight never updates" bug survived: the old pattern required both
+# a "C:" and a "%", so it saw only the live HT form and ignored every restore
+# and the whole AMS 2 dialect.
+CAP_LINES = [
+    # (label, narration, tray, circumference, radius, percent, restored)
+    ("HT live",
+     "[AMS_RFID] STEP4,odom C:0.531,R:0.084,P:107%,od:1.132",
+     None, 0.531, 0.084, 107, False),
+    ("AMS 1 live -- [AMS_DEV] prefix, spaces after every comma",
+     "[AMS_DEV] STEP:odom C:0.480, R:0.076, P:78%, od:0.988",
+     None, 0.480, 0.076, 78, False),
+    ("AMS 2 restore -- no C:, no % sign",
+     "[AMS_RFID]STEP:odom load from flash 2,R:0.072,P:65",
+     2, None, 0.072, 65, True),
+    ("HT restore",
+     "[AMS_RFID] STEP:odom load from flash 0,R:0.088,P:119",
+     0, None, 0.088, 119, True),
+]
+
+
+@pytest.mark.parametrize(
+    "label,text,tray,circ,radius,pct,restored", CAP_LINES,
+    ids=[c[0] for c in CAP_LINES])
+def test_capacity_narration_parses_every_dialect(
+        label, text, tray, circ, radius, pct, restored):
+    m = br._CAP_MEASURE_RE.search(text)
+    assert m is not None, f"{label}: no match -- {text}"
+    g_tray, g_circ, g_radius, g_pct = m.groups()
+    assert (int(g_tray) if g_tray is not None else None) == tray
+    assert (float(g_circ) if g_circ else None) == circ
+    assert float(g_radius) == radius
+    assert int(g_pct) == pct
+    assert (g_tray is not None) is restored
+
+
+def test_capacity_circumference_agrees_with_radius():
+    """C = 2*pi*R on every live measurement.
+
+    This is the check that the field mapping is real rather than three numbers
+    that happen to line up: the unit computes both, so they must agree. It
+    caught nothing when written -- which is the point. If someone reorders the
+    groups, this fails where an eyeball would not.
+    """
+    import math
+    for label, text, _tray, circ, radius, _pct, _r in CAP_LINES:
+        if circ is None:
+            continue                      # restore form states no circumference
+        assert abs(circ - 2 * math.pi * radius) < 0.005, label
+
+
+def test_calibration_done_matches_both_spellings():
+    """The HT misspells it. One 's'."""
+    assert br._CALI_DONE_RE.search("[AMS_RFID] STEP4,odom calib sucess")
+    m = br._CALI_DONE_RE.search(
+        "[AMS_DEV] STEP:odom calib success exit 0,dis:0.989")
+    assert m and m.group(1) == "0"
+
+
+def test_capacity_pattern_ignores_unrelated_odom_chatter():
+    """Must not fire on the odometer lines that surround a real measurement."""
+    for noise in ("[AMS_DEV] STEP:odom search, odo 1.856",
+                  "[AMS_DEV] STEP:odom reset tray 0",
+                  "[AMS_RFID] STEP,odom load tray 3 info invailed",
+                  "[AMS_RFID] STEP,odom save R nan, exit"):
+        assert br._CAP_MEASURE_RE.search(noise) is None, noise
+
+
+# ── dialect tolerance: the three units do not share a vocabulary ────────────
+# Counted over 2026-08-05 single-unit captures, where every fragment is
+# provably one unit's:
+#
+#   HT     [AMS_SWITCH] [AMS_COMMON] [AMS_LINK] [AMS_LED] [AMS_TRAY] [AMS_CHMB]
+#   AMS 2  the same, plus [AMS_RFID] [AMS_PMSM]
+#   AMS 1  [AMS_DEV] almost exclusively (63 of 64 fragments), plus [AMS_CALL]
+#
+# So a rule anchored on any one bracket tag is structurally blind to at least
+# one unit. These are REAL lines, copied verbatim from the captures.
+DIALECT_LINES = [
+    # (event, HT form, AMS 2 form, AMS 1 form)
+    ("tag read",
+     "[AMS_RFID] STEP3,read success ,goto Cali",
+     "[AMS_RFID]STEP:read success",
+     "[AMS_DEV] STEP:read success"),
+    ("calibration done",
+     "[AMS_RFID] STEP4,odom calib sucess",          # HT misspells it
+     "[AMS_RFID]STEP:odom calib success",
+     "[AMS_DEV] STEP:odom calib success exit 0,dis:0.989"),
+]
+
+
+@pytest.mark.parametrize("event,ht,ams2,ams1",
+                         DIALECT_LINES, ids=[c[0] for c in DIALECT_LINES])
+def test_a_rule_fires_on_every_dialect(event, ht, ams2, ams1):
+    """Whatever matches one unit must match all three."""
+    for label, line in (("HT", ht), ("AMS 2", ams2), ("AMS 1", ams1)):
+        hit = any(rx.search(line) for rx, _ in br._AMS_HUMAN)
+        assert hit, f"{event}: no rule matched the {label} form -- {line}"
+
+
+def test_step_helper_tolerates_every_punctuation_seen():
+    """STEP4, / STEP: / STEP2: with and without a space after the bracket."""
+    rx = br._STEP("read success")
+    for line in ("[AMS_RFID] STEP4,read success",
+                 "[AMS_RFID]STEP:read success",
+                 "[AMS_DEV] STEP:read success",
+                 "[AMS_DEV]STEP2: read success",
+                 "[AMS_SWITCH] STEP : read success".replace(" :", ":")):
+        assert rx.search(line), line
+
+
+def test_step_helper_does_not_match_a_different_event():
+    rx = br._STEP("read success")
+    assert not rx.search("[AMS_DEV] STEP:odom search, odo 1.856")
+    assert not rx.search("[AMS_RFID] STEP3,search 1 card")
+
+
+def test_the_load_time_search_lines_are_NOT_a_measurement():
+    """The radius search running mid-load looks like a measurement and is not.
+
+        [AMS_DEV] STEP:odom r:0, dt0.442, R:0.073, P:70%, od:0.741
+        [AMS_DEV] STEP:odom r:1, dt0.887, R:0.071, P:65%
+
+    A dedicated calibration of THE SAME SPOOL minutes earlier said 73%. Across
+    two loads the estimates converge on neither that nor each other: one ran
+    26% -> 54% (up 28 points), the other 70% -> 65% (down 5). Adopting "the
+    last one of the load" was built, tested against a shimmed accessor, and
+    would have written a figure 8 points under the calibrated one on every
+    toolchange.
+
+    The real measurement carries a CIRCUMFERENCE and comes from the calibration
+    cycle, which samples ~2 spool revolutions. The pattern requires R: to
+    follow `odom` closely, and that is what excludes these -- load-bearing, not
+    incidental, so this test exists to stop it being "fixed".
+    """
+    for line in (
+            "[AMS_DEV] STEP:odom r:0, dt0.442, R:0.073, P:70%, od:0.741",
+            "[AMS_DEV] STEP:odom r:1, dt0.887, R:0.071, P:65%",
+            "[AMS_DEV] STEP:odom r:1, dt0.895, R:0.077, P:54%"):
+        assert br._CAP_MEASURE_RE.search(line) is None, line
+
+
+def test_the_calibrated_line_from_the_same_session_does_parse():
+    """...and the one that IS a measurement still does, so the exclusion above
+    is not simply a broken pattern."""
+    m = br._CAP_MEASURE_RE.search(
+        "[AMS_DEV] STEP,second detected [AMS_DEV] STEP:odom "
+        "C:0.469,R:0.075,P:73%, od:0.724")
+    assert m is not None
+    assert float(m.group(2)) == 0.469 and int(m.group(4)) == 73
+
+
+def test_capacity_line_parses_on_all_three_units():
+    """The measurement itself, in each unit's own punctuation."""
+    for label, line, pct in (
+            ("HT",    "[AMS_RFID] STEP4,odom C:0.531,R:0.084,P:107%,od:1.132", 107),
+            ("AMS 1", "[AMS_DEV] STEP:odom C:0.480, R:0.076, P:78%, od:0.988", 78),
+            ("AMS 2", "[AMS_RFID]STEP:odom load from flash 2,R:0.072,P:65",    65)):
+        m = br._CAP_MEASURE_RE.search(line)
+        assert m, f"{label}: {line}"
+        assert int(m.group(4)) == pct, label
+
+
+class TestAms1GivesUpInStateNotWords:
+    """Three dialects, three ways of saying "I gave up":
+
+        AMS 2 Pro   "feed finish -1, stall", "pull err, bdc stall"
+        AMS HT      "TIMEOUT error N"
+        AMS 1       none of those -- state:6 / en:0,mode:7,idx:255
+
+    The AMS 1 was long recorded as silent about faults. It is not; it answers
+    in STATE rather than words, so a word-matching detector walked past it and
+    a jammed AMS 1 rode out the entire load window."""
+
+    def _say(self, b, text, addr=0x0700):
+        b.handle_line(json.dumps(
+            {"evt": "amsdbg", "text": text, "addr": addr}))
+        return b.last_fault()[0]
+
+    def test_ams1_state_6_is_a_fault(self):
+        b, r, lg = _bridge()
+        before = b.last_fault()[0]
+        self._say(b, "[AMS_COMMON]state:6,tray_now:255,tray_exit:6")
+        assert b.last_fault()[0] != before
+
+    def test_ams1_en0_mode7_is_a_fault(self):
+        b, r, lg = _bridge()
+        before = b.last_fault()[0]
+        self._say(b, "[AMS_LINK]en:0,mode:7,idx:255,ref:0")
+        assert b.last_fault()[0] != before
+
+    def test_the_states_of_a_healthy_load_are_not(self):
+        # Counted across a lane15 load that genuinely reached the toolhead:
+        # state:4 and state:0 only, and ZERO of the two above.
+        b, r, lg = _bridge()
+        before = b.last_fault()[0]
+        self._say(b, "[AMS_COMMON]state:4,tray_now:255,tray_exit:6")
+        self._say(b, "[AMS_COMMON]state:0,tray_now:255,tray_exit:6")
+        self._say(b, "[AMS_DEV] STEP:odom search, odo 0.516")
+        assert b.last_fault()[0] == before
+
+    def test_the_other_two_dialects_still_fire(self):
+        for text in ("[AMS_SWITCH]feed finish -1, stall, len_det:1.0 m",
+                     "[AMS_LED]TIMEOUT error 2"):
+            b, r, lg = _bridge()
+            before = b.last_fault()[0]
+            self._say(b, text)
+            assert b.last_fault()[0] != before, text

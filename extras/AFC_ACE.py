@@ -2228,8 +2228,8 @@ class afcACE(afcUnit):
         # The ACE can only drive ONE slot at a time: a feed_filament sent while
         # ANOTHER slot is still running feed-assist never gets acked and times out
         # ("ACE never moved"). Stop assist on every other active slot before we
-        # feed — in ALL modes (this was previously gated to combined mode only,
-        # so a toolchanger/direct unit could feed into a live assist and hang).
+        # feed. This must cover ALL modes: gating it to combined mode lets a
+        # toolchanger/direct unit feed into a live assist and hang.
         for other_slot in list(self._feed_assist_active):
             if other_slot != slot:
                 self._stop_feed_assist(other_slot)
@@ -2780,7 +2780,7 @@ class afcACE(afcUnit):
             gcmd.respond_info("ACE not connected")
             return
         if not hasattr(self._ace, "set_material_name"):
-            gcmd.respond_info("ACE_SET_MATERIAL: requires an ACE Pro 2 unit")
+            gcmd.respond_info("ACE_SET_MATERIAL: requires an ACE 2 Pro unit")
             return
         slot = gcmd.get_int('SLOT', None, minval=0)
         if slot is None:
@@ -3113,9 +3113,9 @@ class afcACE(afcUnit):
         # The ACE can only feed-assist ONE slot at a time. Stop any OTHER active
         # slot before starting (or confirming) this one, so loading a new lane
         # while the previous tool's lane is still assisting can't leave two
-        # assists running (or trip error_2 for an over-limit start). This makes
-        # the single-assist invariant hold at every call site — the direct
-        # load-completion / TOOLED-restore starts previously skipped the stop.
+        # assists running (or trip error_2 for an over-limit start). The
+        # single-assist invariant has to hold at every call site, including the
+        # direct load-completion and TOOLED-restore starts.
         for other in list(self._feed_assist_active):
             if other != slot:
                 self._stop_feed_assist(other)
@@ -3910,7 +3910,7 @@ class afcACE(afcUnit):
                 # V1 ACE applies the tag to the lane (above) but does NOT
                 # create/match Spoolman — see on_filament_insert for why.
 
-    # NOTE: V1 ACE no longer syncs to Spoolman. The firmware reader identifies
+    # NOTE: V1 ACE does not sync to Spoolman. The firmware reader identifies
     # spools by SKU only (no unique per-tag UID), and SKU matching creates a
     # sloppy database (SKUs aren't unique per physical spool). The decoded tag
     # values are applied straight to the lane by apply_filament_defaults instead

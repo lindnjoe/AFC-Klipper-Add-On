@@ -34,13 +34,13 @@ from configparser import Error as error
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-# Reuse the ACE2's transport-agnostic MFRC522 + MIFARE + multi-manufacturer
+# The shared transport-agnostic MFRC522 + MIFARE + multi-manufacturer
 # decode stack. read_tag() only needs an object exposing reg_read/reg_write.
 try: from extras.AFC_utils import ERROR_STR
 except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
 
-try: from extras.AFC_ACE2_rfid import read_tag, Mfrc522, MifareClassic
-except: raise error(ERROR_STR.format(import_lib="AFC_ACE2_rfid", trace=traceback.format_exc()))
+try: from extras.AFC_rfid_readers import read_tag, Mfrc522, MifareClassic
+except: raise error(ERROR_STR.format(import_lib="AFC_rfid_readers", trace=traceback.format_exc()))
 
 try: from extras.AFC_RFID import (AFCUnitRFID,
     map_tag_to_slot_info,

@@ -1,5 +1,6 @@
 """
-Additional branch-coverage tests for extras/AFC_ACE2_rfid.py.
+Additional branch-coverage tests for extras/AFC_ACE2_rfid.py and the shared
+reader stack in extras/AFC_rfid_readers.py.
 
 Complements tests/test_AFC_ACE2_rfid.py and tests/test_ace2_rfid_reader.py by
 covering the large previously-untested blocks:
@@ -35,6 +36,10 @@ def _load(name, relpath):
     spec.loader.exec_module(mod)
     return mod
 
+
+# Package import (not _load) so this is the SAME module object whose globals
+# rfid.read_tag resolves — patching readers.MifareClassic must affect it.
+import extras.AFC_rfid_readers as readers  # noqa: E402
 
 rfid = _load("AFC_ACE2_rfid", "extras/AFC_ACE2_rfid.py")
 
@@ -285,15 +290,15 @@ class _ToCardLink:
         self.writes = []
 
     def reg_read(self, r):
-        if r == rfid.ComIrqReg:
+        if r == readers.ComIrqReg:
             return self.comirq
-        if r == rfid.ErrorReg:
+        if r == readers.ErrorReg:
             return self.errorreg
-        if r == rfid.FIFOLevelReg:
+        if r == readers.FIFOLevelReg:
             return len(self.fifo_bytes)
-        if r == rfid.FIFODataReg:
+        if r == readers.FIFODataReg:
             return self.fifo_bytes.pop(0) if self.fifo_bytes else 0
-        if r == rfid.ControlReg:
+        if r == readers.ControlReg:
             return self.ctrl
         return 0
 
@@ -305,25 +310,25 @@ class TestMfrc522ToCard:
     def test_timer_irq_returns_failure(self):
         link = _ToCardLink(comirq=0x01)          # Timer bit, no Rx/Idle
         m = rfid.Mfrc522(link)
-        assert m._to_card(rfid.PCD_TRANSCEIVE, b"\x26", 7) == (False, b"", 0)
+        assert m._to_card(readers.PCD_TRANSCEIVE, b"\x26", 7) == (False, b"", 0)
 
     def test_error_reg_returns_failure(self):
         link = _ToCardLink(comirq=0x30, errorreg=0x02)   # Rx set, error bit
         m = rfid.Mfrc522(link)
-        assert m._to_card(rfid.PCD_TRANSCEIVE, b"\x26", 7) == (False, b"", 0)
+        assert m._to_card(readers.PCD_TRANSCEIVE, b"\x26", 7) == (False, b"", 0)
 
     def test_poll_times_out_then_reads_fifo(self):
         # ComIrq never sets Rx/Idle/Timer -> the 2000-poll loop runs to
         # completion, then the error check passes and the FIFO is read.
         link = _ToCardLink(comirq=0x00, errorreg=0x00, fifo=b"\xab\xcd", ctrl=0x03)
         m = rfid.Mfrc522(link)
-        ok, rx, last = m._to_card(rfid.PCD_TRANSCEIVE, b"\x26", 7)
+        ok, rx, last = m._to_card(readers.PCD_TRANSCEIVE, b"\x26", 7)
         assert ok is True and rx == b"\xab\xcd" and last == 3
 
     def test_authent_returns_no_rx(self):
         link = _ToCardLink(comirq=0x30, errorreg=0x00)
         m = rfid.Mfrc522(link)
-        assert m._to_card(rfid.PCD_MFAUTHENT, b"\x60\x00") == (True, b"", 0)
+        assert m._to_card(readers.PCD_MFAUTHENT, b"\x60\x00") == (True, b"", 0)
 
 
 # ── Mfrc522.anticoll ─────────────────────────────────────────────────────────
@@ -357,7 +362,7 @@ class _AntennaLink:
         self.writes = []
 
     def reg_read(self, r):
-        return self._txcontrol if r == rfid.TxControlReg else 0
+        return self._txcontrol if r == readers.TxControlReg else 0
 
     def reg_write(self, r, v):
         self.writes.append((r, v))
@@ -367,7 +372,7 @@ class TestMfrc522AntennaOn:
     def test_turns_on_when_off(self):
         link = _AntennaLink(txcontrol=0x00)
         rfid.Mfrc522(link).antenna_on()
-        assert (rfid.TxControlReg, 0x03) in link.writes
+        assert (readers.TxControlReg, 0x03) in link.writes
 
     def test_noop_when_already_on(self):
         link = _AntennaLink(txcontrol=0x03)
@@ -385,7 +390,7 @@ class _AoMfrc:
         self._sak = sak
 
     def request(self, req):
-        return self._req_wupa if req == rfid.PICC_WUPA else self._req_reqa
+        return self._req_wupa if req == readers.PICC_WUPA else self._req_reqa
 
     def anticoll(self):
         return self._uid
@@ -479,14 +484,14 @@ class TestMifareClassicReadBlocks:
 class TestDecodeBambu:
     def test_wrong_length_raises(self):
         with pytest.raises(ValueError):
-            rfid.decode_bambu(b"\x00" * 100)
+            readers.decode_bambu(b"\x00" * 100)
 
     def test_optional_fields_present(self):
         d = bytearray(1024)
         struct.pack_into("<f", d, 140, 0.4)      # nozzle in (0, 2)
         struct.pack_into("<H", d, 164, 6000)     # spool width 60.0 mm
         struct.pack_into("<H", d, 228, 250)      # length 250 m
-        out = rfid.decode_bambu(bytes(d))
+        out = readers.decode_bambu(bytes(d))
         assert out["nozzle_diameter"] == 0.4
         assert out["spool_width_mm"] == 60.0
         assert out["length_m"] == 250
@@ -494,7 +499,7 @@ class TestDecodeBambu:
     def test_optional_fields_absent(self):
         d = bytearray(1024)
         struct.pack_into("<f", d, 140, 5.0)      # nozzle out of (0, 2) -> None
-        out = rfid.decode_bambu(bytes(d))
+        out = readers.decode_bambu(bytes(d))
         assert out["nozzle_diameter"] is None
         assert out["spool_width_mm"] is None
         assert out["length_m"] is None
@@ -502,26 +507,26 @@ class TestDecodeBambu:
 
 class TestDecodeAnycubic:
     def test_short_returns_none(self):
-        assert rfid.decode_anycubic(b"\x00" * 0x40) is None
+        assert readers.decode_anycubic(b"\x00" * 0x40) is None
 
     def test_wrong_magic_returns_none(self):
-        assert rfid.decode_anycubic(b"\x11" * 0x80) is None
+        assert readers.decode_anycubic(b"\x11" * 0x80) is None
 
 
 class TestDecodeSnapmaker:
     def test_short_returns_none(self):
-        assert rfid.decode_snapmaker(b"\x00" * 100) is None
+        assert readers.decode_snapmaker(b"\x00" * 100) is None
 
 
 class TestDecodeCreality:
     def test_short_returns_none(self):
-        assert rfid.decode_creality(b"\x00" * 33) is None
+        assert readers.decode_creality(b"\x00" * 33) is None
 
     def test_bad_hex_color_and_length_default(self):
         payload = (b"PRODU" + b"0276" + b"XX" + b"101001"
                    + b"ZZZZZZZ" + b"YYYY" + b"SERIAL" + b"\x00" * 14)
         assert len(payload) == 48
-        out = rfid.decode_creality(payload)
+        out = readers.decode_creality(payload)
         assert out["type"] == "PLA"
         assert out["color_argb"] is None       # color hex unparsable
         assert out["length_m"] is None         # length hex unparsable
@@ -530,7 +535,7 @@ class TestDecodeCreality:
 
 class TestDecodeBtt:
     def test_short_returns_none(self):
-        assert rfid.decode_btt(b"\x00" * 300) is None
+        assert readers.decode_btt(b"\x00" * 300) is None
 
 
 # ── read_tag branches ────────────────────────────────────────────────────────
@@ -543,8 +548,8 @@ class TestReadTag:
             def activate(self, is_excluded=None, seen=None, reset=True):
                 return None, None
 
-        monkeypatch.setattr(rfid, "MifareClassic", _MC)
-        assert rfid.read_tag(object()) is None
+        monkeypatch.setattr(readers, "MifareClassic", _MC)
+        assert readers.read_tag(object()) is None
 
     def test_dump_blocks_attaches_raw_blocks(self, monkeypatch):
         class _MC:
@@ -560,10 +565,10 @@ class TestReadTag:
                     img[b * 16:b * 16 + 16] = bytes([b & 0xFF]) * 16
                 return bytes(img)
 
-        monkeypatch.setattr(rfid, "MifareClassic", _MC)
+        monkeypatch.setattr(readers, "MifareClassic", _MC)
         master = bytes.fromhex("00" * 16)
-        out = rfid.read_tag(object(), bambu_master_key=master,
-                            dump_blocks=(5, 16))
+        out = readers.read_tag(object(), bambu_master_key=master,
+                               dump_blocks=(5, 16))
         assert out["raw_blocks"][5] == (bytes([5]) * 16).hex()
         assert out["raw_blocks"][16] == (bytes([16]) * 16).hex()
 
@@ -578,8 +583,8 @@ class TestReadTag:
             def read_ntag(self, n=128):
                 return b"\x11" * n                    # not Anycubic/Elegoo
 
-        monkeypatch.setattr(rfid, "MifareClassic", _MC)
-        out = rfid.read_tag(object())
+        monkeypatch.setattr(readers, "MifareClassic", _MC)
+        out = readers.read_tag(object())
         assert out["tag_type"] == "MifareUltralight"
         assert out["filament"] is None
 

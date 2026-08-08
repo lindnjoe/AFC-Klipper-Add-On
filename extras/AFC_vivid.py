@@ -259,10 +259,10 @@ class AFC_vivid(afcBoxTurtle):
             distance (origin -> load sensor) feeds the dist_hub calibration.
         """
         if not lane.calibrated_lane:
-            budget = self.CALIBRATION_DISTANCE
+            distance = self.CALIBRATION_DISTANCE
             move_speed = SpeedMode.SHORT
         else:
-            budget = lane.dist_hub
+            distance = lane.dist_hub
             move_speed = SpeedMode.LONG
 
         # Tell an RFID module the feed is starting so it can poll the reader while
@@ -278,9 +278,14 @@ class AFC_vivid(afcBoxTurtle):
         # FAKES the sensor to abort the move early (stop-on-detect): the homing
         # call then returns homed=True but the real sensor pin (raw_load_state) is
         # still False — that's our cue to read and re-issue. A GENUINE miss returns
-        # homed=False (endstop never hit) and is retried at most twice, as before.
+        # homed=False (endstop never hit) and is retried at most twice.
         # Segment distances are summed so dist_hub calibration stays origin->sensor,
         # and the real sensor (not the faked homing return) decides success.
+        #
+        # `distance` is the per-segment budget and must stay CONSTANT. A
+        # fake-abort returns only the distance fed so far, so feeding that back
+        # in as the next budget shrinks every segment and the feed never reaches
+        # the sensor -- it just burns through STAGE_MAX_SEGMENTS short of it.
         total = 0.0
         misses = 0
         segments = 0
@@ -288,7 +293,7 @@ class AFC_vivid(afcBoxTurtle):
             while (lane.prep_state and not lane.raw_load_state
                    and misses < 2 and segments < self.STAGE_MAX_SEGMENTS):
                 homed, moved, _ = lane.move_to(
-                    budget, move_speed, assist_active=AssistActive.NO,
+                    distance, move_speed, assist_active=AssistActive.NO,
                     endstop=lane.load_endstop_name, use_homing=True)
                 total += moved
                 segments += 1

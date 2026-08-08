@@ -1,6 +1,6 @@
 """
 Tests for the shared-reader RFID ambiguity guard in extras/AFC_ACE.py /
-AFC_ACE2.py. Two MFRC522 readers cover the ACE Pro 2's four slots (0/1 -> r0,
+AFC_ACE2.py. Two MFRC522 readers cover the ACE 2 Pro's four slots (0/1 -> r0,
 2/3 -> r1), so a STATIC per-slot read can return the paired slot's tag. The guard
 skips applying such an ambiguous read to a lane at startup (only a spinning
 insert read can disambiguate).

@@ -379,9 +379,9 @@ def test_endstop_query():
 def test_stepper_lane_disabled_buffer_refreshes_advance_state():
     # Regression: on a stepper lane (BoxTurtle) with the buffer DISABLED (during
     # bowden calibration / load), _adc_callback must still refresh advance/trailing
-    # from the live fps. Previously gated behind `not has_stepper`, which froze the
-    # state stale so get_toolhead_pre_sensor_state() never reported filament
-    # arrival and the ramming home-to-buffer calibration looped forever.
+    # from the live fps. Gating it behind `not has_stepper` freezes the state
+    # stale, so get_toolhead_pre_sensor_state() never reports filament arrival
+    # and the ramming home-to-buffer calibration loops forever.
     # (Boolean convention is jimmy's: HIGH/compressed -> advance_state True.)
     buf = _make_fps_buffer(KalicoAdc(),
                            values={"smoothing": 0.0, "set_point": 0.5,

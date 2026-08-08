@@ -1316,10 +1316,9 @@ def sync_rfid_to_spoolman(afc: Any, lane: Any, slot_info: dict, logger: Any,
                     vendor_id = vendor.get("id")
             # "<brand> <material> <sub_type>" e.g. "Bambu PLA Basic" — the same
             # builder feeds the scan notifications so every surface matches.
-            # Always non-empty here: creation is gated above on `material`
-            # being present, and build_filament_name emits the material unless
-            # the sub_type already spells it out (in which case it emits that).
             filament_name = build_filament_name(brand, material, sub_type)
+            if not filament_name:
+                filament_name = material or "Unknown"
             filament = moonraker.create_filament(
                 name=filament_name,
                 vendor_id=vendor_id,

@@ -5,11 +5,11 @@ The V2 binary protocol carries a 16-bit request sequence id (encode_request
 masks it to & 0xFFFF), and the unit echoes back only those low 16 bits. The
 driver must key its pending/async request tracking by that same masked value.
 
-Before the fix, send_command / send_command_async keyed by the full
-_next_request_id, so once the counter passed 65535 the echoed id
-(e.g. 86480 -> 20944) no longer matched anything: every synchronous command
-timed out and every async reply logged "unknown request id". Observed live on
-hardware as: TX id=86480 get_status / RX id=20944 / "unknown request id=20944".
+Keying send_command / send_command_async by the full _next_request_id breaks
+once the counter passes 65535: the echoed id comes back masked (e.g. 86480 ->
+20944) and matches nothing, so every synchronous command times out and every
+async reply logs "unknown request id". Observed live on hardware as:
+TX id=86480 get_status / RX id=20944 / "unknown request id=20944".
 """
 
 from __future__ import annotations

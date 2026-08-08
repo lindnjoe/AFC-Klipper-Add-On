@@ -1,6 +1,6 @@
 """
-Driver-level verification of the ACE2 RFID reader stack now inlined in
-extras/AFC_ACE2_rfid.py (previously the standalone ace2_rfid host module).
+Driver-level verification of the shared RFID reader stack in
+extras/AFC_rfid_readers.py, plus the ACE2 frame layer that feeds it.
 
 The FakeReader emulates an MFRC522 + a synthetic Bambu MIFARE Classic 1K (or
 Anycubic NTAG) tag at the *register* level, so the REAL driver code (Mfrc522 +
@@ -23,7 +23,8 @@ def _load(name, relpath):
     return mod
 
 
-A = _load("AFC_ACE2_rfid", "extras/AFC_ACE2_rfid.py")
+A = _load("AFC_rfid_readers", "extras/AFC_rfid_readers.py")
+ACE2 = _load("AFC_ACE2_rfid", "extras/AFC_ACE2_rfid.py")
 
 
 # ── build synthetic tags with known fields ──────────────────────────────────
@@ -145,22 +146,22 @@ def test_hkdf_rfc5869_vector():
 
 
 def test_frame_crc_matches_firmware_algo():
-    link = A.Ace2Link(lambda f: f)
+    link = ACE2.Ace2Link(lambda f: f)
     f = link.build_frame(0x06, b"")
-    assert f[:2] == A.PREAMBLE and f[-1:] == A.END
+    assert f[:2] == ACE2.PREAMBLE and f[-1:] == ACE2.END
     body = f[3:-3]
-    assert struct.unpack("<H", f[-3:-1])[0] == A.crc16_kermit(body)
+    assert struct.unpack("<H", f[-3:-1])[0] == ACE2.crc16_kermit(body)
 
 
 def test_reader_power_frame_encodes_cmd_0x52():
     sent = {}
-    link = A.Ace2Link(lambda f: sent.setdefault("frame", f) or f, slot=1)
+    link = ACE2.Ace2Link(lambda f: sent.setdefault("frame", f) or f, slot=1)
     link.reader_power(True)
     frame = sent["frame"]
     # FF AA seq TYPE(2) CMD LEN PAYLOAD... — CMD byte is at index 5
-    assert frame[5] == A.CMD_MFRC522_READER_POWER == 0x52
+    assert frame[5] == ACE2.CMD_MFRC522_READER_POWER == 0x52
     # payload varint = (1<<16)|1
-    assert frame[7] == 0x08 and A._varint_decode(frame, 8)[0] == (1 << 16) | 1
+    assert frame[7] == 0x08 and ACE2._varint_decode(frame, 8)[0] == (1 << 16) | 1
 
 
 def test_reg_rw_roundtrip_through_link():
@@ -291,7 +292,7 @@ def test_activate_without_excluder_returns_first_tag():
     fake = _FakeMfrc([(NEIGH, 0x08), (OWN, 0x08)])
     mc = A.MifareClassic(fake)
     uid, sak = mc.activate()
-    assert uid == NEIGH and sak == 0x08        # no exclusion: first tag, as before
+    assert uid == NEIGH and sak == 0x08        # no exclusion: first tag wins
 
 
 def test_activate_seen_records_halted_neighbour_and_own():

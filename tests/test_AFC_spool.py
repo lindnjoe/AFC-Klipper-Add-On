@@ -1222,7 +1222,7 @@ class TestSetSnapmakerFilamentParams:
         assert print_task_config["filament_vendor"][0] == "Generic"
         assert print_task_config["filament_type"][0] == lane.material
         assert print_task_config["filament_sub_type"][0] == "NONE"
-
+    
     def test_snapmaker_printer_extruder_check_sub_type_from_lane(self):
         from tests.conftest import _make_print_task_config
         import sys

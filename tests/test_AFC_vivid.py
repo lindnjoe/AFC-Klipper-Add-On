@@ -513,8 +513,8 @@ class TestPrepLoad:
         assert lane.calibrated_lane is True
         assert lane.dist_hub == round(300.0, 2) + AFC_vivid.LANE_OVERSHOOT
         unit.afc.function.ConfigRewrite.assert_called()
-
-    def test_fake_abort_segments_sum_for_calibration(self):
+    
+    def test_uncalibrated_lane_updates_dist_hub_and_config_two_tries(self):
         # An RFID stop-on-detect splits the feed: the homing call returns homed but
         # the real sensor is still false, so the feed re-issues. dist_hub must be
         # the SUM of the segment distances (origin->sensor), not just the last one.
@@ -536,7 +536,7 @@ class TestPrepLoad:
         assert lane.calibrated_lane is True
         assert lane.dist_hub == round(600.0, 2) + AFC_vivid.LANE_OVERSHOOT
         unit.afc.function.ConfigRewrite.assert_called()
-
+    
     def test_uncalibrated_lane_updates_dist_hub_and_config_failed(self):
         unit = _make_vivid()
         lane = _make_afc_lane()
@@ -559,7 +559,7 @@ class TestPrepLoad:
         # Failure should be reported/logged
         error_msgs = [m for lvl, m in unit.logger.messages if lvl == "error"]
         assert error_msgs
-
+    
     def test_uncalibrated_lane_updates_dist_hub_no_prep(self):
         unit = _make_vivid()
         lane = MagicMock()

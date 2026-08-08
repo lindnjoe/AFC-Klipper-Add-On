@@ -152,7 +152,7 @@ _ERROR_CODE_OPCODES = frozenset({
 
 def crc16_kermit(data: Union[bytes, bytearray]) -> int:
     """
-    Compute the Kermit-style CRC16 used by the ACE Pro 2 framing.
+    Compute the Kermit-style CRC16 used by the ACE 2 Pro framing.
 
     :param data: Bytes-like sequence to checksum.
     :return: 16-bit CRC value as an integer.
@@ -790,14 +790,14 @@ def decode_frames(buffer: bytearray,
 
 # ── Transport: V2 framing over the inherited connection machinery ─────────
 class ACE2Connection(ACEConnection):
-    """ACE Pro 2 transport. Reuses the V1 connection's reactor I/O, request
+    """ACE 2 Pro transport. Reuses the V1 connection's reactor I/O, request
     completion, heartbeat and reconnect machinery, but encodes/decodes the V2
     binary protocol. The high-level command wrappers (feed_filament, get_status,
     get_filament_info, …) are inherited verbatim — they just call send_command,
     which here speaks V2 and returns the same V1-shaped result dicts."""
 
     def _pre_info_handshake(self) -> None:
-        """ACE Pro 2 must be discovered before it answers other commands. The V2
+        """ACE 2 Pro must be discovered before it answers other commands. The V2
         initial handshake sends discover_device first (then get_info); without it
         the unit ignores get_status/get_info and never replies.
         """
@@ -960,7 +960,7 @@ class ACE2Connection(ACEConnection):
 
 # ── Unit: the V1 ACE unit with the V2 transport swapped in ───────────
 class afcACE2(afcACE):
-    """Anycubic ACE Pro 2 AFC unit. Reuses all of afcACE's AFC integration
+    """Anycubic ACE 2 Pro AFC unit. Reuses all of afcACE's AFC integration
     (load/unload, feed assist, RFID->Spoolman, dryer, diagnostics) and only
     swaps the serial transport to the V2 protocol."""
 
@@ -976,14 +976,14 @@ class afcACE2(afcACE):
 
     def __init__(self, config: ConfigWrapper) -> None:
         """
-        Initialize the ACE Pro 2 unit on top of the V1 ACE unit.
+        Initialize the ACE 2 Pro unit on top of the V1 ACE unit.
 
         :param config: ConfigWrapper for this unit; ``type`` defaults to ``ACE2``
                        and the dryer set-point ceiling defaults to 70C.
         """
         super().__init__(config)
         self.type = config.get('type', 'ACE2')
-        # ACE Pro 2 V2 serial runs at 230400 baud (the V1 ACE default is
+        # ACE 2 Pro V2 serial runs at 230400 baud (the V1 ACE default is
         # 115200); at the wrong baud the unit never sees a valid frame and
         # never replies. Override the inherited default.
         self.baud_rate = config.getint("baud_rate", 230400)
@@ -1144,7 +1144,7 @@ class afcACE2(afcACE):
         Create the V2 transport used in place of the V1 ACE connection.
 
         :param reactor: Klipper reactor for scheduling I/O.
-        :param serial_port: Serial device path for the ACE Pro 2.
+        :param serial_port: Serial device path for the ACE 2 Pro.
         :param logger: Logger passed to the connection.
         :param baud_rate: Serial baud rate.
         :return: A configured :class:`ACE2Connection` instance.
@@ -1153,7 +1153,7 @@ class afcACE2(afcACE):
                               logger=logger, baud_rate=baud_rate)
 
     def _reader_sibling_slot(self, slot: int) -> Optional[int]:
-        """ACE Pro 2 has 2 MFRC522 readers, each covering a slot PAIR (0/1 -> r0,
+        """ACE 2 Pro has 2 MFRC522 readers, each covering a slot PAIR (0/1 -> r0,
         2/3 -> r1). The paired slot shares the reader, so a static read of one can
         return the other's tag — used to skip ambiguous startup RFID reads."""
         sib = int(slot) ^ 1
@@ -1169,7 +1169,7 @@ class afcACE2(afcACE):
 
 def load_config_prefix(config: ConfigWrapper) -> afcACE2:
     """
-    Klipper entry point that instantiates the ACE Pro 2 unit.
+    Klipper entry point that instantiates the ACE 2 Pro unit.
 
     :param config: ConfigWrapper for the unit section.
     :return: A new :class:`afcACE2` instance.

@@ -1,8 +1,32 @@
 # AFCProject Automated Filament Changer
 #
-# Copyright (C) 2024-2026 AFCProject
+# Copyright (C) 2024-2026 J0eB0l. All Rights Reserved.
 #
-# This file may be distributed under the terms of the GNU GPLv3 license.
+# LIMITED USE LICENSE
+#
+# This file is NOT distributed under the GNU GPL.
+#
+# Permission is granted, free of charge, to download, install and execute this
+# file solely as an add-on component of the official, unmodified AFC
+# (Automated Filament Control) distribution hosted at:
+#
+#     https://github.com/AFCProject/AFC-Klipper-Add-On
+#
+# The AFC Project is granted permission to host and distribute this file as
+# part of that repository, unmodified and with this notice intact.
+#
+# RESTRICTIONS
+#   1. You may NOT modify, reverse-engineer, decompile or create derivative
+#      works of this file.
+#   2. You may NOT bundle, redistribute, re-host or include this file in any
+#      third-party software, installer or package manager without express
+#      written consent of the copyright holder.
+#   3. You may NOT use this file with modified forks or unauthorised
+#      distributions of the AFC ecosystem.
+#
+# THIS FILE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED. THE COPYRIGHT HOLDER IS NOT LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY ARISING FROM ITS USE.
 #
 # Bambu AMS bridge TRANSPORT: the link to the Pi Pico that masters the AMS's
 # RS-485 bus, and the wire-format helpers that go with it.
@@ -144,22 +168,57 @@ _CHMB_STATE_RE = re.compile(
 #: "AMS_CTRL_state_switch finish, sucessful", which occurs 242 times in one
 #: night's log. Hence "pull" is required immediately before it rather than
 #: looking for the word on its own.
+#: ...and the AMS HT's OWN completion words, which say neither "finish" nor
+#: "sucess". Measured on the rig during a healthy load:
+#:
+#:   [AMS_SWITCH]feed to dw ok, len_det:0.126 m, bldc_i:0.3A
+#:   [AMS_SWITCH]feed to normal, len_det:0.253 m, bldc_i:0.267A
+#:
+#: Neither matched anything here, so EVERY HT move ran its full watchdog
+#: instead of ending on the unit's own report -- the module kept driving a
+#: move the unit had already finished, which is what "it keeps sending the
+#: wrong signal" looks like from the outside. The module's own _MC table
+#: comment had already named "feed to normal" as "the move-completion
+#: narration whose absence has been making every move wait out its deadline"
+#: -- it was documented and never added to the pattern. Both HT forms are
+#: accepted; "to dw ok" is the mid-path (drive wheel) stage and "to normal"
+#: the end of the move.
 _MOTION_FINISH_RE = re.compile(
-    r"\b(?:(?:feed|pull|preload)\s+finish|pull\s+suc+ess)\b",
+    r"\b(?:(?:feed|pull|preload)\s+finish|pull\s+suc+ess"
+    r"|feed\s+to\s+(?:normal|dw\s+ok))\b",
     re.IGNORECASE)
+
+#: The AMS HT's capacity CALIBRATION verdict. The HT does not narrate the
+#: boxed units' "odom C:..,R:..,P:NN%" line at all -- it runs the odometer
+#: (start_odo -> first detected) and reports a result code:
+#:
+#:   [AMS_RFID] STEP4,Calibration rst:0   <- completed (clean run, measured)
+#:   [AMS_RFID] STEP4,Calibration rst:1   <- refused ("odom tray capacity no en")
+#:   [AMS_RFID] STEP4,Calibration rst:4   <- aborted ("check stall during calib")
+#:
+#: Watching only for "P:NN%" meant a SUCCESSFUL HT calibration read as a
+#: silent failure, which is why the HT "never measured" while its own log
+#: said it had. The percent itself is written to the tag, so the value is
+#: picked up by the next filament-info read of that slot, not from this line.
+_HT_CALI_RST_RE = re.compile(r"Calibration\s+rst:(\d+)", re.IGNORECASE)
 
 #: The filament reached the EXTRUDER, as an AMS 2 Pro / HT reports it:
 #:
 #:   [AMS_SWITCH]e_in tray:0,buff_pos:-0.34,i:0.566A,len:1.670m
 #:
-#: "e_in" is the unit's own toolhead-sensor equivalent and it fires EARLIER
-#: than the feed completion -- in the captured AMS 2 load, e_in at +56.8 s and
-#: the path measurement at +57.9 s. It is an arrival, not an end of motion:
-#: the capture it comes from went on to fail downstream on a hotend jam, and
-#: e_in fired all the same. That is the right semantics here -- it says where
-#: the filament is, not that everything went well. Captures only, unconfirmed
-#: on hardware.
-_EXTRUDER_IN_RE = re.compile(r"\be_in\s+tray:", re.IGNORECASE)
+#: "e_in tray:N,buff_pos:...,len:N.Nm" has NO pattern here, deliberately.
+#:
+#: Reading it as "extruder in" and completing a load on it is probably wrong:
+#: in both captures containing it an err_code transition follows within
+#: a second (0 -> 37, 0x00 -> 0x25), neither capture is of a healthy load, and
+#: a live AMS 2 Pro has never emitted it across a full day of cycles -- which
+#: fits an error that has not happened rather than an arrival that should occur
+#: every load. "Error in tray" is the better reading.
+#:
+#: Nothing is lost by not matching it: the line still reaches AFC_BambuAMS.log
+#: like all narration, and its buff_pos is still read by _BUFF_POS_RE below. If
+#: it turns out to be a fault it belongs with "finish -1" / "stall" /
+#: "timeout error", not with the completions.
 
 #: Buffer position as an instantaneous reading -- e_in during a load, feed
 #: finish at the end of one.
@@ -217,13 +276,77 @@ FINISH_ARRIVAL_TOLERANCE_MM = 100.0
 #: reset line is cross-dialect -- an HT emits it inside its own finish blob
 #: ("...tube_len:3.619 m [AMS_RFID] STEP,odom reset tray 0 ...").
 _ODOM_RESET_RE = re.compile(r"odom\s+reset\s+tray\s*\d+", re.IGNORECASE)
+#: The unit's CURRENT error level, both forms it is written in:
+#:   [AMS_LINK]err_code: 0 -> 23        decimal, spaced (HT)
+#:   [AMS_LINK]err_code:0x00->0x80      hex, unspaced (AMS 2)
+#: Captured on both unit types. The value after the arrow is the new level;
+#: 0 means "no error". Deliberately a LEVEL, not an edge -- see handle_line.
+_ERR_CODE_RE = re.compile(
+    r"err_code:\s*(0x[0-9A-Fa-f]+|\d+)\s*->\s*(0x[0-9A-Fa-f]+|\d+)")
+
 _ODOM_NO_TRAY_RE = re.compile(r"odom\s+tray_id\s+error\s*255", re.IGNORECASE)
+
+#: NOT a completion marker, though it looked like one.
+#:
+#:   [AMS_COMMON]state:2,tray_now:255,tray_exit:1
+#:
+#: On one AMS 2 unload this tracked perfectly -- retract at 13:42:27,
+#: tray_now:255 from 13:42:43, 19 s before AFC gave up on its watchdog -- so it
+#: was read as the AMS 2's wording for "the tray has left" and wired up like
+#: the odometer form.
+#:
+#: It is not. The same line appears while the unit is LOADED and FOLLOWING:
+#:
+#:   [AMS_COMMON]state:4,tray_now:255,tray_exit:1
+#:   [AMS_SWITCH]tray:0, bldc slip, dw_pos:-0.000 m
+#:
+#: so 255 here does not mean the filament is out of the unit. Used as a
+#: completion it would end a move early on a unit that is merely idle between
+#: trays, which is the failure the whole completion path exists to avoid.
+#: Left unmatched until its meaning is actually known.
 
 #: Distance the AMS says it actually moved, in metres.
 _LEN_DET_M_RE = re.compile(r"len_det:([0-9]+\.[0-9]+)\s*m\b")
 
+#: The AMS's own pull-and-push at the mode change into mode:4, e.g.
+#:   [AMS_SWITCH]pull sucess,mode change,mode:4,tray_sw[2]:3;
+#:               len:3.441m,0.052m,3.497m;bdc_i:0.555A;spd:-15.6cm/s;t:0.9s
+#: This is the NATIVE seating tug -- it is in every working load. What matters
+#: to the host is only WHEN IT IS OVER, because the extruder must not advance
+#: into it. "cond match" pulls (mode:1) are the unload's multi-metre unwind and
+#: are deliberately NOT matched here.
+_PULL_DONE_RE = re.compile(r"pull sucess,\s*mode change,\s*mode:4")
+
+#: The unit's seating cycle is PULL BACK **and then PUSH BACK FORWARD**, and
+#: "pull sucess" is only the first half. This ends the second:
+#:   [AMS_SWITCH]assist finish 0, ref:0
+#: Waiting on the pull alone released the extruder while the unit was still
+#: pushing -- which is the same fight, just moved later.
+_ASSIST_DONE_RE = re.compile(r"assist finish\s*-?\d*")
+
 _TUBE_LEN_MM_RE = re.compile(r"tube_len:(\d+)\s*mm")
 _TUBE_LEN_M_RE = re.compile(r"tube_len:([0-9]+\.[0-9]+)\s*m\b")
+# The length a unit reports at the END OF A FEED, which is a DIFFERENT
+# quantity from tube_len and is recorded here so the difference can be
+# measured rather than assumed:
+#
+#   [AMS_SWITCH]feed finish 0, mode:0, dw_len:3.661 m, ...        (HT)
+#   [AMS_SWITCH]feed finish 0, dw_len:3.508 m                     (AMS 2 Pro)
+#
+# WHY THIS EXISTS. tube_len is a self-CALIBRATION, narrated with the samples
+# behind it ("new tube_len:3481 mm, list:3491,3472,0 mm, err:19 mm"). Every
+# unit on this rig reports tube_len=None -- it has never once been narrated
+# here -- so measured_path_mm() is None everywhere and _adopt_measured_path
+# takes its "this dialect cannot measure itself" branch on all three. That
+# branch was believed; it was never true. The units DO say how far the
+# filament went, in a word nothing was listening for.
+#
+# NOT WIRED TO ANYTHING. dw_len read 0.000 on a load that failed and 3.661 on
+# the one that worked, which is the signature of a per-LOAD measurement rather
+# than a stored calibration -- so it must not size a deadline or rewrite a
+# config until that is settled. Reported only, so the next few loads gather
+# the evidence.
+_DW_LEN_M_RE = re.compile(r"dw_len:([0-9]+\.[0-9]+)\s*m\b")
 
 
 #: A drying command the AMS REFUSED, in its own words:
@@ -239,6 +362,112 @@ _TUBE_LEN_M_RE = re.compile(r"tube_len:([0-9]+\.[0-9]+)\s*m\b")
 #: command was delivered, and without this the panel just sits at "not drying"
 #: with no reason given.
 _DRY_REFUSED_RE = re.compile(r"\[AMS_CHMB\]\s*err,\s*([^\[\r\n]{1,60})")
+
+#: The unit's OWN echo of the drying settings it is holding, emitted when a dry
+#: is commanded:
+#:
+#:   [AMS_CHMB]rotate:0,0, pw_lim:100, cool_down:0,45, dur:480, tmpr:45
+#:
+#: rotate flags, power limit, cool-down, duration in MINUTES, target in C. This
+#: is better than remembering what we sent: it survives a Klipper restart, and
+#: it is the only source for a cycle this host did not start. It was missed for
+#: a long time because the mid-dry telemetry line shares the [AMS_CHMB] tag and
+#: carries entirely different fields -- s/rf/cd/vt/ap/hts/pw -- so a capture
+#: taken during a dry never contains this one.
+# The spool capacity measurement, narrated by the AMS at the end of its
+# insert calibration: "STEP:odom C:0.491,R:0.078,P:84%, od:1.009" --
+# circumference, spool radius (metres), REMAINING PERCENT, odometer length
+# used. Reproducible on live hardware (84/85/86% across three runs of the
+# same part-used spool). The AMS computes and narrates this but does not
+# persist it to the tag record on our bus (the "odom save" gate is still
+# unbroken), so the bridge captures the narrated number instead -- the
+# measurement itself is what the feature needs.
+#: FOUR real forms, captured with each unit ALONE on the wire so attribution
+#: is exact. Two shapes (a live measurement, and a restore from flash at
+#: power-on) across three units that punctuate differently:
+#:
+#:   HT     [AMS_RFID] STEP4,odom C:0.531,R:0.084,P:107%,od:1.132
+#:   AMS 1  [AMS_DEV]  STEP:odom C:0.480, R:0.076, P:78%, od:0.988
+#:   AMS 2  [AMS_RFID]STEP:odom load from flash 2,R:0.072,P:65
+#:   HT     [AMS_RFID] STEP:odom load from flash 0,R:0.088,P:119
+#:
+#: The restore form has no C: and no % sign, and it is the one seen MOST of
+#: the time -- a measured spool stays measured across reboots. The previous
+#: pattern required both, so it matched only the live HT form and silently
+#: ignored every restore and the whole AMS 2 dialect. That is the "measured
+#: weight never updates" bug: a missing regex, not a missing capability.
+#:
+#: Whitespace is optional everywhere because the units disagree about it
+#: ("P:107%,od:" vs "P:78%, od:"). Do NOT anchor on any one unit's
+#: punctuation -- that is what cost us the AMS 2 for an hour.
+#: DO NOT WIDEN THIS TO MATCH THE LOAD-TIME "r:N" LINES. They look like a
+#: measurement and are not one -- they are the radius search still running:
+#:
+#:     [AMS_DEV] STEP:odom r:0, dt0.442, R:0.073, P:70%, od:0.741
+#:     [AMS_DEV] STEP:odom r:1, dt0.887, R:0.071, P:65%
+#:
+#: Measured against a dedicated calibration of THE SAME SPOOL minutes earlier,
+#: which said 73%. Two loads, and the estimates do not converge on it or on
+#: each other -- one ran 26% -> 54% (up 28 points), the other 70% -> 65% (down
+#: 5). "Take the last one of the load" was tried, and it lands 8 points under
+#: the calibrated figure.
+#:
+#: The real measurement is the one with a CIRCUMFERENCE in it ("C:0.469,
+#: R:0.075, P:73%"), sampled over ~2 spool revolutions by the calibration
+#: cycle. This pattern requires R: to follow `odom` closely, which is what
+#: excludes the search lines -- that is load-bearing, not incidental.
+_CAP_MEASURE_RE = re.compile(
+    r"odom\s+"
+    r"(?:load\s+from\s+flash\s+(\d+)\s*,\s*"     # 1 tray (restore form)
+    r"|C:([0-9.]+)\s*,\s*)?"                       # 2 circumference (live)
+    r"R:([0-9.]+)\s*,\s*"                          # 3 radius, metres
+    r"P:(\d+)\s*%?",                               # 4 remaining percent
+    re.IGNORECASE)
+
+#: The calibration verdict, also two forms. The HT MISSPELLS it:
+#:   HT     [AMS_RFID] STEP4,odom calib sucess      (one s)
+#:   AMS 1  [AMS_DEV]  STEP:odom calib success exit 0,dis:0.989
+#: succ?ess covers both. exit 0 is the AMS 1's status code.
+_CALI_DONE_RE = re.compile(
+    r"odom\s+calib\s+succ?ess(?:\s+exit\s+(\d+))?", re.IGNORECASE)
+
+_DRY_CFG_RE = re.compile(
+    r"\[AMS_CHMB\]\s*rotate:(\d+),\s*(\d+),\s*pw_lim:(\d+),"
+    r"\s*cool_down:\d+,\s*(\d+),\s*dur:(\d+),\s*tmpr:(\d+)")
+
+#: THE STEP MARKER'S PUNCTUATION, IN ALL THREE DIALECTS -- one source of truth.
+#:
+#:   AMS 1   [AMS_DEV] STEP:read success,valid          STEP + colon
+#:   AMS 2   [AMS_RFID]STEP:read success,valid          STEP + colon
+#:   HT      [AMS_RFID] STEP3,read success ,goto Cali   STEP + digit + COMMA
+#:
+#: Pulled out of _STEP() below so the patterns that cannot use that helper --
+#: the ones matching a STEP marker mid-line, away from its bracket tag -- share
+#: the same definition instead of restating it and getting it wrong. Restating
+#: it is not a hypothetical failure: _RFID_READ_OK_RE hard-coded "STEP:" and was
+#: therefore HT-blind for months while reading as a working matcher.
+_STEP_SEP = r"STEP\d*\s*[,:]\s*"
+
+
+def _STEP(tail: str) -> "re.Pattern":
+    """
+    Build a pattern for a STEP event that ignores which dialect said it.
+
+    The three units tag and punctuate the same event differently:
+
+        HT     [AMS_RFID] STEP4,odom calib sucess
+        AMS 2  [AMS_RFID]STEP:read success
+        AMS 1  [AMS_DEV]  STEP:odom calib success exit 0
+
+    The pattern therefore accepts any [AMS_*] tag, an optional space, STEP with
+    an optional step number, ',' or ':' as the separator, then the shared
+    wording. Anchoring on one dialect matches nothing on the other two.
+
+    :param tail: the event wording, as a regex fragment
+    :return: a compiled, dialect-tolerant pattern
+    """
+    return re.compile(r"\[AMS_[A-Z_]+\]\s*" + _STEP_SEP + tail, re.IGNORECASE)
+
 
 _AMS_HUMAN = (
     (_DRY_REFUSED_RE,
@@ -263,22 +492,36 @@ _AMS_HUMAN = (
     # below fired on an AMS 1 before these were added -- the firmware half of
     # this project was written watching [AMS_DEV] (its comments say so) while
     # these host rules were written against an AMS 2 or HT.
-    (re.compile(r"\[AMS_DEV\]\s*STEP:read success"),
-     lambda m: "AMS: tag read OK"),
-    (re.compile(r"\[AMS_DEV\]\s*STEP:card auth success"),
+    # PREFIX-AGNOSTIC from here down. Every rule above that names a bracket tag
+    # is blind to at least one unit, because the three do not share a
+    # vocabulary of tags at all -- counted over tonight's single-unit captures:
+    #
+    #   HT     [AMS_SWITCH] [AMS_COMMON] [AMS_LINK] [AMS_LED] [AMS_TRAY] [AMS_CHMB]
+    #   AMS 2  the same, plus [AMS_RFID] [AMS_PMSM]
+    #   AMS 1  [AMS_DEV] almost exclusively (63 of 64 fragments), + [AMS_CALL]
+    #
+    # So an [AMS_RFID]-anchored rule never fires on an AMS 1 and an
+    # [AMS_DEV]-anchored one never fires on an HT -- which is why the same
+    # event was written twice below, once per dialect, and still missed the
+    # third unit. Match the CONTENT instead: the wording is shared, only the
+    # tag and the punctuation around STEP differ ("STEP4," / "STEP:" / "STEP2:",
+    # with or without a space after the bracket).
+    (_STEP("read success"),
+     lambda m: "AMS read the spool tag"),
+    (_STEP("card auth success"),
      lambda m: "AMS: tag authenticated"),
-    (re.compile(r"\[AMS_DEV\]\s*STEP:feed with rfid success"),
+    (_STEP("feed with rfid success"),
      lambda m: "AMS: spool fed and tag read"),
-    (re.compile(r"\[AMS_DEV\]\s*STEP,first detected"),
+    (_STEP("first detected"),
      lambda m: "AMS: spool detected"),
+    (_STEP(r"select card fail, err (\d+)"),
+     lambda m: f"AMS could not read the spool tag (err {m.group(1)})"),
+    (_STEP(r"odom calib succ?ess(?:\s+exit\s+(\d+))?"),
+     lambda m: "AMS finished measuring the spool"),
     (re.compile(r"\[RF\]\s*tray(\d+): info write to flash"),
      lambda m: (f"AMS: tag for bay {int(m.group(1)) + 1} cached in the unit's "
                 f"flash (a later read returns it even after a swap)")),
-    (re.compile(r"\[AMS_RFID\]STEP:read success"),
-     lambda m: "AMS read the spool tag"),
-    (re.compile(r"\[AMS_RFID\]STEP:select card fail, err (\d+)"),
-     lambda m: f"AMS could not read the spool tag (err {m.group(1)})"),
-    (re.compile(r"\[AMS_PRELOAD\]preload finish"),
+    (re.compile(r"preload\s+finish", re.IGNORECASE),
      lambda m: "AMS staged the spool at its feeder"),
 )
 
@@ -304,10 +547,100 @@ _AMS_HUMAN = (
 # and "no card in RF" is not terminal -- insert #2 emitted it 7s before the tag
 # authenticated.
 _RFID_INFLIGHT_RE = re.compile(
-    r"STEP\d?:?\s*(?:pull tray|rfid pull|start,read all card|search finished|"
-    r"feed and judge|no card in RF|card auth|read success|feed with rfid)"
+    _STEP_SEP + r"(?:pull tray|rfid pull|start,read all card|search finished|"
+    r"feed and judge|no card in RF|card auth|read success|feed with rfid|"
+    r"empty to read|anticoll get UID|direct read card|search \d+ card)"
     r"|\[RF\]\s*tray\d+:"
     r"|\[AMS_RFID\]STEP:")
+
+# The TERMINAL success markers, as opposed to the in-flight steps above. A read
+# that runs is not a read that lands: the same insert emits "search finished,
+# found 0 card" and "STEP5:no card in RF" on the way to a successful auth, so
+# only these say a tag was actually recovered. Measured on an AMS 1 bay 3
+# insert: "card auth success! [RF] tray2: info write to flash / read
+# success,valid / read_done=1", 16s after the insert edge.
+#
+# The failure end of the same window looks like "tray pull over 790 mm, but no
+# card detected" -- deliberately NOT matched here, because absence of success
+# is what the caller tests and a unit can also simply go quiet.
+#
+# THIS PATTERN WAS HT-BLIND, AND THAT WAS THE WHOLE "HT KEEPS APPLYING THE OLD
+# TAG" BUG. Every alternative began with a literal "STEP:" -- the boxed
+# punctuation. The HT says "STEP3,": digit, comma. So on an AMS HT this regex
+# could not match anything, ever, and rfid_read_succeeded_since() was hard-wired
+# to False for that model. Measured, not deduced, from AFC_BambuAMS.log:
+#
+#   17:49:02  0x1800  [AMS_RFID] STEP3,auth card successful
+#                     [RF] tray0: info write to flash
+#                     [AMS_RFID] STEP3,save to flash ,card info valid
+#   17:49:04  0x1800  [AMS_RFID] STEP3,read success ,goto Cali
+#   17:49:22  module: "no readable tag profile in slot 0 ... the bay reader
+#                      saw no chip"
+#
+# The unit read the tag, said so twice in plain language, and the module
+# answered that it saw no chip. _finalize_scan's read_ok test is the only thing
+# standing between a real read and the "apply lane defaults / keep the leftover
+# record" path, so an HT took that path on every single insert -- including a
+# re-insert of the SAME spool, which is precisely the case that has to work.
+#
+# Four firmware rounds were spent hunting this in the bridge (min holds, rescan
+# evidence, insert gates, a stale-tag refusal), and every one of them was
+# looking at a unit that had already answered correctly.
+_RFID_READ_OK_RE = re.compile(
+    _STEP_SEP + r"read success"
+    r"|" + _STEP_SEP + r"read_done=1"
+    r"|" + _STEP_SEP + r"feed with rfid success"
+    # The HT's commit sentence: it has authenticated the chip and written the
+    # record to its own flash. Stronger than "read success" -- this is the unit
+    # stating the tag it now serves BELONGS to the spool in the bay, which is
+    # exactly the question the caller is asking.
+    r"|" + _STEP_SEP + r"save to flash"
+    r"|card info valid")
+
+# End of the scan CYCLE, whatever its outcome. The unit emits this on both ends
+# -- after "feed with rfid success" and after "tray pull over 790 mm, but no
+# card detected" -- which makes it the only honest moment to say a tag did not
+# read. Before it, "no tag" is a guess against a clock.
+#
+# The clock was wrong in practice: a bay-3 insert went quiet for 11s between its
+# tray_readid chatter and the auth, so a 14s fallback announced "no readable tag"
+# two seconds before the tag landed and then corrected itself. tray_readid cannot
+# be used to bridge that gap (see _RFID_INFLIGHT_RE -- a unit can sit in it
+# forever and never pull the tray), but STEP7 can, because a unit that gives up
+# there never reaches it and the caller's hard cap ends the wait instead.
+#: THE UNIT SAYS WHEN IT IS DONE -- listen, do not run a timer alongside it.
+#: One terminal marker per dialect, taken from complete successful cycles in
+#: the 2026-08-05 single-unit captures:
+#:
+#:   HT     [AMS_RFID] STEP4,Calibration rst:0
+#:   AMS 1  [AMS_DEV]  STEP:odom calib success exit 0,dis:0.989
+#:   AMS 2  [AMS_RFID] STEP7:cali end
+#:
+#: "STEP7:" on its own is NOT terminal -- the same captures carry
+#: "STEP7:ready to cali tray" and "STEP7:info_valid 0 or bbl:-1" mid-cycle, so
+#: matching the bare prefix would end the cycle before the measurement runs.
+#: And the HT MISSPELLS success ("calib sucess"), hence succ?ess.
+#: THE UNIT REFUSING A FOREIGN TAG, in its own words. A Mifare chip whose keys
+#: are not Bambu's answers anticollision -- so the UID is readable -- and then
+#: fails authentication:
+#:
+#:     [AMS_RFID]STEP:stop goto auth
+#:     [AMS_RFID]STEP:auth fail:-4
+#:     [AMS_RFID]STEP7:info_valid 0 or bbl:-1        (bbl = Bambu Lab)
+#:
+#: Worth telling apart from an empty bay, because "the bay reader saw no chip"
+#: is simply WRONG for a Snapmaker or Elegoo spool: it saw one and could not
+#: open it. Different problem, different thing for an operator to do.
+_RFID_FOREIGN_TAG_RE = re.compile(
+    r"auth fail\s*:\s*-?\d+"
+    r"|info_valid\s*0\s*or\s*bbl\s*:\s*-?\d+",
+    re.IGNORECASE)
+
+_RFID_CYCLE_END_RE = re.compile(
+    r"Calibration\s+rst:\d+"
+    r"|odom\s+calib\s+succ?ess"
+    r"|STEP7:\s*(?:finish|cali\s+end)",
+    re.IGNORECASE)
 
 # Bus chatter with no operational content. These are the AMS's own link-layer
 # bookkeeping -- who is selected, what mode/ref it moved to -- repeated many
@@ -329,7 +662,27 @@ _AMS_NOISE_RE = re.compile(
     r"|\[AMS_LINK\]\s*ams\d+\s+select,\s*req\s+ams\d+"
     r"|\[AMS_COMMON\]\s*(?:mode|ref):\s*-?\d+\s*->\s*-?\d+"
     r"|\[AMS_IDLE\]\s*set ams state switch"
+    # "[AMS_COMMON]preload_disable:1, tmpr:25.8, cd:0" then :0 again, both in
+    # one frame, every 90 seconds on a boxed unit. The unit's own housekeeping
+    # on a fixed timer -- it toggles preload, samples temperature, re-enables --
+    # with no motion alongside and nothing an operator can act on.
+    #
+    # CONSOLE ONLY. only_debug suppresses the console line and nothing else:
+    # AFC_BambuAMS.log still records it verbatim, and every parser has already
+    # run by the time this is decided. Chamber temperature reaches the card
+    # through [AMS_CHMB], not this line.
+    r"|\[AMS_COMMON\]\s*preload_disable:\d+\s*,\s*tmpr:[0-9.]+\s*,\s*cd:\d+"
     r"))+\s*$")
+
+#: The AMS's 10-second liveness heartbeat, as a segment rather than a line.
+#: The unit bundles it into whatever frame is going out, so it has to be
+#: removable from the middle of a sentence, not just recognised as a whole one.
+#: The colon is OPTIONAL. Both forms are real -- "[DBG] ams time: now=42044054ms
+#: diff=10005ms" on the wire today, and a bare "[DBG] ams time 12345" that a
+#: test pins because it was seen too. Requiring the colon let the second form
+#: through to the console the moment the substring drop below was removed.
+_DBG_AMSTIME_RE = re.compile(r"\[DBG\]\s*ams time\b[^\[]*")
+
 
 def _ams_is_noise(text: str) -> bool:
     """
@@ -353,11 +706,45 @@ _UNSET = object()
 
 _BRIDGE_EVENTS_KNOWN = frozenset((
     "status", "reply", "error", "ack", "amsdbg", "sniff", "chain", "info",
-    "sniff_mode",
+    "sniff_mode", "m3", "rc", "rollcall", "clsprobe",
     # command echoes
-    "dry", "mon", "resync", "mcaddr", "selfc", "armms", "hb",
+    "dry", "mon", "resync", "mcaddr", "armms", "arrivems", "hb",
     "htpoll", "htid", "htunit", "drain", "mute", "units", "variant", "baud",
     "parity", "en", "replay", "load", "unload", "rdinfo", "relink", "rehome",
+    "capscan", "m6", "p0f", "poll", "extmimic", "ht0fhold",
+    "tail", "arrived", "txecho",
+    # Scan-path echoes. Both are the bridge repeating back a command we sent
+    # ("scan" with state start/done, "reread" naming the bay it invalidated),
+    # so they belong with the echoes above and not in the catch-all -- where
+    # every tag scan logged an "unhandled bridge event" line for a message
+    # that was working exactly as designed. The bind/htuid echoes once flooded
+    # this same path badly enough to starve the MCU.
+    "scan", "reid", "reread", "prime",
+    # "tx" is the EVENT (the frames we transmit); "txecho" is only the command
+    # echo. Both must be here: the not-in-_BRIDGE_EVENTS_KNOWN catch-all above
+    # sits BEFORE the per-event branches, so an event missing from this set is
+    # swallowed as "unhandled" and its handler never runs -- which is exactly
+    # how rc/rollcall went missing, and then how the TX echo recorded nothing
+    # on its first real use.
+    "tx", "loops",     # both need a HANDLER below, not just membership here:
+                       # being "known" without one is worse than unknown --
+                       # the catch-all stops logging it and it vanishes.
+    # ENROLLMENT ECHOES. The firmware emits one `bind` per known unit and a
+    # `htuid` per HT every time the chain is re-asserted, which is every status
+    # round. With three units on the wire that is a steady stream, and being
+    # absent from this set sent every one of them down the "unhandled bridge
+    # event" path -- 69 log lines a second inside Klipper's process, measured.
+    #
+    # THAT IS NOT A COSMETIC COST. It starved the reactor until the CAN toolhead
+    # missed a scheduled pin event and the MCU shut down:
+    #
+    #   MCU 'EBBT0' shutdown: Missed scheduling of next digital out event
+    #
+    # They are pure telemetry -- the host already learns the chain from `chain`
+    # -- so they belong here as known-and-ignored rather than as a per-round
+    # logging storm. If a handler is ever wanted, add it BELOW as well; membership
+    # alone would silence them completely.
+    "bind", "htuid",
 ))
 
 # ── Bridge connection (threaded reader, reactor hop) ────────────────────────────
@@ -410,6 +797,13 @@ class BambuBridge:
         # Last drying refusal per device address, so the panel can say WHY a
         # start did nothing. Cleared when that unit actually begins a cycle.
         self._dry_err: Dict[int, str] = {}
+        #: addr -> {"rotate": int, "dur": int, "tmpr": int}, as the unit last
+        #: echoed them. See _DRY_CFG_RE.
+        self._dry_cfg: Dict[int, Dict[str, int]] = {}
+        self._cap_measure: Dict[int, Dict[str, Any]] = {}
+        #: addr -> {"rst": int, "t": float}; the AMS HT's calibration verdict,
+        #: which it reports INSTEAD of the boxed units' percent line.
+        self._ht_cali: Dict[int, Dict[str, Any]] = {}
         # Same records keyed by the device address that sent them, so several
         # AMS units on one bridge do not overwrite each other's chamber.
         self._chmb_by_addr: Dict[int, dict] = {}
@@ -422,6 +816,37 @@ class BambuBridge:
         # the filament travels on this machine, so it is preferred over any
         # configured value.
         self._tube_by_addr: Dict[int, float] = {}
+        # Per-UNIT path length, and which unit is currently being commanded.
+        #
+        # The device address cannot tell two units of the same class apart:
+        # an AMS 1 and an AMS 2 Pro both narrate as 0x0700, so keying by
+        # address alone let one unit's measurement land in the other's config.
+        # Live risk on this rig -- AMS 2 measured 3532 mm while AMS 1 was still
+        # on the 3000 mm default.
+        #
+        # The host knows which unit it commanded, and tube_len is only ever
+        # narrated by the unit doing the feed, so the active unit is a better
+        # key than the address. The address map is kept as the fallback for a
+        # single-unit bus and for anything that has not set an active unit.
+        self._tube_by_unit: Dict[int, float] = {}
+        # Per-unit dw_len, and how many times each unit has said it. The COUNT
+        # is the point: one reading proves the word exists, and only a run of
+        # them says whether the figure is stable enough to trust. Keyed by unit
+        # for the same reason tube_len is -- two boxed units share address
+        # 0x0700, so the address cannot tell them apart.
+        self._dw_by_unit: Dict[int, float] = {}
+        self._dw_n_by_unit: Dict[int, int] = {}
+        # The DEVICE ADDRESS the value actually arrived on, kept beside it.
+        #
+        # _active_unit is set when a load starts and never cleared, so it names
+        # whichever unit loaded LAST -- fine while a load is running, wrong for
+        # anything narrated afterwards. Storing the addr lets a consumer refuse
+        # a value that reached it under another unit's device (an HT is 0x1800
+        # and a boxed AMS 0x0700, so the mismatch that matters is catchable).
+        # The two boxed units share 0x0700 and cannot be told apart this way,
+        # which is exactly why the unit key exists as well.
+        self._dw_addr_by_unit: Dict[int, int] = {}
+        self._active_unit: Optional[int] = None
         # Repeat tracking for the narration dedupe. An identical line is
         # re-emitted periodically with a count, so a repeating fault stays
         # visible as a fault rather than being suppressed into silence.
@@ -435,6 +860,37 @@ class BambuBridge:
         # None (not 0.0) for "never seen": a reactor whose monotonic clock
         # reads 0.0 would otherwise have its stamp treated as absent.
         self._rfid_step_t: Optional[float] = None
+        # Monotonic time of the last narration line reporting a tag read that
+        # actually SUCCEEDED (see _RFID_READ_OK_RE). In-flight above says a read
+        # is running; this says one landed, which is a different question and the
+        # one that decides whether a slot record can be trusted as the new
+        # spool's. Bridge-wide for the same reason and with the same consequence.
+        self._rfid_ok_t: Optional[float] = None
+        # Monotonic time the last scan CYCLE ended (see _RFID_CYCLE_END_RE),
+        # success or failure alike. Bridge-wide, as above.
+        self._rfid_end_t: Optional[float] = None
+        # THE SAME THREE STAMPS, KEYED BY THE DEVICE THAT SAID IT.
+        #
+        # The bridge-wide stamps above stay as the fallback (and are what a
+        # caller that passes no address still gets), but they cross-credit: an
+        # AMS 1 narrating "read success" while an HT is mid-scan hands the HT a
+        # success it never had. That is not a corner case here -- an insert in
+        # one unit routinely overlaps a scan in another, and it is on record:
+        # at 17:49:05 an AMS 1 bay-3 insert began 3s into the HT's scan window.
+        #
+        # The address separates an HT (0x1800) from a boxed unit (0x0700) and
+        # NOT the two boxed units from each other, which both answer at 0x0700.
+        # That is the same limit the chamber telemetry has, documented in the
+        # same terms: it is a real improvement over one shared stamp, and it is
+        # not attribution by chain index. Where a boxed pair must be told apart,
+        # the unit key is the answer -- narration does not carry one.
+        self._rfid_step_by_addr: Dict[int, float] = {}
+        self._rfid_ok_by_addr: Dict[int, float] = {}
+        self._rfid_end_by_addr: Dict[int, float] = {}
+        # The unit said a chip is present but its keys are not Bambu's
+        # ("auth fail:-4"). Distinguishes a THIRD-PARTY tag from an empty bay.
+        self._rfid_foreign_t: Optional[float] = None
+        self._rfid_foreign_by_addr: Dict[int, float] = {}
         # Last motion completion the AMS itself reported ("feed finish",
         # "preload finish", "pull finish"), as (sequence, ok, text). The bridge
         # gives no ack for move COMPLETION -- only that the command was
@@ -443,6 +899,10 @@ class BambuBridge:
         # for. Sequence increments per event so a waiter can tell a fresh
         # completion from a stale one.
         self._finish_seq: int = 0
+        # Bumped each time the unit finishes its native mode:4 pull.
+        self._pull_seq: int = 0
+        # Bumped when the unit finishes the PUSH-FORWARD half.
+        self._assist_seq: int = 0
         self._finish_ok: bool = False
         self._finish_text: str = ""
         # The AMS's own fault reports. It names stalls explicitly -- "feed
@@ -453,9 +913,25 @@ class BambuBridge:
         # can tell a fresh fault from one it has already handled.
         self._fault_seq: int = 0
         self._fault_text: str = ""
+        # The unit's last reported error LEVEL (0 = healthy) and when.
+        # None means it has never said, which is not the same as zero.
+        self._err_code: Optional[int] = None
+        self._err_code_t: float = 0.0
         self._bldc_i: float = 0.0
         self._chain_uids: List[str] = []       # index -> 24-hex UID (from `chain`)
         self._last_raw_reply: str = ""         # last `reply` frame (diagnostic)
+        # Last {"cmd":"rdinfo"} result: the RAW 0x0211 filament-info reply for
+        # one bay, straight off the wire and before any decode. The one way to
+        # tell "the unit did not send this field" from "our decode missed it".
+        self._last_rdinfo: dict = {}
+        self._last_m3: Optional[dict] = None   # last m3 diagnostics (on request)
+        # Roll-call: the firmware's address register (probes/answers/mask), and
+        # whether it is running. Both only on request; None means never asked.
+        self._last_rc: Optional[dict] = None
+        self._last_clsprobe: Optional[dict] = None
+        # Bus-wide spool-operation ownership (see try_claim_bus).
+        self._bus_owner: Optional[str] = None
+        self._bus_claim_t: float = 0.0
         # unit -> the MC address the FIRMWARE read back after being told one.
         # Receipt for the announce. From Klipper an mcaddr command that never
         # arrives and one that arrives and is applied look identical, so the
@@ -515,6 +991,88 @@ class BambuBridge:
             except Exception:
                 pass
 
+    def last_err_code(self) -> Tuple[Optional[int], float]:
+        """
+        Return the unit's last reported error level and when it said it.
+
+        This is a LEVEL, not an event: 0 means the unit currently reports no
+        error, and None means it has never reported one at all -- which is not
+        the same thing and must not be treated as healthy.
+
+        Use it to answer "is this unit still in error", e.g. before resuming a
+        print. Do NOT use it to detect a fault occurring -- err_code cycles
+        during healthy operation; the stall detector keys on the unit's words
+        instead.
+
+        :return tuple: (err_code or None, monotonic time it was reported)
+        """
+        with self._lock:
+            return (self._err_code, self._err_code_t)
+
+    def last_scan_end(self) -> Optional[float]:
+        """
+        When the AMS last said its scan/measure cycle finished.
+
+        The unit announces this -- "Calibration rst:0" on an HT, "odom calib
+        success exit 0" on an AMS 1, "STEP7:cali end" on an AMS 2 -- so a
+        caller can wait for the real end instead of guessing with a timer.
+
+        :return float: monotonic time of the last cycle end, or None
+        """
+        with self._lock:
+            return self._rfid_end_t
+
+    # ── BUS-WIDE SPOOL-OPERATION OWNERSHIP ──────────────────────────────────
+    # One spool operation on the bus at a time. We guarded a scan PER SLOT and
+    # nothing guarded the BUS, so during a relink two units scanned at once and
+    # Klipper crashed.
+    #
+    # A real printer never overlaps them and narrates the handoff out loud:
+    # "[AMS_CALL] ams1 select, select ams2". One owner, and the select lives
+    # inside an owned transaction.
+    #
+    # The claim is released by the UNIT's own cycle-end marker (_rfid_end_t,
+    # what last_scan_end reports -- "Calibration rst:0" on an HT, "odom calib
+    # success exit 0" on an AMS 1, "STEP7:cali end" on an AMS 2), not by a
+    # timer. The timer is only a backstop for a unit that never announces, and
+    # it is deliberately generous: a real scan-and-measure runs ~60 s.
+    BUS_CLAIM_MAX_S = 120.0
+
+    def try_claim_bus(self, owner: str, now: float) -> bool:
+        """
+        Claim the bus for a spool operation, or report that someone else has it.
+
+        :param owner: a stable name for the claimant (the unit's name)
+        :param now: reactor monotonic time
+        :return bool: True if the caller may proceed
+        """
+        with self._lock:
+            cur = getattr(self, "_bus_owner", None)
+            if cur is not None and cur != owner:
+                claimed = getattr(self, "_bus_claim_t", 0.0)
+                ended = self._rfid_end_t
+                done = (ended is not None and ended >= claimed)
+                if not done and (now - claimed) < self.BUS_CLAIM_MAX_S:
+                    return False                  # genuinely busy elsewhere
+            self._bus_owner = owner
+            self._bus_claim_t = now
+            return True
+
+    def release_bus(self, owner: str) -> None:
+        """
+        Drop the claim if we hold it. Safe to call when we do not.
+
+        :param owner: the claimant name that was passed to claim_bus
+        """
+        with self._lock:
+            if getattr(self, "_bus_owner", None) == owner:
+                self._bus_owner = None
+
+    def bus_owner(self) -> Optional[str]:
+        """Who holds the bus for a spool operation, if anyone."""
+        with self._lock:
+            return getattr(self, "_bus_owner", None)
+
     def last_fault(self) -> Tuple[int, str, float]:
         """
         Return the AMS's last self-reported stall.
@@ -524,19 +1082,16 @@ class BambuBridge:
         with self._lock:
             return (self._fault_seq, self._fault_text, self._bldc_i)
 
-    def set_narration_log(self, log_dir: str,
+    def set_narration_log(self, log_dir: str, tag: str = "",
                           max_bytes: int = 10 * 1024 * 1024) -> bool:
         """
         Send the AMS's own narration to its own file.
 
-        The narration gets its own file and handler: always written, never on
-        the console, and independent of any AFC setting. That keeps every
-        STEP, finish, stall and measured length on record on a printer running
-        with AFC's `debug` flag off, which gates logger.debug() and is the
-        normal state for a working printer since the AMS narrates
-        continuously. Rotates at 10 MB keeping NO backups -- narration is a
-        rolling window for diagnosis, not an archive, and an unbounded log on
-        a Pi's SD card is its own hazard.
+        Narration gets its own file and handler: always written, never on the
+        console, and independent of AFC's `debug` flag, so every STEP, finish,
+        stall and measured length stays on record even with debug off.
+        Rotates at 10 MB keeping NO backups -- it is a rolling window for
+        diagnosis, not an archive.
 
         :param log_dir: directory to write into (Klipper's log directory)
         :param max_bytes: rotate at this size; 0 disables rotation
@@ -544,7 +1099,13 @@ class BambuBridge:
         """
         if self._nar_lg is not None:
             return True
-        lg = logging.getLogger("AFC_BambuAMS_file")
+        # ONE LOG PER BUS MASTER. Two Picos writing one file cannot be
+        # untangled afterwards: the only per-line attribution is the device
+        # address, and two boxed units on different buses both narrate as
+        # 0x0700. `tag` names the master -- empty for the first, so a
+        # single-Pico printer writes plain AFC_BambuAMS.log.
+        suffix = ("_" + tag) if tag else ""
+        lg = logging.getLogger("AFC_BambuAMS_file" + suffix)
         # isinstance, NOT `if not lg.handlers`. logging.getLogger() is
         # process-global, so anything that attached a handler first -- pytest,
         # another unit, a reload -- makes the truthy check skip setup and hand
@@ -554,14 +1115,15 @@ class BambuBridge:
                    for h in lg.handlers):
             try:
                 fh = _TruncatingRotatingFileHandler(
-                    os.path.join(log_dir, "AFC_BambuAMS.log"),
+                    os.path.join(log_dir, "AFC_BambuAMS%s.log" % suffix),
                     maxBytes=max_bytes, backupCount=0)
                 fh.setFormatter(logging.Formatter(
                     "%(asctime)s %(message)s", datefmt="%H:%M:%S"))
                 lg.addHandler(fh)
             except Exception as e:
                 self.logger.warning(
-                    "AFC bambu: could not open AFC_BambuAMS.log: %s" % (e,))
+                    "AFC bambu: could not open AFC_BambuAMS%s.log: %s"
+                    % (suffix, e))
                 return False
         lg.setLevel(logging.DEBUG)
         # Never propagate: this would otherwise duplicate every narration line
@@ -574,10 +1136,9 @@ class BambuBridge:
         """
         Record one narration line verbatim.
 
-        Written BEFORE the console dedupe, deliberately: a line repeating
-        hundreds of times is how a stuck loop looks, and collapsing it in the
-        file would hide the shape of the fault. The address is included so a
-        bus carrying several units stays attributable.
+        Written BEFORE the console dedupe, so a line repeating hundreds of
+        times still shows the shape of a stuck loop. The address is included
+        so a bus carrying several units stays attributable.
 
         :param text: the raw narration line
         :param addr: device address that produced it, if known
@@ -595,11 +1156,9 @@ class BambuBridge:
         """
         The buffer position the unit last reported, or None.
 
-        Reported at two moments worth having: "e_in" while the filament
-        enters the extruder, and "feed finish" when the load completes. At
-        end-of-load it reads ~1.28 on an HT (five consecutive loads, spread
-        0.01) -- hard compressed -- which is the reference point for buffer
-        ramming.
+        Reported at two moments: "e_in" as the filament enters the extruder,
+        and "feed finish" when the load completes. End-of-load reads ~1.28 on
+        an HT -- hard compressed -- which is the reference for buffer ramming.
 
         :return Optional[float]: the reading, or None if it has said none
         """
@@ -624,10 +1183,10 @@ class BambuBridge:
         """
         Record, or clear, a drying refusal for the device that narrated it.
 
-        Recorded BEFORE the dedupe, like the file log: the AMS repeats the
-        refusal on every retry, and a deduped repeat still means "still
-        refusing". Cleared the moment that unit reports it is heating or
-        self-checking, so a stale reason cannot outlive the condition.
+        Recorded BEFORE the dedupe, because the AMS repeats the refusal on
+        every retry and a deduped repeat still means "still refusing". Cleared
+        as soon as that unit reports heating or self-checking, so a stale
+        reason cannot outlive the condition.
 
         :param text: the narration line
         :param addr: device address that produced it
@@ -646,6 +1205,151 @@ class BambuBridge:
         except Exception:
             pass          # a diagnostic must never take the reader thread down
 
+    def _note_dry_cfg(self, text: Optional[str], addr: Optional[int]) -> None:
+        """
+        Record the drying settings a device echoes back.
+
+        Kept even when the command is refused -- the echo reports what the unit
+        is HOLDING, which a refusal does not erase. Cleared only by a cycle
+        finishing with dur:0, which the unit emits itself.
+
+        :param text: the narration line
+        :param addr: device address that produced it
+        """
+        if not text or not addr:
+            return
+        try:
+            m = _DRY_CFG_RE.search(text)
+            if not m:
+                return
+            with self._lock:
+                self._dry_cfg[int(addr)] = {
+                    "rotate": 1 if (int(m.group(1)) or int(m.group(2))) else 0,
+                    "dur":    int(m.group(5)),
+                    "tmpr":   int(m.group(6)),
+                }
+        except Exception:
+            pass          # a diagnostic must never take the reader thread down
+
+    def last_dry_cfg(self, addr: Optional[int]) -> Optional[Dict[str, int]]:
+        """
+        The drying settings this device last echoed, or None.
+
+        :param addr: device address (an HT is 0x1800, a boxed AMS 0x0700)
+        :return: dict with rotate/dur/tmpr, or None if it has never echoed
+        """
+        if not addr:
+            return None
+        with self._lock:
+            cfg = self._dry_cfg.get(int(addr))
+            return dict(cfg) if cfg else None
+
+    def _note_cap_measure(self, text: Optional[str], addr: Optional[int],
+                          now: float) -> None:
+        """
+        Record a narrated capacity measurement (see _CAP_MEASURE_RE).
+
+        :param text: the narration line
+        :param addr: device address that produced it
+        :param now: reactor-monotonic receive time, so consumers can tell a
+            fresh measurement from a stale one
+        """
+        if not text or not addr:
+            return
+        try:
+            # The AMS HT's calibration verdict, which carries no percent (see
+            # _HT_CALI_RST_RE). Recorded alongside the boxed measurement so a
+            # caller can tell "the cycle finished" from "the cycle was never
+            # heard from" -- watching only for a percent made every successful
+            # HT calibration look like silence.
+            c = _HT_CALI_RST_RE.search(text)
+            if c:
+                with self._lock:
+                    self._ht_cali[int(addr)] = {"rst": int(c.group(1)),
+                                                "t": now}
+            else:
+                # The AMS 1 has no "Calibration rst:N" line at all -- it says
+                # "odom calib success exit 0" instead. Map a success onto the
+                # same rst 0 the other units report, so a caller does not need
+                # to know which generation it is talking to.
+                d = _CALI_DONE_RE.search(text)
+                if d:
+                    with self._lock:
+                        self._ht_cali[int(addr)] = {"rst": 0, "t": now}
+            m = _CAP_MEASURE_RE.search(text)
+            if not m:
+                return
+            tray, circ, radius, pct = m.groups()
+            with self._lock:
+                self._cap_measure[int(addr)] = {
+                    # Clamped for callers that drive a 0-100 display, but the
+                    # raw value is kept: a fresh spool legitimately reads over
+                    # 100 (107% captured on the HT), and silently flattening
+                    # that to 100 would throw away a real measurement.
+                    "pct": min(100, int(pct)),
+                    "pct_raw": int(pct),
+                    "radius_m": float(radius),
+                    # Present only on a live measurement; a restore from flash
+                    # reports no circumference. None means "not stated", which
+                    # is not the same as zero.
+                    "circumference_m": float(circ) if circ else None,
+                    # The restore form names its tray; the live form does not,
+                    # because it can only be the tray just measured.
+                    "tray": int(tray) if tray is not None else None,
+                    # Distinguishes "the unit just measured this" from "the
+                    # unit recalled it at power-on". Both are valid readings,
+                    # but only the first means a spool was physically pulled.
+                    "restored": tray is not None,
+                    "t": now,
+                }
+        except Exception:
+            pass          # a diagnostic must never take the reader thread down
+
+    def last_ht_cali(self, addr: Optional[int]) -> Optional[Dict[str, Any]]:
+        """
+        The most recent AMS HT calibration verdict, or None.
+
+        :param addr: device address (an HT is 0x1800)
+        :return: dict with rst / t -- rst 0 = completed, 1 = refused
+            ("capacity no en"), 4 = aborted (stall during calib)
+        """
+        if not addr:
+            return None
+        with self._lock:
+            m = self._ht_cali.get(int(addr))
+            return dict(m) if m else None
+
+    def last_cap_measure(self, addr: Optional[int]) -> Optional[Dict[str, Any]]:
+        """
+        The most recent capacity measurement this device narrated, or None.
+
+        :param addr: device address (an HT is 0x1800, a boxed AMS 0x0700)
+        :return: dict with pct / radius_m / t, or None
+        """
+        if not addr:
+            return None
+        with self._lock:
+            m = self._cap_measure.get(int(addr))
+            return dict(m) if m else None
+
+    def clear_dry_error(self, addr: Optional[int]) -> None:
+        """
+        Forget why this device last refused, because a NEW attempt is starting.
+
+        The error describes the LAST ATTEMPT, so a new attempt is what resets
+        it. Called as a dry is commanded, before anything reaches the bus.
+
+        Narration alone is not enough: the only lines that clear it are
+        CTC_STATE_HEATING and CTC_STATE_SELF_CHECK, and an AMS HT emits
+        neither, so without this one refusal would read as "refused" forever.
+
+        :param addr: device address (an HT is 0x1800, a boxed AMS 0x0700)
+        """
+        if not addr:
+            return
+        with self._lock:
+            self._dry_err.pop(int(addr), None)
+
     def last_dry_error(self, addr: Optional[int]) -> Optional[str]:
         """
         Why this device last refused to dry, or None if it has not.
@@ -663,22 +1367,13 @@ class BambuBridge:
         """
         Whether a motion completion means the filament ARRIVED.
 
-        "finish -1, stall" is not a failure on every unit. An AMS HT ends a
+        "finish -1, stall" is not a failure on every unit: an AMS HT ends a
         normal load by feeding to the end of its PTFE and stalling against the
-        extruder gear -- that IS how it knows it is there, and it says so:
+        extruder gear, which is how it knows it has arrived. Reading the word
+        "stall" as failure marks a good load failed. What matters is how far
+        it got, not that it stalled:
 
-          feed finish -1, stall, len_det:3.601 m, tube_len:3.619 m
-          feed finish, buff_pos:1.28, bldc_i:1.600A
-
-        18 mm short of a 3619 mm path, immediately followed by a clean finish.
-        Reading the word "stall" as failure marks a perfectly good load failed.
-        A REAL stall looks nothing like it -- the unload that genuinely came up
-        short reported len_det:3.283 m against the same 3619 mm, 336 mm out,
-        and did need its retry.
-
-        So the question is not whether it stalled, it is how far it got:
-
-        1. no stall reported at all -> success, as before
+        1. no stall reported at all -> success
         2. stalled, but len_det reached tube_len (within tolerance) -> success
         3. the same line also carries a clean finish -> success
         4. otherwise -> failure
@@ -713,12 +1408,10 @@ class BambuBridge:
         """
         Record every CHANGE of the AMS's own mode into the narration log.
 
-        `fstate` is what the move-completion wait keys on, so whether it
-        actually moves during a load is not something to reason about -- it is
-        something to read off a trace next to the narration that shares its
-        clock. Changes only: the field rides every status frame, several a
-        second, and logging all of them would bury the narration it sits
-        beside.
+        `fstate` is what the move-completion wait keys on, so the trace sits
+        next to the narration on the same clock. Changes only: the field rides
+        every status frame, several a second, and logging all of them would
+        bury the narration beside it.
 
         :param obj: a decoded status event
         """
@@ -734,20 +1427,79 @@ class BambuBridge:
         except Exception:
             pass          # a trace must never take the reader thread down
 
-    def tube_len(self, addr: Optional[int] = None) -> Optional[float]:
+    def set_active_unit(self, unit: Optional[int]) -> None:
+        """
+        Name the unit currently being commanded, so narration it produces is
+        attributed to it rather than to its device address.
+
+        Two units of the same class share an address (an AMS 1 and an AMS 2 Pro
+        are both 0x0700), so the address alone cannot say which one spoke --
+        but the host knows, having issued the move. Set around a load, cleared
+        after.
+
+        :param unit: chain index, or None to clear
+        """
+        with self._lock:
+            self._active_unit = None if unit is None else int(unit)
+
+    def dw_len(self, unit: Optional[int] = None) -> tuple:
+        """
+        The last dw_len a unit reported at the end of a feed, and how many.
+
+        REPORTED, NEVER USED -- see _DW_LEN_M_RE for why. The count matters as
+        much as the value: one reading proves only that the word exists.
+
+        :param unit: chain index; None returns the most recent from any unit
+        :return tuple: (mm, count, addr) -- (None, 0, 0) if never reported
+        """
+        with self._lock:
+            if unit is not None:
+                u = int(unit)
+                return (self._dw_by_unit.get(u),
+                        self._dw_n_by_unit.get(u, 0),
+                        self._dw_addr_by_unit.get(u, 0))
+            if not self._dw_by_unit:
+                return (None, 0, 0)
+            u = max(self._dw_n_by_unit, key=self._dw_n_by_unit.get)
+            return (self._dw_by_unit.get(u),
+                    self._dw_n_by_unit.get(u, 0),
+                    self._dw_addr_by_unit.get(u, 0))
+
+    def tube_len(self, addr: Optional[int] = None,
+                 unit: Optional[int] = None) -> Optional[float]:
         """
         The AMS's own measured PTFE path length in mm, if it has told us.
 
-        The unit learns this itself from consecutive feed measurements and
-        narrates it. It is the real distance on this machine, so it beats any
-        configured estimate -- but it is only available once the unit has
-        enough samples, and it reports 0 until then.
+        The unit learns this from consecutive feed measurements and narrates
+        it, so it is the real distance on this machine and beats a configured
+        estimate. Only available once it has enough samples; it reports 0
+        until then.
 
         :param addr: Device address to look up (0x0700 AMS, 0x1800 HT); None
             returns the most recent from any unit
         :return Optional[float]: length in mm, or None if never reported
         """
         with self._lock:
+            if unit is not None:
+                if int(unit) in self._tube_by_unit:
+                    return self._tube_by_unit[int(unit)]
+                if self._tube_by_unit:
+                    # Per-unit attribution is in play and this unit has not
+                    # measured yet. Do NOT fall through to the address: two
+                    # units of the same class share one (an AMS 1 and an AMS 2
+                    # Pro are both 0x0700), so the address map holds whichever
+                    # of them measured last.
+                    #
+                    # That fallback made the fix useless. Observed with both
+                    # boxed units present: AMS 2 measured 3532 mm, and AMS 1 --
+                    # which had never measured -- read 3532 mm through the
+                    # address and would have adopted it as its own path on its
+                    # next load.
+                    #
+                    # "Unknown" is the correct answer for a unit that has not
+                    # measured. It keeps the configured value, which is what
+                    # an un-calibrated unit should use.
+                    return None
             if addr is not None:
                 v = self._tube_by_addr.get(int(addr))
                 if v:
@@ -767,6 +1519,34 @@ class BambuBridge:
         """
         with self._lock:
             return (self._finish_seq, self._finish_ok, self._finish_text)
+
+    def last_pull(self) -> int:
+        """
+        Sequence number of the AMS's last completed mode:4 pull.
+
+        The unit pulls the tray back on the mode change into mode:4 (native,
+        0.5-2.2s) and the extruder must not advance into it. Wait for this to
+        change rather than for a fixed settle: measured, a pull ended 2.02s
+        after the assist was armed against a 2.00s blind settle, so a timer
+        releases the advance 20ms early.
+
+        :return int: increments once per completed mode:4 pull
+        """
+        with self._lock:
+            return self._pull_seq
+
+    def last_assist_done(self) -> int:
+        """
+        Sequence of the last completed assist cycle (the PUSH-FORWARD half).
+
+        The unit's seating cycle is pull back THEN push forward. `last_pull`
+        marks the end of the pull; this marks the end of the push. Releasing
+        the extruder on the pull alone just moves the fight later.
+
+        :return int: increments once per "assist finish"
+        """
+        with self._lock:
+            return self._assist_seq
 
     def latest_status(self) -> Optional[dict]:
         """
@@ -801,13 +1581,11 @@ class BambuBridge:
         """
         Surface the AMS's own words on the console, in English.
 
-        Everything the unit says already goes to AFC.log verbatim; this picks
-        out the handful an operator would actually want to see and says them
-        plainly. A refused dry command is the motivating case: the AMS answers
-        "[AMS_CHMB]ignore dry_mode:1, ams_state:2", which is the difference
-        between "the heater is broken" and "it was busy, try again" -- and
-        BAMBU_HEATER_START reports success either way, so without this the
-        refusal is invisible.
+        Everything the unit says already reaches AFC.log verbatim; this picks
+        the handful an operator wants to see and renders them plainly. A
+        refused dry is the case that matters: the AMS answers
+        "[AMS_CHMB]ignore dry_mode:1, ams_state:2" and AFC_BAMBU_HEATER_START
+        reports success either way, so the refusal is otherwise invisible.
 
         :param text: One narration line from the AMS
         :param now: Reactor monotonic time, for rate limiting
@@ -853,11 +1631,27 @@ class BambuBridge:
             with self._lock:
                 prev = self._tube_by_addr.get(int(addr))
                 self._tube_by_addr[int(addr)] = mm
+                if self._active_unit is not None:
+                    self._tube_by_unit[int(self._active_unit)] = mm
             if prev is None:
                 self.logger.info(
                     f"AFC bambu {self.name}: AMS 0x{int(addr):04X} reports its "
                     f"measured filament path as {mm:.0f}mm -- using it to size "
                     f"move timeouts instead of the configured estimate")
+
+        # dw_len: RECORDED, NOT USED. See _DW_LEN_M_RE. Same > 0 rule as
+        # tube_len and for a sharper reason -- a load that fails reports
+        # dw_len:0.000, so zero here means "this feed measured nothing",
+        # which is exactly the value that must never reach a deadline.
+        dw = _DW_LEN_M_RE.search(text)
+        if dw:
+            dw_mm = float(dw.group(1)) * 1000.0
+            if dw_mm > 0.0 and self._active_unit is not None:
+                with self._lock:
+                    u = int(self._active_unit)
+                    self._dw_by_unit[u] = dw_mm
+                    self._dw_n_by_unit[u] = self._dw_n_by_unit.get(u, 0) + 1
+                    self._dw_addr_by_unit[u] = int(addr or 0)
 
         # Drying telemetry arrives every ~10s and would be console spam, so it
         # is reported on its own slow cadence rather than per line.
@@ -892,7 +1686,33 @@ class BambuBridge:
                 f"AFC bambu {self.name}: drying -- chamber {m.group(3)}C"
                 f"{hum}, target {m.group(2)}C")
 
-    def rfid_read_in_flight(self, now: float, quiet: float = 3.0) -> bool:
+    def _rfid_stamp(self, wide: Optional[float], by_addr: Dict[int, float],
+                    addr: Optional[int]) -> Optional[float]:
+        """
+        Pick the narration stamp for ``addr``, or the bridge-wide one.
+
+        An address the bridge has never heard narrate falls back to the shared
+        stamp rather than reading as "never", so a unit whose firmware predates
+        per-device attribution is not reported silent. Once it HAS narrated its
+        own stamp wins, and another unit's chatter cannot be credited to it.
+
+        :param wide: the bridge-wide stamp
+        :param by_addr: per-device stamps
+        :param addr: device address to resolve, or None for bridge-wide
+        :return: the stamp to compare against, or None if there is none
+        """
+        if addr:
+            got = by_addr.get(int(addr))
+            if got is not None:
+                return got
+            if by_addr:
+                # This bridge attributes narration and this device has said
+                # nothing of the kind. That is an answer, not a gap.
+                return None
+        return wide
+
+    def rfid_read_in_flight(self, now: float, quiet: float = 3.0,
+                            addr: Optional[int] = None) -> bool:
         """
         Whether an AMS on this bridge is mid tag-read right now.
 
@@ -903,10 +1723,81 @@ class BambuBridge:
 
         :param now: Reactor monotonic time
         :param quiet: Seconds of narration silence that end a read
+        :param addr: device address to scope the answer to (0x1800 = an HT);
+                     None answers for the bridge as a whole
         :return bool: True if a read appears to still be running
         """
-        t = self._rfid_step_t
+        t = self._rfid_stamp(self._rfid_step_t, self._rfid_step_by_addr, addr)
         return t is not None and (now - t) < quiet
+
+    def rfid_read_succeeded_since(self, since: Optional[float],
+                                  addr: Optional[int] = None) -> bool:
+        """
+        Whether a tag read has LANDED since ``since``.
+
+        Distinct from ``rfid_read_in_flight``: that says a read is running, this
+        says one recovered a tag. The caller needs the second to decide whether a
+        slot's profile record belongs to the spool now in the bay or to the one
+        before it -- an AMS reports its stored record for a bay from the moment a
+        spool goes in, long before the reader has seen the new tag.
+
+        Scoped to ``addr`` when one is given: this decides whether a bay's
+        record is the NEW spool's, so crediting it to the wrong unit applies
+        wrong data. Two boxed units still share 0x0700 and cannot be separated
+        this way.
+
+        :param since: Reactor monotonic time to compare against (None = never)
+        :param addr: device address to scope the answer to (0x1800 = an HT);
+                     None answers for the bridge as a whole
+        :return bool: True if a successful read was narrated at or after ``since``
+        """
+        ok = self._rfid_stamp(self._rfid_ok_t, self._rfid_ok_by_addr, addr)
+        return ok is not None and since is not None and ok >= since
+
+    def last_rdinfo(self) -> dict:
+        """
+        The last raw 0x0211 reply captured by {"cmd":"rdinfo"}.
+
+        :return dict: {"unit","slot","len","hex"} or {} if none yet
+        """
+        with self._lock:
+            return dict(self._last_rdinfo)
+
+    def rfid_foreign_tag_since(self, since: Optional[float],
+                               addr: Optional[int] = None) -> bool:
+        """
+        Whether the unit refused a chip it could not authenticate since ``since``.
+
+        A Mifare tag whose keys are not Bambu's still answers anticollision, so
+        its UID is readable; only the profile is locked. That is a THIRD-PARTY
+        SPOOL, not an empty bay, and the two need different words.
+
+        :param since: Reactor monotonic time to compare against (None = never)
+        :param addr: device address to scope the answer to
+        :return bool: True if a foreign tag was refused at or after ``since``
+        """
+        t = self._rfid_stamp(self._rfid_foreign_t,
+                             self._rfid_foreign_by_addr, addr)
+        return t is not None and since is not None and t >= since
+
+    def rfid_cycle_ended_since(self, since: Optional[float],
+                               addr: Optional[int] = None) -> bool:
+        """
+        Whether a scan cycle has RUN TO COMPLETION since ``since``.
+
+        The unit narrates ``STEP7:finish,cali tray`` at the end of a scan
+        whatever the outcome, so this is the moment -- and the only moment --
+        at which "no tag read" is a fact rather than a guess against a clock.
+
+        Scoped to ``addr`` when one is given, like the stamps above.
+
+        :param since: Reactor monotonic time to compare against (None = never)
+        :param addr: device address to scope the answer to (0x1800 = an HT);
+                     None answers for the bridge as a whole
+        :return bool: True if a cycle ended at or after ``since``
+        """
+        end = self._rfid_stamp(self._rfid_end_t, self._rfid_end_by_addr, addr)
+        return end is not None and since is not None and end >= since
 
     def handle_line(self, line: str) -> None:
         """
@@ -926,11 +1817,19 @@ class BambuBridge:
             for cb in self._listeners:
                 self.reactor.register_async_callback(
                     lambda et, o=obj, c=cb: c(o))
-        elif obj.get("evt") == "reply":
-            # Raw AMS frame, requested by BAMBU_BUFFER_PROBE. Diagnostic only --
-            # held here so the probe can print it without a shell on the printer.
+        elif obj.get("evt") in ("reply", "raw"):
+            # Raw AMS frame. Diagnostic only -- held here so a probe can print
+            # it without a shell on the printer.
+            #
+            # TWO event names, and they were not both handled. AFC_BAMBU_BUFFER_PROBE
+            # gets {"evt":"reply","hex":...}; the firmware's {"cmd":"raw"}
+            # answers with {"evt":"raw","rx":...}. Listening for the first alone
+            # meant every raw transaction completed on the wire and its answer
+            # was dropped on the floor here, reporting "no reply" for a frame the
+            # AMS had in fact returned.
             with self._lock:
-                self._last_raw_reply = str(obj.get("hex") or "")
+                self._last_raw_reply = str(
+                    obj.get("hex") or obj.get("rx") or "")
         elif obj.get("evt") == "error":
             self.logger.warning(f"AFC bambu: bridge error: {obj.get('msg')}")
         elif obj.get("evt") == "ack":
@@ -959,8 +1858,78 @@ class BambuBridge:
             # and before any dedupe or noise suppression.
             self._narrate_to_file(text, obj.get("addr"))
             self._note_dry_refusal(text, obj.get("addr"))
+            self._note_dry_cfg(text, obj.get("addr"))
+            self._note_cap_measure(text, obj.get("addr"), now)
+            # Stamp bridge-wide AND per-device. The address comes off the same
+            # frame as the text (firmware capture_dbg reads it from bytes
+            # [9:10]), so attribution costs nothing and is not a guess.
+            _addr = obj.get("addr")
+            _addr = int(_addr) if isinstance(_addr, int) and _addr else None
             if text and _RFID_INFLIGHT_RE.search(text):
                 self._rfid_step_t = now
+                if _addr:
+                    self._rfid_step_by_addr[_addr] = now
+            if text and _RFID_READ_OK_RE.search(text):
+                self._rfid_ok_t = now
+                if _addr:
+                    self._rfid_ok_by_addr[_addr] = now
+            if text and _RFID_CYCLE_END_RE.search(text):
+                self._rfid_end_t = now
+                if _addr:
+                    self._rfid_end_by_addr[_addr] = now
+            # The unit refusing a chip it cannot authenticate. Stamped with the
+            # other RFID markers -- above the dedupe, so a repeat still counts.
+            if text and _RFID_FOREIGN_TAG_RE.search(text):
+                self._rfid_foreign_t = now
+                if _addr:
+                    self._rfid_foreign_by_addr[_addr] = now
+            # STRIP THE 10s HEARTBEAT BEFORE THE DEDUPE, NOT AFTER.
+            #
+            # "[DBG] ams time: now=42024044ms diff=10005ms" carries nothing and
+            # its timestamp changes every time, so it was already being dropped
+            # from the console further down -- but only AFTER the dedupe below
+            # had stored it as _last_dbg. The unit bundles it into the SAME
+            # frame as other narration ("[AMS_LINK]get_slot ... [DBG] ams time:
+            # ..."), so every 10 s it broke the run of identical lines and the
+            # next repeat printed as if it were new.
+            #
+            # That is the whole reason a sentence repeating 200 times a minute
+            # reached the console 6 times a minute instead of once: 6 = 60/10,
+            # the heartbeat period, not anything about the message.
+            #
+            # The narration FILE keeps the line verbatim -- it was written above,
+            # before this -- so nothing is lost from the record.
+            if text and "[DBG] ams time" in text:
+                stripped = _DBG_AMSTIME_RE.sub("", text).strip()
+                # NOTHING LEFT BUT THE FRAME'S JUNK BYTE -> NOTHING TO REPORT.
+                #
+                # The drain reply starts with one stray byte rendered as a
+                # character, so a heartbeat-only frame strips down to something
+                # like "," -- no bracket, no content. Publishing that put a bare
+                # comma on the operator's console every 10 seconds.
+                #
+                # This is the bug the strip itself created: the console drop
+                # further down tests for the "[DBG] ams time" substring, and
+                # stripping the segment first meant that test could no longer
+                # match. Fixed by making the decision HERE, once: keep the line
+                # only if real narration rode along with the heartbeat.
+                text = stripped if "[" in stripped else None
+            # THE DEDUPE IS A CONSOLE CONCERN. THE PARSERS GET THE RAW LINE.
+            #
+            # Everything below used to read `text`, which the dedupe blanks on
+            # an exact consecutive repeat -- so two byte-identical, back-to-back
+            # completion lines for two genuinely separate moves would bump the
+            # sequence once, and a waiter would sit through the second move and
+            # time out. That reports a load that SUCCEEDED as a failure, which
+            # is the expensive direction.
+            #
+            # The RFID stamps above were hoisted over the dedupe for exactly
+            # this reason and the motion completions were left behind. They read
+            # `raw` now, so suppressing a repeat can only ever cost a console
+            # line. Double-counting one physical event is harmless here: every
+            # consumer asks "has the sequence CHANGED since I started"
+            # (_wait_move, _pull_seq_now), never "how many".
+            raw = text
             if text and text == self._last_dbg:
                 # Same line again: count it, and re-emit once a minute so a
                 # loop that is going nowhere still shows up.
@@ -975,15 +1944,15 @@ class BambuBridge:
                 self._last_dbg = text
                 self._last_dbg_n = 1
                 self._last_dbg_t = now
-            if text:
+            if raw:
                 # Buffer position, from whichever line carries it. Recorded
                 # before the completion branches below so a line that is both
                 # (a feed finish carrying buff_pos) contributes both.
-                bp = _BUFF_POS_RE.search(text)
+                bp = _BUFF_POS_RE.search(raw)
                 if bp:
                     with self._lock:
                         self._buff_pos = float(bp.group(1))
-                rf = _BUFF_REFILL_RE.search(text)
+                rf = _BUFF_REFILL_RE.search(raw)
                 if rf:
                     det = float(rf.group(3)) if rf.group(3) else None
                     with self._lock:
@@ -992,27 +1961,29 @@ class BambuBridge:
                         self._buff_refill = (float(rf.group(1)),
                                              float(rf.group(2)), det)
                 # Motion completion.
-                low = text.lower()
-                if _MOTION_FINISH_RE.search(text):
+                low = raw.lower()
+                # INDEPENDENT OF THE FINISH CHAIN BELOW. A single narration
+                # line can carry both a pull and a finish, and the chain's
+                # if/elif ordering exists to make a finish WIN over an odom
+                # reset in the HT's combined blob -- folding this into it broke
+                # that rule and a test caught it. So it is asked separately.
+                if _PULL_DONE_RE.search(raw):
+                    with self._lock:
+                        self._pull_seq += 1
+                if _ASSIST_DONE_RE.search(raw):
+                    with self._lock:
+                        self._assist_seq += 1
+                if _MOTION_FINISH_RE.search(raw):
                     # Judged BEFORE the lock: it reads tube_len(), which takes
                     # the same non-reentrant lock, and doing this inside the
                     # with-block deadlocks the reader thread outright.
-                    ok = self._finish_succeeded(text, low, obj.get("addr"))
+                    ok = self._finish_succeeded(raw, low, obj.get("addr"))
                     with self._lock:
                         self._finish_seq += 1
                         self._finish_ok = ok
-                        self._finish_text = text
+                        self._finish_text = raw
                     self._tray_gone = False
-                elif _EXTRUDER_IN_RE.search(text):
-                    # Arrival at the extruder. Same standing as an odom reset:
-                    # it says the filament got there, which is what a load is
-                    # waiting to hear.
-                    with self._lock:
-                        self._finish_seq += 1
-                        self._finish_ok = True
-                        self._finish_text = text
-                    self._tray_gone = False
-                elif _ODOM_RESET_RE.search(text):
+                elif _ODOM_RESET_RE.search(raw):
                     # A tray was engaged and its odometer zeroed: the feed
                     # arrived. This is the only completion an [AMS_DEV]-dialect
                     # unit gives -- it never says "feed finish" -- and it also
@@ -1020,9 +1991,9 @@ class BambuBridge:
                     with self._lock:
                         self._finish_seq += 1
                         self._finish_ok = True
-                        self._finish_text = text
+                        self._finish_text = raw
                     self._tray_gone = False
-                elif _ODOM_NO_TRAY_RE.search(text) and not self._tray_gone:
+                elif _ODOM_NO_TRAY_RE.search(raw) and not self._tray_gone:
                     # The odometer has no tray, so the filament has left the
                     # unit: a retract completed.
                     #
@@ -1036,7 +2007,7 @@ class BambuBridge:
                     with self._lock:
                         self._finish_seq += 1
                         self._finish_ok = True
-                        self._finish_text = text
+                        self._finish_text = raw
                 # Motor current, when the AMS reports it. It clamps at its
                 # limiter (~1.6A observed) against a ~0.07A median, so this is a
                 # threshold signal rather than a proportional one.
@@ -1044,10 +2015,10 @@ class BambuBridge:
                 try:
                     # addr identifies WHICH AMS narrated (0x0700 AMS 2 Pro,
                     # 0x1800 HT); absent on firmware older than 1.0.7.0.
-                    self._narrate_human(text, now, obj.get("addr"))
+                    self._narrate_human(raw, now, obj.get("addr"))
                 except Exception:
                     pass          # a nicety must never break the reader thread
-                mi = _BLDC_I_RE.search(text)
+                mi = _BLDC_I_RE.search(raw)
                 if mi:
                     try:
                         with self._lock:
@@ -1064,30 +2035,80 @@ class BambuBridge:
                 # drying or sustained follower runs -- and the unit emits them
                 # as soon as its own motor stalls, ahead of the buffer
                 # finishing its drain.
+                # THREE DIALECTS, THREE WAYS OF SAYING "I GAVE UP".
+                #
+                #   AMS 2 Pro   "feed finish -1, stall", "pull err, bdc stall"
+                #   AMS HT      "TIMEOUT error N"
+                #   AMS 1       says none of those -- it drops to
+                #               state:6 / en:0,mode:7,idx:255
+                #
+                # The AMS 1 was long recorded as "genuinely silent about
+                # faults". It is not; it just answers in STATE rather than
+                # words, so a word-matching detector walked past it and a
+                # jammed AMS 1 rode out the entire load window.
+                #
+                # VERIFIED AS A DISCRIMINATOR, not merely a signal: captured on
+                # a failing lane15 load, and counted ZERO times across a lane15
+                # load that genuinely reached the toolhead (18 kicks, state:4
+                # and state:0 only).
+                #
+                # An earlier count said the opposite -- state:6 alongside
+                # "successful" loads in hist.log and full.log. Those logs
+                # predate the pin-read fix, so their successes were FALSE ones
+                # on filament that never arrived: state:6 was there because the
+                # unit HAD given up. The control was contaminated. Check that
+                # the good loads are actually good before trusting a negative.
                 if ("stall" in low or "finish -1" in low
-                        or "timeout error" in low):
+                        or "timeout error" in low
+                        or "state:6" in low or "en:0,mode:7" in low):
                     with self._lock:
                         self._fault_seq += 1
-                        self._fault_text = text.strip()
-                if "[DBG] ams time" in text:
-                    pass
-                else:
-                    # The AMS's own narration -- its feed cycle
-                    # ("[AMS_SWITCH]BUFF,pos:0.09->0.74,det:12mm"), motor
-                    # transitions and scan steps. All of it goes to AFC.log via
-                    # the AFC logger, never the console.
-                    #
-                    # This is the only place the AMS reports whether it is
-                    # actually feeding, so it is written unconditionally
-                    # rather than through python logging.debug, which klipper
-                    # runs at INFO and would discard outright.
-                    #
-                    # Pure bus chatter is additionally kept OFF the console
-                    # (only_debug=True) -- see _AMS_NOISE_RE. Narration that
-                    # says something stays on the console, where an operator
-                    # with AFC's debug flag on watches a load happen.
+                        self._fault_text = raw.strip()
+                # ...but DO track err_code's CURRENT VALUE, which is a
+                # different question from "did a fault just happen". The note
+                # above is about triggering: err_code cycles during healthy
+                # operation, so an edge is not a fault. The LEVEL still answers
+                # "is this unit in error right now", which is what a resume
+                # guard needs -- and the unit states it plainly on both types:
+                #   [AMS_LINK]err_code: 0 -> 23      HT declaring a stall
+                #   [AMS_LINK]err_code: 18 -> 0      HT accepting the clear
+                #   [AMS_LINK]err_code:0x00->0x80    AMS 2, hex form
+                me = _ERR_CODE_RE.search(raw)
+                if me:
+                    try:
+                        raw = me.group(2)
+                        # 0x-prefixed is hex, bare is decimal -- "18" and
+                        # "0x18" are different numbers and both occur.
+                        val = int(raw, 16) if raw.lower().startswith("0x") \
+                            else int(raw, 10)
+                        with self._lock:
+                            self._err_code = val
+                            self._err_code_t = now
+                    except ValueError:
+                        pass
+                # THE ONE THING THAT STILL USES THE DEDUPED TEXT, on purpose.
+                #
+                # Everything above reads `raw` so a suppressed repeat cannot
+                # cost a parse. This is the operator's console, where a repeat
+                # IS noise -- so it reads `text`, which the dedupe blanks, and
+                # a run of identical lines re-emits once a minute with a count.
+                #
+                # The AMS's own narration -- its feed cycle
+                # ("[AMS_SWITCH]BUFF,pos:0.09->0.74,det:12mm"), motor
+                # transitions and scan steps. All of it goes to AFC.log via
+                # the AFC logger, never bare python logging.debug, which
+                # klipper runs at INFO and would discard outright.
+                #
+                # Pure bus chatter is additionally kept OFF the console
+                # (only_debug=True) -- see _AMS_NOISE_RE. Narration that says
+                # something stays on the console, where an operator with AFC's
+                # debug flag on watches a load happen.
+                if text:
                     self.logger.debug(f"AMS: {text}",
                                       only_debug=_ams_is_noise(text))
+        elif obj.get("evt") == "rdinfo":
+            with self._lock:
+                self._last_rdinfo = dict(obj)
         elif obj.get("evt") == "mcaddr":
             # Receipt for the announce. The firmware does not echo what we
             # asked for -- it echoes what bb_get_mc_addr() reads back AFTER
@@ -1108,6 +2129,34 @@ class BambuBridge:
             # here on every prep and have no business on an operator's console.
             self.logger.debug(f"AFC bambu: unhandled bridge event {obj}",
                               only_debug=True)
+        elif obj.get("evt") == "loops":
+            # Main-loop iterations + a timestamp. Everything the master can do
+            # is bounded by this rate: the 21ms drive channel needs 48 passes a
+            # second. Straight to the narration file, like tx.
+            try:
+                self._narrate_to_file(
+                    f'{{"evt":"loops","n":{int(obj.get("n", 0))},'
+                    f'"us":{int(obj.get("us", 0))}}}', None)
+            except Exception:
+                pass
+        elif obj.get("evt") == "tx":
+            # The frames WE transmit. Same shape as "sniff" on purpose, so the
+            # capture tools read a TX log without changes -- which is the whole
+            # point: a load can be DIFFED against a printer capture instead of
+            # reasoned about. Straight to the narration file; this is a
+            # diagnostic stream, not console output.
+            try:
+                # dir distinguishes what WE sent from what the AMS sent back.
+                # Without it a transcript is half a conversation, and "the unit
+                # never says X" cannot be told from "we never recorded X".
+                _dir = str(obj.get("dir", "tx"))
+                self._narrate_to_file(
+                    f'{{"evt":"tx","dir":"{_dir}",'
+                    f'"us":{int(obj.get("us", 0))},'
+                    f'"n":{int(obj.get("n", 0))},'
+                    f'"hex":"{obj.get("hex", "")}"}}', None)
+            except Exception:
+                pass
         elif obj.get("evt") == "sniff":
             # Passive bus-sniffer frame (real printer <-> AMS). Log every raw frame
             # verbatim so a capture can be pulled from AFC.log -- no dedup, each
@@ -1115,6 +2164,29 @@ class BambuBridge:
             # File-only: a sniff runs at hundreds of frames a second and would
             # make the console unusable.
             self.logger.debug(f"SNIFF {obj.get('hex')}", only_debug=True)
+        elif obj.get("evt") == "m3":
+            # Short-motion poll diagnostics, on request ({"cmd":"m3"}). Held
+            # whole for AFC_BAMBU_M3DIAG to print; the fields are the firmware's
+            # own counters and mean nothing individually out of order.
+            with self._lock:
+                self._last_m3 = dict(obj)
+        elif obj.get("evt") == "clsprobe":
+            # Active class probe result: did the unit at this bus id answer on
+            # device 0x1800 (HT) or not (boxed). Held whole for AFC_BAMBU_CLSPROBE.
+            with self._lock:
+                self._last_clsprobe = dict(obj)
+        elif obj.get("evt") in ("rc", "rollcall"):
+            # NB: this branch sits AFTER the not-in-_BRIDGE_EVENTS_KNOWN
+            # catch-all above, so an event only reaches here if it is IN that
+            # set. Adding a handler without adding the name silently routes the
+            # event to the debug log instead -- which is exactly what happened
+            # on the first try: firmware 1.0.59.0 was answering and the console
+            # still said "no rc reply (firmware older than 1.0.59.0?)".
+            # Roll-call state. "rollcall" is the toggle's echo, "rc" the
+            # diagnostics; both land here so AFC_BAMBU_RC can print whichever came
+            # last. Held whole -- these are the firmware's own counters.
+            with self._lock:
+                self._last_rc = dict(obj)
         elif obj.get("evt") == "chain":
             # Enrollment map: uids is a comma-separated list of 12-byte (24-hex)
             # UIDs, POSITION = the unit's polling address (ams_index). Keep empty
@@ -1132,6 +2204,16 @@ class BambuBridge:
                 except Exception:
                     self._chain_htmask = 0
                 self._chain_fw = str(obj.get("fw") or "")
+                # Announce-reply tag byte per discovered unit, in chain order.
+                # Candidate signal for bus-based class detection -- observe
+                # only, nothing acts on it. See the CLASS DETECTION notes.
+                self._chain_tags = str(obj.get("tags") or "")
+                try:
+                    self._chain_capn = int(obj.get("capn") or 0)
+                    self._chain_capdiag = int(obj.get("capdiag") or 0)
+                except Exception:
+                    self._chain_capn = 0
+                    self._chain_capdiag = 0
                 # Per-unit MC addressing as the FIRMWARE holds it. Absent on
                 # firmware older than 1.0.10.9, which is why None (unknown) is
                 # kept distinct from [] (known-empty).
@@ -1171,11 +2253,10 @@ class BambuBridge:
         Per-unit MC device addresses as the firmware holds them.
 
         None means the firmware did not report them (pre-1.0.10.9), which is
-        deliberately distinct from an empty/zero list meaning "reported, and
-        nothing is set". That distinction is the whole point: an unset address
-        drops the narration log drain back to the captured 0x0700 pair, which
-        never asks an AMS HT at 0x1800 -- a failure that was invisible from
-        Klipper until this was surfaced.
+        distinct from an empty/zero list meaning "reported, and nothing is
+        set". The distinction matters: an unset address drops the narration
+        log drain back to the captured 0x0700 pair, which never asks an AMS HT
+        at 0x1800.
 
         :return Optional[List[int]]: addresses by unit index, or None
         """

@@ -13,7 +13,7 @@
 #   min_temp: 0
 #   max_temp: 70
 #
-# On an ACE Pro 2 you can add extra sensors for the individual thermal
+# On an ACE 2 Pro you can add extra sensors for the individual thermal
 # channels the unit reports (box1/box2 chamber, ptc1/ptc2 dryer heater, env),
 # cached each heartbeat via GET_TEMP. Handy for watching the dryer heaters
 # during a drying cycle:

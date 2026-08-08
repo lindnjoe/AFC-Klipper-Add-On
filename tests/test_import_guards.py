@@ -55,11 +55,12 @@ def _import_fresh(module_name, blocked):
 CASES = [
     ("extras.AFC_BambuAMS",   "extras.AFC_BambuAMS_bridge", "AFC_BambuAMS_bridge"),
     ("extras.AFC_U1_rfid",    "extras.AFC_RFID",            "AFC_RFID"),
-    ("extras.AFC_Vivid_rfid", "extras.AFC_ACE2_rfid",       "AFC_ACE2_rfid"),
+    ("extras.AFC_Vivid_rfid", "extras.AFC_rfid_readers",    "AFC_rfid_readers"),
     ("extras.AFC_Vivid_rfid", "extras.AFC_lane",            "AFC_lane"),
     ("extras.AFC_ACE2",       "extras.AFC_ACE",             "AFC_ACE"),
     ("extras.AFC_ACE2_rfid",  "extras.AFC_RFID",            "AFC_RFID"),
-    ("extras.AFC_OpenAMS_rfid", "extras.AFC_ACE2_rfid",     "AFC_ACE2_rfid"),
+    ("extras.AFC_ACE2_rfid",  "extras.AFC_rfid_readers",    "AFC_rfid_readers"),
+    ("extras.AFC_OpenAMS_rfid", "extras.AFC_rfid_readers",  "AFC_rfid_readers"),
     # AFC_utils holds ERROR_STR itself, so each module's FIRST guard has to
     # format its own message -- checked per module because they are separate
     # copies of that special case.
