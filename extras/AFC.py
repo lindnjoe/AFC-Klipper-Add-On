@@ -45,7 +45,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.2.1"
+AFC_VERSION="1.2.4"
 
 # Class for holding different states so its clear what all valid states are
 class State(str, Enum):
@@ -812,6 +812,26 @@ class afc:
         except Exception:
             self.logger.debug("Unable to restore extruder temperature", exc_info=True)
 
+    def _set_display_status(self, variable: str, value: bool) -> None:
+        """
+        Best-effort notification of a display status change during tool-change
+        actions (e.g. pushing new filament into the toolhead, retracting it back
+        out). Calls the user-defined _AFC_DISPLAY_STATUS macro (if any) with the
+        changed variable/value as params, letting any display integration (KNOMI
+        or otherwise) decide what to do with it. No-ops silently if the user
+        hasn't defined that macro, since this is purely cosmetic and must never
+        affect the actual load/unload sequence.
+
+        :param variable: Name of the status variable that changed
+        :param value: True/False the variable changed to
+        """
+        if 'gcode_macro _AFC_DISPLAY_STATUS' in self.printer.objects:
+            try:
+                self.gcode.run_script_from_command(
+                    f"_AFC_DISPLAY_STATUS VARIABLE={variable} VALUE={value}")
+            except Exception:
+                self.logger.debug("_AFC_DISPLAY_STATUS macro raised an error", exc_info=True)
+
     def _set_quiet_mode(self, val):
         """
         Helper function to set quiet mode to on or off
@@ -884,7 +904,11 @@ class afc:
             if self.get_bypass_state():
                 if unload:
                     self.logger.info("Bypass detected, calling manual unload filament routine")
-                    self.gcode.run_script_from_command(self.RENAMED_UNLOAD_FILAMENT)
+                    self._set_display_status('retraction', True)
+                    try:
+                        self.gcode.run_script_from_command(self.RENAMED_UNLOAD_FILAMENT)
+                    finally:
+                        self._set_display_status('retraction', False)
                     self.logger.info("Filament unloaded")
                 else:
                     msg = "Filament loaded in bypass, not doing tool load"
@@ -1448,7 +1472,10 @@ class afc:
 
         purge_length = gcmd.get('PURGE_LENGTH', None)
 
-        self.TOOL_LOAD(cur_lane, purge_length)
+        if not self.TOOL_LOAD(cur_lane, purge_length):
+            # Error happened, reset toolchanges without error count
+            # and increase load error count
+            self.afc_stats.increase_load_error_count(self)
 
     def TOOL_LOAD(self, cur_lane: AFCLane, purge_length: Optional[float]=None, set_start_time=False):
         """
@@ -1506,6 +1533,7 @@ class afc:
                 msg = ('Failed to unload currently loaded lane {} from extruder {} before loading new lane {}.'.format(
                     lane_name, cur_extruder_obj.name, cur_lane.name))
                 self.error.fix(msg, self.lanes[lane_name])
+                self.afc_stats.increase_unload_error_count(self)
                 return False
 
         if cur_lane.name != self.current:
@@ -1530,7 +1558,11 @@ class afc:
                 temp_state = self.capture_toolhead_temp()
                 try:
                     # Run the load sequence, which may include custom gcode commands.
-                    success = self.load_sequence(cur_lane, cur_hub, cur_extruder)
+                    self._set_display_status('pushing', True)
+                    try:
+                        success = self.load_sequence(cur_lane, cur_hub, cur_extruder)
+                    finally:
+                        self._set_display_status('pushing', False)
                     if not success:
                         return success
 
@@ -1848,7 +1880,10 @@ class afc:
             self.logger.info('{} Unknown'.format(lane))
             return
         cur_lane = self.lanes[lane]
-        self.TOOL_UNLOAD(cur_lane)
+        if not self.TOOL_UNLOAD(cur_lane):
+            # Error happened, reset toolchanges without error count
+            # and increase unload error count
+            self.afc_stats.increase_unload_error_count(self)
 
         # User manually unloaded spool from toolhead, remove spool from active status
         self.spool.set_active_spool(None)
@@ -1956,7 +1991,11 @@ class afc:
             temp_state = self.capture_toolhead_temp()
             try:
                 # Run the unload sequence, which may include custom gcode commands.
-                success = self.unload_sequence(cur_lane, cur_hub, cur_extruder)
+                self._set_display_status('retraction', True)
+                try:
+                    success = self.unload_sequence(cur_lane, cur_hub, cur_extruder)
+                finally:
+                    self._set_display_status('retraction', False)
                 if not success:
                     return success
             finally:
@@ -2437,6 +2476,9 @@ class afc:
                             # Abort if the unloading process fails.
                             msg = (' UNLOAD ERROR NOT CLEARED')
                             self.error.fix(msg, unload_lane)  #send to error handling
+                            # Error happened, reset toolchanges without error count
+                            # and increase unload error count
+                            self.afc_stats.increase_unload_error_count(self)
                             return
 
                         if (force_unload
@@ -2487,8 +2529,8 @@ class afc:
                     cur_lane.extruder_obj.estats.increase_toolcount_change()
                 else:
                     # Error happened, reset toolchanges without error count
-                    if not self.testing:
-                        self.afc_stats.reset_toolchange_wo_error()
+                    # and increase load error count
+                    self.afc_stats.increase_load_error_count(self)
             else:
                 # Calling handle activate extruder just to make sure lanes are synced as tool
                 # could have been changed with KTC SELECT_TOOL and lane might not be synced

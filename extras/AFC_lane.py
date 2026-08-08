@@ -145,9 +145,9 @@ class AFCLane:
         self.drive_stepper: AFCExtruderStepper = None
         unit: str               = config.get('unit')                                    # Unit name(AFC_BoxTurtle/NightOwl/etc) that belongs to this stepper.
         # Overrides buffers set at the unit level
-        self.hub: str           = config.get('hub',None)                                # Hub name(AFC_hub) that belongs to this stepper, overrides hub that is set in unit(AFC_BoxTurtle/NightOwl/etc) section.
+        self.hub: Optional[str] = config.get('hub',None)                                # Hub name(AFC_hub) that belongs to this stepper, overrides hub that is set in unit(AFC_BoxTurtle/NightOwl/etc) section.
         # Overrides buffers set at the unit and extruder level
-        self.buffer_name: str   = config.get("buffer", None)                            # Buffer name(AFC_buffer) that belongs to this stepper, overrides buffer that is set in extruder(AFC_extruder) or unit(AFC_BoxTurtle/NightOwl/etc) sections.
+        self.buffer_name: Optional[str] = config.get("buffer", None)                            # Buffer name(AFC_buffer) that belongs to this stepper, overrides buffer that is set in extruder(AFC_extruder) or unit(AFC_BoxTurtle/NightOwl/etc) sections.
         self.unit               = unit.split(':')[0]
         try:
             self.index              = int(unit.split(':')[1])
@@ -280,9 +280,8 @@ class AFCLane:
                                      self.load, AFCHomingPoints.LOAD)
 
         self._selector_state: Optional[bool] = None
-        self.selector_cal_dis: Optional[float] = None
+        self.selector_cal_dis: float = config.getfloat("selector_cal_distance", 0.0)
         if self.selector is not None:
-            self.selector_cal_dis = config.getfloat("selector_cal_distance", 0.0)
             show_sensor = True
             if not self.enable_sensors_in_gui or (self.sensor_to_show is not None and 'selector' not in self.sensor_to_show):
                 show_sensor = False
@@ -295,11 +294,14 @@ class AFCLane:
         if (self.hub
             and "direct" not in self.hub):
             self._get_hub_object()
-            self._set_homing_endstop(query_endstops, ppins,
-                                     self.hub_obj.switch_pin, AFCHomingPoints.HUB)
+            if (self.hub_obj
+                and self.hub_obj.switch_pin):
+                self._set_homing_endstop(query_endstops, ppins,
+                                        self.hub_obj.switch_pin, AFCHomingPoints.HUB)
         if self.buffer_name:
             self._get_buffer_object()
-            if self.buffer_obj.advance_pin is not None:
+            if (self.buffer_obj
+                and self.buffer_obj.advance_pin is not None):
                 self._set_homing_endstop(query_endstops, ppins,
                                          self.buffer_obj.advance_pin, AFCHomingPoints.BUFFER)
 
@@ -307,13 +309,14 @@ class AFCLane:
             and not self.standalone_lane): # Protects against standalone lanes
             self._get_extruder_object()
             pin = self.extruder_obj.tool_start
-            if pin and "buffer" not in pin:
+            if (pin
+                and "buffer" not in pin):
                 self._set_homing_endstop(query_endstops, ppins,
                                          pin, AFCHomingPoints.TOOL)
 
         self.connect_done = False
         self.prep_active = False
-        self.last_prep_time = 0
+        self.last_prep_time: float = 0.
 
         self.show_macros = self.afc.show_macros
         self.function = self.printer.load_object(config, 'AFC_functions')
@@ -1058,9 +1061,11 @@ class AFCLane:
             self.afc.error.pause_resume.send_pause_command()
             self.afc.save_pos()
             # self.gcode.run_script_from_command('PAUSE')
-            self.afc.TOOL_UNLOAD(self)
-            if not self.afc.error_state:
+            unloaded = self.afc.TOOL_UNLOAD(self)
+            if unloaded and not self.afc.error_state:
                 self.afc.LANE_UNLOAD(self)
+            else:
+                self.afc.afc_stats.increase_unload_error_count(self.afc)
         # Pause print
         self.status = AFCLaneState.NONE
         if self.auto_switch_triggered:
@@ -1162,7 +1167,8 @@ class AFCLane:
                     if self.afc.function.is_printing(check_movement=True):
                         self.afc.error.AFC_error("Cannot load spool to toolhead while printer is actively moving or homing", False)
                     else:
-                        self.afc.TOOL_LOAD(self)
+                        if not self.afc.TOOL_LOAD(self):
+                            self.afc.afc_stats.increase_load_error_count(self.afc)
 
                 self._post_prep_user_macro()
             else:
@@ -1192,8 +1198,23 @@ class AFCLane:
 
         self.afc.save_vars()
 
-    def prep_callback(self, eventtime, state):
-        self.prep_state = state
+    def prep_callback(self, eventtime: float, state: int) -> None:
+        """
+        Callback for the lane's prep (filament presence) sensor/button.
+        Decides whether to kick off a load sequence, guarded against
+        re-entrancy (prep_active) and rapid retriggering (delta_time
+        debounce).
+
+        Loads only when the prep sensor is triggered and the load sensor is
+        not (filament present but not yet at the extruder); if both are
+        triggered at once, the lane is stuck and an error is reported
+        instead. Lanes on a direct_load hub skip prep_post_load and go
+        straight to a toolhead load.
+
+        :param eventtime: reactor time the sensor state changed
+        :param state: 1 if the prep sensor is now triggered (filament present), 0 otherwise
+        """
+        self.prep_state = bool(state)
 
         delta_time = eventtime - self.last_prep_time
         self.last_prep_time = eventtime
@@ -1202,13 +1223,13 @@ class AFCLane:
         if self.prep_active:
             return
 
-        if (self.printer.state_message == 'Printer is ready' and
-            True == self._afc_prep_done and
-            "direct_load" in self.hub and
-            not self.afc.auto_home and
-            not self.afc.function.is_homed()):
+        if (self.printer.state_message == 'Printer is ready'
+            and True == self._afc_prep_done
+            and self.hub == "direct_load"
+            and not self.afc.auto_home
+            and not self.afc.function.is_homed()):
             self.afc.error.AFC_error("Please home printer before directly loading to toolhead", False)
-            return False
+            return
 
         self.prep_active = True
 
@@ -1217,9 +1238,12 @@ class AFCLane:
             # Hacky way for do{}while(0) loop, DO NOT return from this for loop, use break instead so that self.prep_state variable gets sets correctly
             #  before exiting function
             with self.mutex:
-                if self.printer.state_message == 'Printer is ready' and self._afc_prep_done and self.status != AFCLaneState.TOOL_UNLOADING:
+                if (self.printer.state_message == 'Printer is ready'
+                    and self._afc_prep_done
+                    and self.status != AFCLaneState.TOOL_UNLOADING):
                     # Only try to load when load state trigger is false
-                    if self.prep_state and not self.raw_load_state:
+                    if (self.prep_state
+                        and not self.raw_load_state):
                         self.logger.debug(f"Prep: callback triggered {self.name}")
                         # Checking to make sure last time prep switch was activated was less than 1 second, returning to keep is printing message from spamming
                         # the console since it takes klipper some time to transition to idle when idle_resume=printing
@@ -1240,9 +1264,11 @@ class AFCLane:
 
                         # Verify that load state is still true as this would still trigger if prep sensor was triggered and then filament was removed
                         #   This is only really a issue when using direct_load and still using load sensor
-                        if self.hub == 'direct_load' and self.prep_state:
+                        if (self.hub == 'direct_load'
+                            and self.prep_state):
                             self.logger.debug(f"Prep: direct load logic-{self.name}-{self.hub}")
-                            self.afc.TOOL_LOAD(self)
+                            if not self.afc.TOOL_LOAD(self):
+                                self.afc.afc_stats.increase_load_error_count(self.afc)
                             self.afc.spool._set_values(self)
                             self.logger.debug(f"Prep: direct load logic done-{self.name}-{self.hub}")
                             break
@@ -1260,7 +1286,7 @@ class AFCLane:
                             if self.td1_device_id:
                                 self._prep_capture_td1()
 
-                    elif (self.prep_state == True
+                    elif(self.prep_state == True
                         and self.raw_load_state == True
                         and not self.afc.function.is_printing()):
                         message = 'Cannot load {} load sensor is triggered.'.format(self.name)
@@ -1735,7 +1761,9 @@ class AFCLane:
         """
         Sends lane data to moonrakers `machine/set_lane_data` endpoint
         """
-        if self.map is not None and "T" in self.map:
+        if (self.afc.moonraker
+            and self.map is not None
+            and "T" in self.map):
             scan_time = self.td1_data['scan_time'] if 'scan_time' in self.td1_data else ""
             td        = self.td1_data['td']        if 'td'        in self.td1_data else ""
 
@@ -1761,7 +1789,9 @@ class AFCLane:
         """
         Clears lane data that is currently stored at moonrakers `machine/set_lane_data` endpoint
         """
-        if self.map is not None and "T" in self.map:
+        if (self.afc.moonraker
+            and self.map is not None
+            and "T" in self.map):
             lane_data = {
                 "namespace": "lane_data",
                 "key": self.name,

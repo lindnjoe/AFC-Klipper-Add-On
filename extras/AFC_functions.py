@@ -1186,7 +1186,8 @@ class afcFunction:
 
                     self._safe_extrude(self.afc.test_extrude_amt)
                     self.logger.info("Unloading lane {}".format(lane))
-                    self.afc.TOOL_UNLOAD(lane_obj)
+                    if not self.afc.TOOL_UNLOAD(lane_obj):
+                        self.afc.afc_stats.increase_unload_error_count(self.afc)
 
                     if not self.afc.error_state:
                         self.afc.logger.info(
@@ -1218,7 +1219,8 @@ class afcFunction:
                         self.afc.logger.info(
                             "Finished testing with {} iterations for all loaded lanes".format(iterations)
                         )
-                        self.afc.TOOL_UNLOAD(lane_obj)
+                        if not self.afc.TOOL_UNLOAD(lane_obj):
+                            self.afc.afc_stats.increase_unload_error_count(self.afc)
         prompt.p_end()
 
     cmd_AFC_CALIBRATION_help = 'Open prompt to begin calibration by selecting Unit to calibrate'
@@ -1660,6 +1662,7 @@ class afcFunction:
         if (tool_load := self.get_current_lane_obj()) is not None:
             prompt.p_end()
             self.afc.error.AFC_error("Toolhead is loaded with '{}', unload or check sensor before resetting lane".format(tool_load.name), pause=False)
+            return
 
         prompt.p_end()
 
