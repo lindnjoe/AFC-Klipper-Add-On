@@ -1,21 +1,22 @@
 """
-Broad branch-coverage tests for extras/AFC_ACE.py (afcACE V1 unit) covering the
-large previously-uncovered method blocks: module logo/CRC helpers, RFID slot
-cache (_store_slot_rfid), the diagnostic gcode commands (DRY/FAN/FEED_INFO/
-RFID_DUMP/CMD/LANE_RESET/CALIBRATE), stuck-spool detection, feed/unwind waiters,
-feed-assist start/stop retry paths, load/unload transports and the calibration
-routines.
+Tests for the ACE V1 unit, extras/AFC_ACE.py.
 
-Style: typed fakes (tests/ace_helpers.py), __new__ construction like the sibling
-ACE tests, one test class per method under test, exact log-list assertions.
+Everything this suite knows about an afcACE lives here: the module's logo/CRC
+helpers, RFID slot handling and the shared-reader ambiguity guard, feed assist,
+slot-state sync, the stage-probe feed, the startup inventory sweep, the
+diagnostic gcode handlers, current-action surfacing, sensor and temperature
+helpers, the overlapping unload retract, and eject's reload suppression.
+
+Consolidated from twelve files. Where two of them defined a module-level helper
+under the same name, the helper carries its old file's tag -- _make_unit_assist,
+_make_unit_slot_sync and so on -- because those were different implementations
+that happened to share a name, and merging them would have silently shadowed
+one with the other. Section banners below name the file each block came from.
 """
 
 from __future__ import annotations
-
 import types
-
 import pytest
-
 import extras.AFC_ACE as ace_mod
 from extras.AFC_ACE import (
     MODE_COMBINED,
@@ -27,7 +28,6 @@ from extras.AFC_ACE import (
     crc16_ccitt_reflected,
 )
 from extras.AFC_lane import AFCLaneState
-
 from tests.ace_helpers import (
     FakeAFC,
     FakeAce,
@@ -39,8 +39,65 @@ from tests.ace_helpers import (
     FakeToolheadPrinter,
     Recorder,
 )
+import sys  # noqa: E402
+from extras.AFC_ACE import (  # noqa: E402
+    ACEConnection,
+    ACESerialError,
+    HEARTBEAT_INTERVAL,
+    crc16_ccitt_reflected as _crc,
+    load_config_prefix,
+)
+from extras.AFC_ACE import afcACE
+from tests.ace_helpers import (
+    FakeAce,
+    FakeAFC,
+    FakeExtruderObj,
+    FakeGcmd,
+    FakeLane,
+    FakeLogger,
+    FakeToolheadPrinter,
+    Recorder,
+)
+import types as _types
+from extras.AFC_ACE import MODE_DIRECT
+from tests.ace_helpers import (
+    FakeAFC,
+    FakeExtruderObj,
+    FakeHub,
+    FakeLane,
+    FakeLogger,
+    Recorder,
+)
+from tests.ace_helpers import FakeAce, FakeLane, FakeLogger, Recorder
+from tests.ace_helpers import (
+    FakeAce2,
+    FakeGcmd,
+    Recorder,
+)
+from tests.ace_helpers import FakeLogger, FakeGcmd, FakeAce, Recorder
+from extras.AFC_ACE2 import _decode_status, pb_uint32  # noqa: E402
+from extras.AFC_ACE2 import afcACE2
+from tests.ace_helpers import (
+    FakeAce,
+    FakeHub,
+    FakeLane,
+    FakeLogger,
+    Recorder,
+)
+from extras.AFC_ACE import afcACE, ACEConnection
+from extras.AFC_ACE2 import ACE2Connection
+from tests.ace_helpers import FakeLogger, Recorder
+from tests.ace_helpers import FakeLogger
+from tests.ace_helpers import (
+    FakeAce, FakeError, FakeFunction, FakeLane, FakeHub, FakeLogger, Recorder,
+)
+import contextlib
+from tests.ace_helpers import FakeAce, FakeHub, FakeLane, FakeLogger, Recorder
 
 
+# ── Broad branch-coverage tests for extras/AFC_ACE.py (afcACE V1 unit) covering the ───
+#
+# was tests/test_AFC_ACE_coverage.py
 # ── Shared fakes / builders ───────────────────────────────────────────────────
 
 class Gcmd(FakeGcmd):
@@ -1635,15 +1692,7 @@ class TestDeferredAceConnect:
 # ACEConnection serial transport
 # ══════════════════════════════════════════════════════════════════════════════
 
-import sys  # noqa: E402
 
-from extras.AFC_ACE import (  # noqa: E402
-    ACEConnection,
-    ACESerialError,
-    HEARTBEAT_INTERVAL,
-    crc16_ccitt_reflected as _crc,
-    load_config_prefix,
-)
 
 
 class FakeCompletion:
@@ -2706,3 +2755,2266 @@ class TestQuickReconnectCallbackFailure:
         assert conn._connected is False
         assert any("quick reconnect failed" in m
                    for m in conn._logger.lines["warning"])
+
+
+# ── Unit tests for afcACE feed-assist management in extras/AFC_ACE.py ─────────
+#
+# was tests/test_AFC_ACE_assist.py
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _lane_assist(name, ext_section="extruder", ext_physical=None, tool_loaded=True,
+          lane_loaded=None):
+    ext = FakeExtruderObj(name=ext_section, th_extruder_name=ext_physical,
+                          lane_loaded=lane_loaded)
+    return FakeLane(name, extruder_obj=ext, tool_loaded=tool_loaded)
+
+
+def _make_unit_assist(lanes=(), slot_map=None, active_extruder="extruder"):
+    unit = afcACE.__new__(afcACE)
+    unit.name = "ACE_1"
+    unit.logger = FakeLogger()
+    unit.afc = FakeAFC()
+    unit.lanes = {}
+    for lane in lanes:
+        unit.lanes[lane.name] = lane
+        unit.afc.lanes[lane.name] = lane
+    unit._slot_map = dict(slot_map or {})
+    unit._feed_assist_active = set()
+    unit._assist_suppressed = set()
+    unit._assist_watchdog = True
+    unit._ace = None
+    unit.printer = FakeToolheadPrinter(active_extruder=active_extruder)
+    return unit
+
+
+# ── _active_assist_lane ───────────────────────────────────────────────────────
+
+def test_active_assist_lane_matches_section_name():
+    lane = _lane_assist("lane0", ext_section="extruder", lane_loaded="lane0")
+    unit = _make_unit_assist([lane], active_extruder="extruder")
+    assert unit._active_assist_lane() == "lane0"
+
+
+def test_active_assist_lane_matches_physical_name():
+    """[AFC_extruder e0] with extruder_name: extruder — toolhead reports the
+    PHYSICAL name; the lane must still resolve (SET_LANE_LOADED fix)."""
+    lane = _lane_assist("lane0", ext_section="e0", ext_physical="extruder",
+                 lane_loaded="lane0")
+    unit = _make_unit_assist([lane], active_extruder="extruder")
+    assert unit._active_assist_lane() == "lane0"
+
+
+def test_active_assist_lane_toolhead_lookup_failure_returns_none():
+    lane = _lane_assist("lane0", lane_loaded="lane0")
+    unit = _make_unit_assist([lane], active_extruder=None)  # lookup raises
+    assert unit._active_assist_lane() is None
+
+
+def test_active_assist_lane_skips_lane_without_extruder():
+    lane = _lane_assist("lane0", lane_loaded="lane0")
+    lane.extruder_obj = None
+    unit = _make_unit_assist([lane], active_extruder="extruder")
+    assert unit._active_assist_lane() is None
+
+
+def test_active_assist_lane_skips_unloaded_lanes():
+    lane = _lane_assist("lane0", tool_loaded=False)
+    unit = _make_unit_assist([lane], active_extruder="extruder")
+    assert unit._active_assist_lane() is None
+
+
+def test_active_assist_lane_ignores_other_extruders():
+    lane = _lane_assist("lane0", ext_section="e0", ext_physical="extruder",
+                 lane_loaded="lane0")
+    unit = _make_unit_assist([lane], active_extruder="extruder4")
+    assert unit._active_assist_lane() is None
+
+
+def test_active_assist_lane_fallback_when_lane_loaded_lags():
+    """extruder.lane_loaded lags tool_loaded at print start — the unique
+    loaded lane is still the assist target via the fallback candidate."""
+    lane = _lane_assist("lane0", lane_loaded=None)
+    unit = _make_unit_assist([lane], active_extruder="extruder")
+    assert unit._active_assist_lane() == "lane0"
+
+
+def test_active_assist_lane_exact_match_beats_candidate():
+    """A lane the extruder RECORDS as loaded wins over an earlier
+    tool_loaded-only candidate."""
+    ext = FakeExtruderObj(name="extruder", lane_loaded="lane1")
+    lane0 = FakeLane("lane0", extruder_obj=ext, tool_loaded=True)
+    lane1 = FakeLane("lane1", extruder_obj=ext, tool_loaded=True)
+    unit = _make_unit_assist([lane0, lane1], active_extruder="extruder")
+    assert unit._active_assist_lane() == "lane1"
+
+
+# ── _maybe_assist_watchdog ────────────────────────────────────────────────────
+
+def _watchdog_unit(**kw):
+    lane = _lane_assist("lane0", lane_loaded="lane0")
+    unit = _make_unit_assist([lane], slot_map={"lane0": 0},
+                      active_extruder="extruder", **kw)
+    unit._use_feed_assist = Recorder(result=True)
+    return unit
+
+
+def test_watchdog_schedules_reconcile_when_assist_missing():
+    unit = _watchdog_unit()
+    unit._maybe_assist_watchdog()
+    assert unit.afc.reactor.register_callback.call_count == 1
+    assert "enabling feed assist" in unit.logger.lines["info"][0]
+
+
+def test_watchdog_fires_when_wrong_slot_assisting():
+    unit = _watchdog_unit()
+    unit._feed_assist_active = {3}
+    unit._maybe_assist_watchdog()
+    assert unit.afc.reactor.register_callback.call_count == 1
+
+
+def test_watchdog_noop_when_assist_already_correct():
+    unit = _watchdog_unit()
+    unit._feed_assist_active = {0}
+    unit._maybe_assist_watchdog()
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_watchdog_respects_manual_suppression():
+    unit = _watchdog_unit()
+    unit._assist_suppressed = {0}
+    unit._maybe_assist_watchdog()
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_watchdog_disabled_by_config():
+    unit = _watchdog_unit()
+    unit._assist_watchdog = False
+    unit._maybe_assist_watchdog()
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_watchdog_noop_without_active_lane():
+    unit = _make_unit_assist(active_extruder="extruder")  # no lanes at all
+    unit._maybe_assist_watchdog()
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_watchdog_noop_when_assist_disabled_for_lane():
+    unit = _watchdog_unit()
+    unit._use_feed_assist = Recorder(result=False)
+    unit._maybe_assist_watchdog()
+    assert not unit.afc.reactor.register_callback.called
+
+
+# ── cmd_ACE_FEED_ASSIST ───────────────────────────────────────────────────────
+
+def test_feed_assist_cmd_requires_enable():
+    unit = _make_unit_assist()
+    with pytest.raises(RuntimeError, match="ENABLE is required"):
+        unit.cmd_ACE_FEED_ASSIST(FakeGcmd(LANE="lane0"))
+
+
+def test_feed_assist_cmd_requires_lane_or_slot():
+    unit = _make_unit_assist()
+    with pytest.raises(RuntimeError, match="LANE or SLOT"):
+        unit.cmd_ACE_FEED_ASSIST(FakeGcmd(ENABLE=0))
+
+
+def test_feed_assist_cmd_unknown_lane():
+    unit = _make_unit_assist()
+    with pytest.raises(RuntimeError, match="Unknown lane"):
+        unit.cmd_ACE_FEED_ASSIST(FakeGcmd(ENABLE=0, LANE="nope"))
+
+
+def test_feed_assist_stop_suppresses_and_stops_tracked_slot():
+    unit = _make_unit_assist(slot_map={"lane0": 2})
+    unit._feed_assist_active = {2}
+    unit._stop_feed_assist = Recorder()
+
+    gcmd = FakeGcmd(ENABLE=0, LANE="lane0")
+    unit.cmd_ACE_FEED_ASSIST(gcmd)
+
+    assert unit._assist_suppressed == {2}
+    assert unit._stop_feed_assist.calls == [((2,), {})]
+    assert "suppressed" in gcmd.responses[0]
+
+
+def test_feed_assist_stop_sends_firmware_stop_on_tracking_drift():
+    """Slot not tracked as assisting, but firmware might be — the manual stop
+    must still reach the hardware."""
+    unit = _make_unit_assist(slot_map={"lane0": 2})
+    unit._ace = FakeAce(connected=True)
+    unit._stop_feed_assist = Recorder()
+
+    unit.cmd_ACE_FEED_ASSIST(FakeGcmd(ENABLE=0, LANE="lane0"))
+
+    assert unit._assist_suppressed == {2}
+    assert not unit._stop_feed_assist.called            # not tracked
+    assert unit._ace.stop_feed_assist.calls == [((2,), {})]  # raw stop
+
+
+def test_feed_assist_stop_untracked_without_hardware_only_suppresses():
+    unit = _make_unit_assist(slot_map={"lane0": 2})  # _ace is None
+    unit._stop_feed_assist = Recorder()
+
+    gcmd = FakeGcmd(ENABLE=0, LANE="lane0")
+    unit.cmd_ACE_FEED_ASSIST(gcmd)
+
+    assert unit._assist_suppressed == {2}
+    assert not unit._stop_feed_assist.called
+    assert len(gcmd.responses) == 1
+
+
+def test_feed_assist_start_stops_other_slots_first():
+    """The ACE can only feed-assist one slot at a time — a manual start must
+    stop the other assisting slot(s) before starting (or the ACE refuses
+    with error_2)."""
+    unit = _make_unit_assist(slot_map={"lane0": 0, "lane1": 1})
+    unit._feed_assist_active = {1}
+    calls = []
+    unit._stop_feed_assist = lambda s: calls.append(("stop", s))
+    unit._start_feed_assist = lambda s, explicit=False: calls.append(("start", s))
+
+    gcmd = FakeGcmd(ENABLE=1, LANE="lane0")
+    unit.cmd_ACE_FEED_ASSIST(gcmd)
+
+    assert calls == [("stop", 1), ("start", 0)]
+    assert "started" in gcmd.responses[0]
+
+
+def test_feed_assist_start_accepts_slot_param():
+    unit = _make_unit_assist()
+    unit._start_feed_assist = Recorder()
+    unit.cmd_ACE_FEED_ASSIST(FakeGcmd(ENABLE=1, SLOT=3))
+    # A user ENABLE=1 is an EXPLICIT start (clears any manual suppression).
+    assert unit._start_feed_assist.calls == [((3,), {"explicit": True})]
+
+
+# ── _start_feed_assist (real method) early-outs ───────────────────────────────
+
+def test_explicit_start_clears_suppression():
+    """An EXPLICIT start ends the manual suppression — with no hardware
+    connected the method early-outs right after the discard."""
+    unit = _make_unit_assist()
+    unit._assist_suppressed = {2}
+    unit._start_feed_assist(2, explicit=True)
+    assert unit._assist_suppressed == set()
+    assert unit._feed_assist_active == set()  # no hardware -> not tracked
+
+
+def test_non_explicit_start_respects_suppression():
+    """A non-explicit (watchdog/restore/load) start must NOT clear a manual
+    suppression, and bails without enabling assist — so a reconcile queued just
+    before ACE_FEED_ASSIST ENABLE=0 can't re-enable it behind the user's back."""
+    unit = _make_unit_assist()
+    unit._ace = FakeAce(connected=True)
+    unit._assist_suppressed = {2}
+    unit._start_feed_assist(2)                # non-explicit
+    assert unit._assist_suppressed == {2}     # suppression preserved
+    assert not unit._ace.start_feed_assist.called
+    assert unit._feed_assist_active == set()
+
+
+def test_start_already_active_is_noop():
+    unit = _make_unit_assist()
+    unit._ace = FakeAce(connected=True)
+    unit._feed_assist_active = {2}
+
+    unit._start_feed_assist(2)
+
+    assert not unit._ace.start_feed_assist.called
+    assert unit._feed_assist_active == {2}
+
+
+def test_start_feed_assist_stops_other_active_slot_first():
+    # The ACE assists ONE slot at a time. Starting slot 0 (e.g. loading a lane)
+    # must stop the previously-active slot 2 first, so we never leave two assists
+    # running — the single-assist invariant the live toolchange test caught.
+    unit = _make_unit_assist()
+    unit._ace = FakeAce(connected=True)
+    unit._wait_for_ace_ready = lambda *a, **k: True
+    unit._feed_assist_active = {2}
+    stopped = []
+    unit._stop_feed_assist = lambda s: (stopped.append(s),
+                                        unit._feed_assist_active.discard(s))
+
+    unit._start_feed_assist(0)
+
+    assert stopped == [2]                      # stopped the other slot first
+    assert unit._ace.start_feed_assist.called  # then started the target
+    assert unit._feed_assist_active == {0}     # exactly one active
+
+
+def test_start_feed_assist_clears_stale_second_assist_when_already_active():
+    # Even if the target slot is already tracked active, a stray second active
+    # slot must be stopped (defensive: never more than one).
+    unit = _make_unit_assist()
+    unit._ace = FakeAce(connected=True)
+    unit._wait_for_ace_ready = lambda *a, **k: True
+    unit._feed_assist_active = {0, 2}
+    unit._stop_feed_assist = lambda s: unit._feed_assist_active.discard(s)
+
+    unit._start_feed_assist(0)
+
+    assert unit._feed_assist_active == {0}
+
+
+# ── _reconcile_feed_assist ────────────────────────────────────────────────────
+
+def _reconcile_unit():
+    lane = _lane_assist("lane0")
+    unit = _make_unit_assist([lane], slot_map={"lane0": 0, "lane1": 1})
+    unit._use_feed_assist = Recorder(result=True)
+    unit._toolhead_sensor_triggered = Recorder(result=True)
+    unit._stop_feed_assist = Recorder()
+    unit._start_feed_assist = Recorder()
+    return unit
+
+
+def test_reconcile_stops_other_slots_then_starts_target():
+    unit = _reconcile_unit()
+    unit._feed_assist_active = {1}
+    calls = []
+    unit._stop_feed_assist = lambda s: calls.append(("stop", s))
+    unit._start_feed_assist = lambda s: calls.append(("start", s))
+
+    unit._reconcile_feed_assist("lane0")
+
+    assert calls == [("stop", 1), ("start", 0)]
+
+
+def test_reconcile_does_not_start_before_filament_at_toolhead():
+    unit = _reconcile_unit()
+    unit._toolhead_sensor_triggered = Recorder(result=False)
+    unit._reconcile_feed_assist("lane0")
+    assert not unit._start_feed_assist.called
+
+
+def test_reconcile_sensor_exception_treated_as_not_at_toolhead():
+    unit = _reconcile_unit()
+    unit._toolhead_sensor_triggered = Recorder(raises=RuntimeError("boom"))
+    unit._reconcile_feed_assist("lane0")
+    assert not unit._start_feed_assist.called
+
+
+def test_reconcile_respects_suppression():
+    unit = _reconcile_unit()
+    unit._assist_suppressed = {0}
+    unit._reconcile_feed_assist("lane0")
+    assert not unit._start_feed_assist.called
+
+
+def test_reconcile_already_active_does_not_restart():
+    unit = _reconcile_unit()
+    unit._feed_assist_active = {0}
+    unit._reconcile_feed_assist("lane0")
+    assert not unit._start_feed_assist.called
+    assert not unit._stop_feed_assist.called  # target slot is never stopped
+
+
+def test_reconcile_assist_disabled_for_lane():
+    unit = _reconcile_unit()
+    unit._use_feed_assist = Recorder(result=False)
+    unit._reconcile_feed_assist("lane0")
+    assert not unit._start_feed_assist.called
+
+
+def test_reconcile_lane_on_other_unit_stops_ours():
+    unit = _reconcile_unit()
+    unit._feed_assist_active = {0}
+    unit.afc.lanes["other_lane"] = _lane_assist("other_lane")
+
+    unit._reconcile_feed_assist("other_lane")  # not in our _slot_map
+
+    assert unit._stop_feed_assist.calls == [((0,), {})]
+    assert not unit._start_feed_assist.called
+
+
+def test_reconcile_unresolvable_name_leaves_assist_untouched():
+    unit = _reconcile_unit()
+    unit._feed_assist_active = {0}
+
+    unit._reconcile_feed_assist("ghost")  # not our lane, not any afc lane
+
+    assert not unit._stop_feed_assist.called
+    assert not unit._start_feed_assist.called
+    assert unit._feed_assist_active == {0}
+
+
+# ── Retract distance math ─────────────────────────────────────────────────────
+
+class _Hub:
+    def __init__(self, unload=None, bowden=None):
+        if unload is not None:
+            self.afc_unload_bowden_length = unload
+        if bowden is not None:
+            self.afc_bowden_length = bowden
+
+
+def _distance_unit():
+    unit = _make_unit_assist()
+    unit.eject_buffer = 475.0
+    return unit
+
+
+def test_eject_length_staged_at_hub():
+    unit = _distance_unit()
+    lane = FakeLane("lane0")
+    lane.dist_hub = 300.0
+    assert unit._get_eject_length(lane) == 300.0 + 475.0
+
+
+def test_eject_length_tool_loaded_uses_full_unload_path():
+    unit = _distance_unit()
+    lane = FakeLane("lane0", tool_loaded=True, hub_obj=None)
+    lane.dist_hub = 300.0
+    lane.hub_obj = _Hub(unload=1000.0)
+    assert unit._get_eject_length(lane) == 300.0 + 1000.0
+
+
+def test_unload_length_falls_back_to_bowden_length():
+    unit = _distance_unit()
+    lane = FakeLane("lane0")
+    lane.dist_hub = 300.0
+    lane.hub_obj = _Hub(bowden=900.0)  # no afc_unload_bowden_length
+    assert unit._get_unload_length(lane) == 300.0 + 900.0
+
+
+def test_unload_length_without_hub():
+    unit = _distance_unit()
+    lane = FakeLane("lane0")
+    lane.dist_hub = 300.0
+    lane.hub_obj = None
+    assert unit._get_unload_length(lane) == 300.0
+
+
+# ── check_runout ──────────────────────────────────────────────────────────────
+
+def test_check_runout_true_while_printing():
+    unit = _make_unit_assist()
+    unit.afc.function.printing = True
+    assert unit.check_runout(FakeLane("lane0")) is True
+
+
+def test_check_runout_false_when_idle():
+    unit = _make_unit_assist()
+    unit.afc.function.printing = False
+    assert unit.check_runout(FakeLane("lane0")) is False
+
+
+def test_check_runout_false_on_exception():
+    unit = _make_unit_assist()
+    unit.afc.function.raise_on_is_printing = RuntimeError("boom")
+    assert unit.check_runout(FakeLane("lane0")) is False
+
+
+# ── _start_feed_assist error handling ─────────────────────────────────────────
+
+def test_start_feed_assist_error_2_logged_debug_not_error():
+    """error_2 = the ACE momentarily refusing assist (concurrent-assist limit /
+    slot state settling); the watchdog retries, so it's debug, not an error."""
+    unit = _make_unit_assist(slot_map={"lane0": 2})
+    unit._ace = FakeAce(connected=True)
+    unit._wait_for_ace_ready = Recorder()
+
+    def _refuse(slot):
+        raise Exception("ACE2 command 'start_feed_assist' failed: "
+                        "code=2, msg=error_2")
+    unit._ace.start_feed_assist = _refuse
+
+    unit._start_feed_assist(2)
+
+    assert 2 not in unit._feed_assist_active
+    assert unit.logger.lines["error"] == []
+    assert any("refused (error_2" in m for m in unit.logger.lines["debug"])
+
+
+def test_start_feed_assist_unexpected_error_stays_error():
+    unit = _make_unit_assist(slot_map={"lane0": 2})
+    unit._ace = FakeAce(connected=True)
+    unit._wait_for_ace_ready = Recorder()
+
+    def _boom(slot):
+        raise Exception("something genuinely unexpected")
+    unit._ace.start_feed_assist = _boom
+
+    unit._start_feed_assist(2)
+
+    assert any("Failed to start feed assist" in m
+               for m in unit.logger.lines["error"])
+
+
+# ── slot map build/validation (D4) and _get_slot fallback (D2) ────────────────
+
+def _idx_lane(name, index):
+    lane = _lane_assist(name)
+    lane.index = index
+    return lane
+
+
+def test_build_slot_map_maps_index_to_zero_based_slot():
+    unit = _make_unit_assist(lanes=[_idx_lane("lane1", 1), _idx_lane("lane2", 3)])
+    assert unit._build_slot_map() == {"lane1": 0, "lane2": 2}
+
+
+def test_build_slot_map_rejects_duplicate_index():
+    unit = _make_unit_assist(lanes=[_idx_lane("a", 1), _idx_lane("b", 1)])
+    with pytest.raises(Exception):
+        unit._build_slot_map()
+
+
+def test_build_slot_map_rejects_out_of_range_index():
+    unit = _make_unit_assist(lanes=[_idx_lane("a", afcACE.SLOTS_PER_UNIT + 1)])
+    with pytest.raises(Exception):
+        unit._build_slot_map()
+    unit0 = _make_unit_assist(lanes=[_idx_lane("z", 0)])   # 0 is not a valid 1-based idx
+    with pytest.raises(Exception):
+        unit0._build_slot_map()
+
+
+def test_get_slot_returns_mapped_slot():
+    unit = _make_unit_assist(slot_map={"lane1": 2})
+    assert unit._get_slot("lane1") == 2
+
+
+def test_get_slot_unknown_lane_defaults_zero_and_warns():
+    unit = _make_unit_assist(slot_map={"lane1": 2})
+    assert unit._get_slot("ghost") == 0                 # safe fallback
+    assert any("not in this unit's slot map" in m
+               for m in unit.logger.lines["warning"])
+    # warned once per lane — a second lookup doesn't re-log
+    unit.logger.lines["warning"].clear()
+    assert unit._get_slot("ghost") == 0
+    assert unit.logger.lines["warning"] == []
+
+
+# ── load feed stops other assists first (all modes) + _log_delta guard ────────
+
+
+
+def test_ace_load_stops_other_assist_before_feed_in_direct_mode():
+    # The ACE can't feed one slot while another assists. _ace_load_inner must
+    # stop other active-assist slots before feeding in ALL modes (was gated to
+    # combined mode only, so a toolchanger/direct unit fed into a live assist and
+    # the feed timed out — the live incident). We bail at the pre-feed sensor
+    # check right after the stop, so no real feed is needed.
+    lane = _lane_assist("lane0", tool_loaded=False)
+    lane.loaded_to_hub = False
+    lane.buffer_obj = None
+    unit = _make_unit_assist([lane], slot_map={"lane0": 0, "lane2": 2})
+    unit.mode = MODE_DIRECT                       # NOT combined
+    unit._ace = FakeAce(connected=True)
+    unit._hub_load_suppressed = set()
+    unit._feed_assist_active = {2}                # another slot still assisting
+    stopped = []
+    unit._stop_feed_assist = lambda s: (stopped.append(s),
+                                        unit._feed_assist_active.discard(s))
+    unit._get_bowden_length = lambda l: 100.0
+    unit._set_hub_state = lambda l, s: None
+    unit._toolhead_sensor_triggered = lambda l: True   # bail right after the stop
+    unit.afc.function = _types.SimpleNamespace(in_print=lambda: False)
+    unit.afc.error = _types.SimpleNamespace(handle_lane_failure=Recorder())
+
+    ok = unit._ace_load_inner(lane, _types.SimpleNamespace())
+
+    assert ok is False                            # bailed at the pre-feed check
+    assert stopped == [2]                          # but stopped slot 2 FIRST
+
+
+def test_log_delta_starts_clock_when_unstarted():
+    unit = _make_unit_assist()
+
+    class DT:
+        start_time = None
+        started = False
+        logged = None
+        def set_start_time(self):
+            self.start_time = "now"; self.started = True
+        def log_with_time(self, m, debug=True):
+            self.logged = m
+    dt = DT()
+    unit.afc = _types.SimpleNamespace(afcDeltaTime=dt)
+    unit._log_delta("hello")
+    assert dt.started is True and dt.logged == "hello"
+
+
+def test_log_delta_swallows_upstream_error():
+    unit = _make_unit_assist()
+
+    class DT:
+        start_time = "x"
+        def log_with_time(self, m, debug=True):
+            raise TypeError("unsupported operand type(s) for -: datetime vs None")
+    unit.afc = _types.SimpleNamespace(afcDeltaTime=DT())
+    unit._log_delta("hello")   # must NOT raise
+
+
+# ── Unit tests for afcACE._sync_slot_states in extras/AFC_ACE.py ──────────────
+#
+# was tests/test_AFC_ACE_slot_sync.py
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _lane_slot_sync(name="lane0", prev_ready=None, tool_loaded=False,
+          status=AFCLaneState.NONE, lane_loaded=None, hub=None):
+    lane = FakeLane(name, extruder_obj=FakeExtruderObj("extruder",
+                                                       lane_loaded=lane_loaded),
+                    hub_obj=hub, tool_loaded=tool_loaded, status=status)
+    lane.prep_state = bool(prev_ready)
+    lane.loaded_to_hub = bool(prev_ready)
+    lane.load_to_hub = True
+    return lane
+
+
+def _make_unit_slot_sync(lane, prev_ready=None, preloads=False, stale=False,
+               current=None):
+    unit = afcACE.__new__(afcACE)
+    unit.logger = FakeLogger()
+    unit.afc = FakeAFC()
+    unit.afc.current = current
+    unit.lanes = {lane.name: lane}
+    unit._slot_map = {lane.name: 0}
+    unit._slot_inventory = [{} for _ in range(afcACE.SLOTS_PER_UNIT)]
+    unit._prev_slot_states = {} if prev_ready is None else {lane.name: prev_ready}
+    unit._prev_states_stale = stale
+    unit._hub_load_suppressed = set()
+    unit._preloads_to_hub_on_insert = preloads
+    unit._use_feed_assist = Recorder(result=False)
+    unit._start_feed_assist = Recorder()
+    unit.lane_tool_loaded = Recorder()
+    unit.lane_tool_loaded_idle = Recorder()
+    # afc collaborators the TOOLED-restore path touches
+    unit.afc.spool = Recorder()
+    unit.afc.spool.set_active_spool = Recorder()
+    lane.spool_id = 42
+    return unit
+
+
+def _hw(slot_status, unit_status="ready"):
+    return {"status": unit_status, "slots": [{"status": slot_status}]}
+
+
+# ── Inventory + malformed input ───────────────────────────────────────────────
+
+def test_inventory_status_copied_per_slot():
+    lane = _lane_slot_sync(prev_ready=True)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    unit._sync_slot_states({"status": "ready",
+                            "slots": [{"status": "ready"}, {"status": "empty"}]})
+
+    assert unit._slot_inventory[0]["status"] == "ready"
+    assert unit._slot_inventory[1]["status"] == "empty"
+
+
+def test_lane_beyond_reported_slots_skipped():
+    lane = _lane_slot_sync(prev_ready=True)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    unit._sync_slot_states({"status": "ready", "slots": []})
+
+    assert lane.prep_state is True            # untouched
+    assert not lane.handle_load_runout.called
+
+
+def test_malformed_slot_entry_skipped():
+    lane = _lane_slot_sync(prev_ready=True)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    unit._sync_slot_states({"status": "ready", "slots": ["garbage"]})
+
+    assert lane.prep_state is True
+    assert not lane.handle_load_runout.called
+
+
+# ── Virtual hub refresh ───────────────────────────────────────────────────────
+
+def test_virtual_hub_refreshed_from_tool_loaded():
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=True, status=AFCLaneState.TOOLED,
+                 hub=FakeHub(virtual=True))
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+    lane._load_state = False  # stale
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane._load_state is True  # derived from tool_loaded every poll
+
+
+def test_real_hub_load_state_untouched():
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=True, status=AFCLaneState.TOOLED,
+                 hub=None)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+    lane._load_state = "sentinel"
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane._load_state == "sentinel"
+
+
+# ── Transient statuses ────────────────────────────────────────────────────────
+
+def test_transient_status_leaves_everything_alone():
+    lane = _lane_slot_sync(prev_ready=True)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    for status in ("shifting", "feeding", "unwinding"):
+        unit._sync_slot_states(_hw(status))
+        assert lane.prep_state is True                  # untouched
+        assert lane.loaded_to_hub is True               # untouched
+        assert unit._prev_slot_states["lane0"] is True  # snapshot untouched
+        assert not lane.handle_load_runout.called
+
+
+# ── Removal / runout ──────────────────────────────────────────────────────────
+
+def test_ready_to_empty_fires_runout_and_clears_staging():
+    lane = _lane_slot_sync(prev_ready=True)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    unit._sync_slot_states(_hw("empty"))
+
+    assert lane.prep_state is False
+    assert lane.loaded_to_hub is False
+    assert lane.handle_load_runout.call_count == 1
+    eventtime, state = lane.handle_load_runout.last_args
+    assert state is False
+    assert unit._prev_slot_states["lane0"] is False
+
+
+def test_unit_busy_suppresses_removal():
+    """ACE2 flickers slots 'empty' while its own cycles run — a unit-level
+    'busy' must not fire a false runout or drop the staged state."""
+    lane = _lane_slot_sync(prev_ready=True)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    unit._sync_slot_states(_hw("empty", unit_status="busy"))
+
+    assert not lane.handle_load_runout.called
+    assert lane.loaded_to_hub is True         # staged state survives
+    assert lane.prep_state is False           # live prep still tracks the slot
+
+
+def test_stale_prev_states_resync_without_events():
+    lane = _lane_slot_sync(prev_ready=True)
+    unit = _make_unit_slot_sync(lane, prev_ready=True, stale=True)
+
+    unit._sync_slot_states(_hw("empty"))
+
+    assert not lane.handle_load_runout.called
+    assert unit._prev_slot_states["lane0"] is False  # re-synced
+    assert unit._prev_states_stale is False          # consumed
+    assert lane.loaded_to_hub is True                # not cleared on resync
+
+
+def test_empty_stays_empty_no_event():
+    lane = _lane_slot_sync(prev_ready=False)
+    unit = _make_unit_slot_sync(lane, prev_ready=False)
+
+    unit._sync_slot_states(_hw("empty"))
+
+    assert not lane.handle_load_runout.called
+    assert unit._prev_slot_states["lane0"] is False
+
+
+# ── Insert / staging ──────────────────────────────────────────────────────────
+
+def test_fresh_insert_v1_preloads_to_hub():
+    """V1 ACE preloads filament to the hub on insert: empty -> ready stages
+    the lane (honoring load_to_hub)."""
+    lane = _lane_slot_sync(prev_ready=False)
+    unit = _make_unit_slot_sync(lane, prev_ready=False, preloads=True)
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane.prep_state is True
+    assert lane.loaded_to_hub is True
+
+
+def test_fresh_insert_respects_load_to_hub_off():
+    lane = _lane_slot_sync(prev_ready=False)
+    lane.load_to_hub = False
+    unit = _make_unit_slot_sync(lane, prev_ready=False, preloads=True)
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane.prep_state is True
+    assert lane.loaded_to_hub is False
+
+
+def test_fresh_insert_ace2_does_not_preload():
+    """ACE2 stages via prep_post_load's real dist_hub feed instead."""
+    lane = _lane_slot_sync(prev_ready=False)
+    unit = _make_unit_slot_sync(lane, prev_ready=False, preloads=False)
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane.prep_state is True
+    assert lane.loaded_to_hub is False
+
+
+def test_tool_loaded_lane_never_preloaded():
+    lane = _lane_slot_sync(prev_ready=False, tool_loaded=True, status=AFCLaneState.TOOLED)
+    lane.loaded_to_hub = False
+    unit = _make_unit_slot_sync(lane, prev_ready=False, preloads=True)
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane.loaded_to_hub is False
+
+
+# ── Insert path for an un-tooled NONE lane ────────────────────────────────────
+
+def test_ready_untooled_lane_fires_insert_path():
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=False, status=AFCLaneState.NONE)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane.handle_load_runout.call_count == 1
+    _, state = lane.handle_load_runout.last_args
+    assert state is True
+    assert lane._load_suppressed is False
+
+
+def test_ready_untooled_suppressed_marks_lane():
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=False, status=AFCLaneState.NONE)
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+    unit._hub_load_suppressed = {"lane0"}
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane._load_suppressed is True
+    assert lane.handle_load_runout.call_count == 1
+
+
+def test_prep_not_done_skips_insert_path():
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=False, status=AFCLaneState.NONE)
+    lane._afc_prep_done = False
+    unit = _make_unit_slot_sync(lane, prev_ready=True)
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert not lane.handle_load_runout.called
+
+
+# ── TOOLED restore ────────────────────────────────────────────────────────────
+
+def test_ready_tooled_current_lane_restores_full_state():
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=True, status=AFCLaneState.NONE,
+                 lane_loaded="lane0")
+    unit = _make_unit_slot_sync(lane, prev_ready=True, current="lane0")
+    unit._use_feed_assist = Recorder(result=True)
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert lane.loaded_to_hub is True
+    assert lane.sync_to_extruder.call_count == 1
+    assert lane.status == AFCLaneState.TOOLED
+    assert unit.afc.spool.set_active_spool.calls == [((42,), {})]
+    assert unit.lane_tool_loaded.calls == [((lane,), {})]
+    assert not unit.lane_tool_loaded_idle.called
+    assert lane.enable_buffer.call_count == 1
+    assert unit._start_feed_assist.calls == [((0,), {})]
+    assert not lane.handle_load_runout.called
+
+
+def test_ready_tooled_idle_lane_restores_idle_state():
+    """A tool-loaded lane on a NOT-current tool restores as idle-tooled (and
+    is marked TOOLED so the restore doesn't re-fire every poll)."""
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=True, status=AFCLaneState.NONE,
+                 lane_loaded="lane0")
+    unit = _make_unit_slot_sync(lane, prev_ready=True, current="other_lane")
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert unit.lane_tool_loaded_idle.calls == [((lane,), {})]
+    assert not unit.lane_tool_loaded.called
+    assert not unit.afc.spool.set_active_spool.called
+    assert lane.status == AFCLaneState.TOOLED
+    assert lane.enable_buffer.call_count == 1
+
+
+def test_restore_does_not_refire_once_tooled():
+    lane = _lane_slot_sync(prev_ready=True, tool_loaded=True, status=AFCLaneState.TOOLED,
+                 lane_loaded="lane0")
+    unit = _make_unit_slot_sync(lane, prev_ready=True, current="lane0")
+
+    unit._sync_slot_states(_hw("ready"))
+
+    assert not lane.sync_to_extruder.called
+    assert not unit.lane_tool_loaded.called
+
+
+# ── Tests for the RFID stage-probe feed in extras/AFC_ACE.py (_feed_to_hub_probing) ───
+#
+# was tests/test_AFC_ACE_stage_probe.py
+def _make_unit_stage_probe(feeds, unwinds, handlers):
+    unit = afcACE.__new__(afcACE)
+    ace = FakeAce(connected=True)
+    ace.feed_filament = lambda slot, d, sp: feeds.append(round(d, 3))
+    ace.unwind_filament = lambda slot, d, sp: unwinds.append(round(d, 3))
+    unit._ace = ace
+    unit.logger = FakeLogger()
+    unit.feed_speed = 50.0
+    unit.retract_speed = 50.0
+    unit.prep_ready_timeout = 5.0
+    unit._wait_for_ace_ready = Recorder()
+    unit._wait_for_feed_complete = Recorder()
+    unit._slot_reports_empty = lambda slot: False       # present unless overridden
+
+    class _Printer:
+        def send_event(self, name, *a):
+            h = handlers.get(name)
+            if h is not None:
+                h(*a)
+    unit.printer = _Printer()
+    return unit
+
+
+def _handlers(fed=0.0, initial=100.0, done=False, removed=False):
+    """Stage-read listener: the scan (run inside begin) reports how far it fed
+    (``fed``), the mandatory ``initial`` load, whether it read a tag (``done``)
+    and whether the spool was pulled mid-scan (``removed``)."""
+    def begin(lane, ctx):
+        ctx["active"] = True
+        ctx["initial"] = initial
+        ctx["fed"] = fed
+        if done:
+            ctx["done"] = True
+        if removed:
+            ctx["removed"] = True
+
+    return {
+        "afc_ace:stage_probe_begin": begin,
+        "afc_ace:stage_probe_end": lambda lane, ctx: None,
+    }
+
+
+def test_no_listener_is_plain_dist_hub_feed():
+    feeds, unwinds = [], []
+    unit = _make_unit_stage_probe(feeds, unwinds, {})              # no listener -> fed=0
+    unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert feeds == [200.0]                             # one move, dist_hub only
+    assert unwinds == []
+
+
+def test_inactive_with_initial_is_one_plain_feed():
+    # disable_rfid path: the listener requests the initial load but the scan
+    # fed nothing -> feed initial + dist_hub in ONE move.
+    feeds, unwinds = [], []
+
+    def begin(lane, ctx):
+        ctx["initial"] = 100.0                         # load set, scan fed nothing
+
+    handlers = {
+        "afc_ace:stage_probe_begin": begin,
+        "afc_ace:stage_probe_end": lambda lane, ctx: None,
+    }
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+    unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert feeds == [300.0]                             # initial 100 + dist_hub 200
+    assert unwinds == []
+
+
+def test_read_during_scan_feeds_remainder_in_one_move():
+    # Scan fed 150mm and read the tag -> remainder (100+200 - 150) in one move.
+    # The smooth scan doesn't trip the stuck-spool latch, so no clearing unwind.
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=150.0, initial=100.0, done=True)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+
+    unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert feeds == [150.0]                             # 300 total - 150 already fed
+    assert unwinds == []                               # no recovery unwind needed
+
+
+def test_tagless_feeds_remainder_after_full_scan():
+    # Tagless spool: scan fed the whole 200mm window, no read -> feed the
+    # remainder (300-200) in one move, no clearing unwind.
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=200.0, initial=100.0, done=False)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+
+    unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert feeds == [100.0]                             # 300 total - 200 scanned
+    assert sum(feeds) + 200.0 == 300.0                 # net = initial + dist_hub
+    assert unwinds == []
+
+
+def test_scan_fed_full_load_needs_no_remainder():
+    # The scan already fed the entire initial+dist_hub -> no remainder move.
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=300.0, initial=100.0, done=True)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+
+    unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert feeds == []                                  # nothing left to stage
+    assert unwinds == []                               # no recovery unwind needed
+
+
+def test_dist_hub_zero_still_does_initial_load():
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=0.0, initial=100.0, done=False)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+
+    unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=0.0)
+
+    assert feeds == [100.0]                             # just the initial load
+    assert unwinds == []
+
+
+def test_completed_stage_returns_true():
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=0.0, initial=100.0, done=False)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+
+    result = unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert result is True
+    assert feeds == [300.0]
+
+
+def test_stage_aborts_when_scan_reports_removed():
+    # The scan detected the spool pulled mid-feed (ctx['removed']) -> abort, no
+    # remainder feed, no clearing unwind.
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=120.0, initial=100.0, removed=True)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+
+    result = unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert result is False
+    assert feeds == []
+    assert unwinds == []
+    assert any("filament removed during staging" in m
+               for m in unit.logger.lines["debug"])
+
+
+def test_stage_aborts_when_slot_already_empty():
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=0.0, initial=100.0)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+    unit._slot_reports_empty = lambda slot: True       # gone before the remainder
+
+    result = unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert result is False
+    assert feeds == []                                 # never fed an empty slot
+    assert unwinds == []
+
+
+def test_recovery_unwind_skipped_when_no_read():
+    # No read (done False) -> no stuck-spool clearing unwind.
+    feeds, unwinds = [], []
+    handlers = _handlers(fed=200.0, initial=100.0, done=False)
+    unit = _make_unit_stage_probe(feeds, unwinds, handlers)
+
+    unit._feed_to_hub_probing(FakeLane("lane3"), 3, dist_hub=200.0)
+
+    assert unwinds == []
+
+
+# ── prep_post_load must NOT short-circuit at dist_hub=0 ───────────────────────
+
+def _prep_unit():
+    """Minimal unit wired for prep_post_load: it should run the stage probe even
+    when dist_hub=0 (the stage scan / initial load are what pull the filament
+    into the unit; dist_hub is additive on top)."""
+    import contextlib
+    unit = afcACE.__new__(afcACE)
+    unit.logger = FakeLogger()
+    unit._unit_load_to_hub = None
+    unit._ace = FakeAce(connected=True)
+    unit._get_slot = lambda name: 3
+    unit.prep_ready_timeout = 5.0
+    unit._wait_for_ace_ready = Recorder()
+    unit._set_hub_state = lambda lane, state: None
+    unit._operation = lambda: contextlib.nullcontext()
+    unit.afc = types.SimpleNamespace(
+        save_vars=lambda: None, td1_present=False)
+    return unit
+
+
+def test_prep_post_load_runs_probe_when_dist_hub_zero():
+    unit = _prep_unit()
+    calls = []
+    unit._feed_to_hub_probing = lambda lane, slot, dist: (
+        calls.append((slot, dist)) or True)
+
+    lane = FakeLane("lane3")
+    lane.load_to_hub = True
+    lane.loaded_to_hub = False
+    lane.prep_state = True
+    lane.dist_hub = 0.0
+    lane.td1_when_loaded = False
+    lane.td1_device_id = None
+
+    unit.prep_post_load(lane)
+
+    assert calls == [(3, 0.0)]          # probe ran even with dist_hub=0
+    assert lane.loaded_to_hub is True   # staged once the probe returned True
+
+
+# ── _slot_reports_empty helper ─────────────────────────────────────────────────
+
+class _StatusAce:
+    def __init__(self, status=None, raises=False, connected=True, sequence=None):
+        self.connected = connected
+        self._status = status
+        self._raises = raises
+        self._sequence = list(sequence) if sequence else None
+
+    def get_status(self, timeout=2.0):
+        if self._raises:
+            raise RuntimeError("status timeout")
+        if self._sequence is not None:
+            return self._sequence.pop(0) if self._sequence else self._status
+        return self._status
+
+
+class _NoWaitReactor:
+    def monotonic(self):
+        return 0.0
+
+    def pause(self, when):
+        pass
+
+
+def _unit_with_ace(ace):
+    unit = afcACE.__new__(afcACE)
+    unit._ace = ace
+    unit.logger = FakeLogger()
+    unit.afc = types.SimpleNamespace(reactor=_NoWaitReactor())
+    return unit
+
+
+def _empty(slot="empty"):
+    return {"status": "ready", "slots": [{"status": slot}]}
+
+
+def test_slot_reports_empty_true_when_stably_empty():
+    ace = _StatusAce(_empty())                          # empty on every poll
+    assert _unit_with_ace(ace)._slot_reports_empty(0) is True
+
+
+def test_slot_reports_empty_false_on_single_flicker():
+    # empty once, then present: a one-poll flicker must NOT abort a live stage.
+    ace = _StatusAce(sequence=[_empty(), _empty("ready")])
+    assert _unit_with_ace(ace)._slot_reports_empty(0) is False
+
+
+def test_slot_reports_empty_false_when_slot_ready():
+    ace = _StatusAce(_empty("ready"))
+    assert _unit_with_ace(ace)._slot_reports_empty(0) is False
+
+
+def test_slot_reports_empty_false_when_unit_busy():
+    # A busy unit's slots can flicker 'empty' mid-motion; never abort on that.
+    ace = _StatusAce({"status": "busy", "slots": [{"status": "empty"}]})
+    assert _unit_with_ace(ace)._slot_reports_empty(0) is False
+
+
+def test_slot_reports_empty_false_when_query_fails():
+    assert _unit_with_ace(_StatusAce(raises=True))._slot_reports_empty(0) is False
+
+
+def test_slot_reports_empty_false_when_disconnected():
+    ace = _StatusAce(_empty(), connected=False)
+    assert _unit_with_ace(ace)._slot_reports_empty(0) is False
+
+
+def test_slot_reports_empty_false_when_no_ace():
+    assert _unit_with_ace(None)._slot_reports_empty(0) is False
+
+
+def test_slot_reports_empty_false_when_slot_index_out_of_range():
+    ace = _StatusAce(_empty())
+    assert _unit_with_ace(ace)._slot_reports_empty(5) is False
+
+
+# ── Unit tests for the ACE diagnostic gcode handlers in extras/AFC_ACE.py: ────
+#
+# was tests/test_AFC_ACE_diag_cmds.py
+def _unit(ace):
+    unit = afcACE.__new__(afcACE)
+    unit._ace = ace
+    return unit
+
+
+# ── cmd_ACE_TEMP_INFO ─────────────────────────────────────────────────────────
+
+def test_temp_info_not_connected():
+    unit = _unit(FakeAce2(connected=False))
+    gcmd = FakeGcmd()
+    unit.cmd_ACE_TEMP_INFO(gcmd)
+    assert gcmd.responses == ["ACE not connected"]
+
+
+def test_temp_info_get_temp_raises():
+    ace = FakeAce2()
+    ace.get_temp = Recorder(raises=RuntimeError("unsupported"))
+    unit = _unit(ace)
+    gcmd = FakeGcmd()
+
+    unit.cmd_ACE_TEMP_INFO(gcmd)
+
+    assert len(gcmd.responses) == 1
+    assert "ACE_TEMP_INFO" in gcmd.responses[0]
+    assert "unsupported" in gcmd.responses[0]
+
+
+def test_temp_info_non_dict_reply():
+    ace = FakeAce2()
+    ace.get_temp = Recorder(result=None)
+    unit = _unit(ace)
+    gcmd = FakeGcmd()
+
+    unit.cmd_ACE_TEMP_INFO(gcmd)
+
+    assert len(gcmd.responses) == 1
+    assert "unexpected reply" in gcmd.responses[0]
+
+
+def test_temp_info_success_formats_all_channels():
+    ace = FakeAce2()
+    ace.get_temp = Recorder(result={
+        'box1_temp': 30.5, 'box2_temp': 31.0,
+        'ptc1_temp': 55.0, 'ptc2_temp': 60.0,
+        'env_temp': 24.0, 'env_humidity': 41.0,
+    })
+    unit = _unit(ace)
+    gcmd = FakeGcmd()
+
+    unit.cmd_ACE_TEMP_INFO(gcmd)
+
+    assert ace.get_temp.call_count == 1
+    assert len(gcmd.responses) == 1
+    msg = gcmd.responses[0]
+    for token in ("box1=30.5", "box2=31.0", "ptc1=55.0",
+                  "ptc2=60.0", "env=24.0", "humidity=41.0"):
+        assert token in msg
+
+
+def test_temp_info_missing_channels_render_na():
+    ace = FakeAce2()
+    ace.get_temp = Recorder(result={'box1_temp': 30.5})  # rest absent
+    unit = _unit(ace)
+    gcmd = FakeGcmd()
+
+    unit.cmd_ACE_TEMP_INFO(gcmd)
+
+    msg = gcmd.responses[0]
+    assert "box1=30.5" in msg
+    assert "humidity=n/a" in msg
+
+
+# ── cmd_ACE_MATERIAL_INFO ─────────────────────────────────────────────────────
+
+def test_material_info_not_connected():
+    unit = _unit(FakeAce2(connected=False))
+    gcmd = FakeGcmd()
+    unit.cmd_ACE_MATERIAL_INFO(gcmd)
+    assert gcmd.responses == ["ACE not connected"]
+
+
+def test_material_info_default_slot_zero():
+    ace = FakeAce2()
+    ace.get_material_info = Recorder(result={
+        'index': 0, 'material_name': 'S0395MB251230046650C3', 'status': 0})
+    unit = _unit(ace)
+    gcmd = FakeGcmd()
+
+    unit.cmd_ACE_MATERIAL_INFO(gcmd)
+
+    assert ace.get_material_info.last_args == (0,)
+    msg = gcmd.responses[0]
+    assert "slot 0" in msg
+    assert "S0395MB251230046650C3" in msg
+
+
+def test_material_info_explicit_slot():
+    ace = FakeAce2()
+    ace.get_material_info = Recorder(result={
+        'index': 3, 'material_name': 'PETG', 'status': 1})
+    unit = _unit(ace)
+    gcmd = FakeGcmd(SLOT=3)
+
+    unit.cmd_ACE_MATERIAL_INFO(gcmd)
+
+    assert ace.get_material_info.last_args == (3,)
+    assert "slot 3" in gcmd.responses[0]
+    assert "PETG" in gcmd.responses[0]
+
+
+def test_material_info_error_surfaced():
+    ace = FakeAce2()
+    ace.get_material_info = Recorder(raises=RuntimeError("timeout"))
+    unit = _unit(ace)
+    gcmd = FakeGcmd(SLOT=0)
+
+    unit.cmd_ACE_MATERIAL_INFO(gcmd)
+
+    assert "ACE_MATERIAL_INFO" in gcmd.responses[0]
+    assert "timeout" in gcmd.responses[0]
+
+
+# ── cmd_ACE_SET_MATERIAL ──────────────────────────────────────────────────────
+
+def test_set_material_not_connected():
+    unit = _unit(FakeAce2(connected=False))
+    gcmd = FakeGcmd(SLOT=0, NAME="X")
+    unit.cmd_ACE_SET_MATERIAL(gcmd)
+    assert gcmd.responses == ["ACE not connected"]
+
+
+def test_set_material_requires_slot():
+    ace = FakeAce2()
+    unit = _unit(ace)
+    gcmd = FakeGcmd(NAME="X")  # no SLOT
+    unit.cmd_ACE_SET_MATERIAL(gcmd)
+    assert "SLOT=<n> required" in gcmd.responses[0]
+    assert ace.set_material_name.call_count == 0
+
+
+def test_set_material_requires_name():
+    ace = FakeAce2()
+    unit = _unit(ace)
+    gcmd = FakeGcmd(SLOT=0)  # no NAME
+    unit.cmd_ACE_SET_MATERIAL(gcmd)
+    assert "NAME=<text> required" in gcmd.responses[0]
+    assert ace.set_material_name.call_count == 0
+
+
+def test_set_material_writes_and_reads_back():
+    ace = FakeAce2()
+    ace.set_material_name = Recorder(result={})
+    ace.get_material_info = Recorder(result={'index': 2, 'material_name': 'PLA_X'})
+    unit = _unit(ace)
+    gcmd = FakeGcmd(SLOT=2, NAME="PLA_X")
+
+    unit.cmd_ACE_SET_MATERIAL(gcmd)
+
+    assert ace.set_material_name.last_args == (2, "PLA_X")
+    assert ace.get_material_info.last_args == (2,)     # read-back
+    assert "slot 2" in gcmd.responses[0]
+    assert "PLA_X" in gcmd.responses[0]
+
+
+def test_set_material_write_error_surfaced():
+    ace = FakeAce2()
+    ace.set_material_name = Recorder(raises=RuntimeError("boom"))
+    unit = _unit(ace)
+    gcmd = FakeGcmd(SLOT=0, NAME="X")
+
+    unit.cmd_ACE_SET_MATERIAL(gcmd)
+
+    assert "ACE_SET_MATERIAL" in gcmd.responses[0]
+    assert "boom" in gcmd.responses[0]
+    assert ace.get_material_info.call_count == 0       # never reached read-back
+
+
+def test_set_material_readback_failure_still_reports_write():
+    ace = FakeAce2()
+    ace.set_material_name = Recorder(result={})
+    ace.get_material_info = Recorder(raises=RuntimeError("readfail"))
+    unit = _unit(ace)
+    gcmd = FakeGcmd(SLOT=0, NAME="X")
+
+    unit.cmd_ACE_SET_MATERIAL(gcmd)
+
+    msg = gcmd.responses[0]
+    assert "wrote 'X'" in msg
+    assert "read-back failed" in msg
+
+
+# ── cmd_ACE_SENSOR_STATE ──────────────────────────────────────────────────────
+
+def test_sensor_state_not_connected():
+    unit = _unit(FakeAce2(connected=False))
+    gcmd = FakeGcmd()
+    unit.cmd_ACE_SENSOR_STATE(gcmd)
+    assert gcmd.responses == ["ACE not connected"]
+
+
+def test_sensor_state_reports_mask_and_triggered():
+    ace = FakeAce2()
+    sensors = [bool(0x11 & (1 << i)) for i in range(17)]  # bits 0 and 4
+    ace.get_sensor_state = Recorder(result={
+        'sensor_bitmask': 0x11, 'sensors': sensors})
+    unit = _unit(ace)
+    gcmd = FakeGcmd()
+
+    unit.cmd_ACE_SENSOR_STATE(gcmd)
+
+    msg = gcmd.responses[0]
+    assert "0x11" in msg
+    assert "[0, 4]" in msg
+
+
+def test_sensor_state_error_surfaced():
+    ace = FakeAce2()
+    ace.get_sensor_state = Recorder(raises=RuntimeError("nope"))
+    unit = _unit(ace)
+    gcmd = FakeGcmd()
+
+    unit.cmd_ACE_SENSOR_STATE(gcmd)
+
+    assert "ACE_SENSOR_STATE" in gcmd.responses[0]
+    assert "nope" in gcmd.responses[0]
+
+
+# ── Unit tests for the ACE "current action" surfacing (extras/AFC_ACE.py): ────
+#
+# was tests/test_AFC_ACE_action.py
+V1_BUSY = {"status": "busy", "action": "preload",
+           "slots": [{"index": 0, "status": "preload"},
+                     {"index": 1, "status": "ready"}]}
+V1_IDLE = {"status": "ready", "slots": [{"index": 0, "status": "ready"}]}
+ACE2_BUSY = {"status": "busy",
+             "slots": [{"index": 0, "slot_status": "feeding", "status": "ready"},
+                       {"index": 1, "slot_status": "ready", "status": "ready"}]}
+ACE2_IDLE = {"status": "ready",
+             "slots": [{"index": 0, "slot_status": "ready", "status": "ready"}]}
+
+
+# ── _derive_action ────────────────────────────────────────────────────────────
+
+def test_derive_action_v1_busy_slot_tagged():
+    assert afcACE._derive_action(V1_BUSY) == "preload(slot 0)"
+
+
+def test_derive_action_ace2_busy_slot_uses_slot_status():
+    assert afcACE._derive_action(ACE2_BUSY) == "feeding(slot 0)"
+
+
+def test_derive_action_top_level_fallback_when_no_busy_slot():
+    r = {"action": "drying", "slots": [{"index": 0, "status": "ready"}]}
+    assert afcACE._derive_action(r) == "drying"
+
+
+def test_derive_action_idle_returns_empty():
+    assert afcACE._derive_action(V1_IDLE) == ""
+    assert afcACE._derive_action(ACE2_IDLE) == ""
+
+
+def test_derive_action_no_slot_index_untagged():
+    assert afcACE._derive_action({"slots": [{"slot_status": "rollback"}]}) == "rollback"
+
+
+def test_derive_action_non_dict_and_empty():
+    assert afcACE._derive_action(None) == ""
+    assert afcACE._derive_action("nope") == ""
+    assert afcACE._derive_action({}) == ""
+
+
+# ── _on_hw_status_callback transition logging ─────────────────────────────────
+
+def _make_unit_action(operation_active=False):
+    unit = afcACE.__new__(afcACE)
+    unit.name = "Ace_1"
+    unit.logger = FakeLogger()
+    unit._cached_hw_status = {}
+    unit._cached_temp_info = {}
+    unit._current_action = ""
+    unit._operation_active = operation_active
+    unit._sync_slot_states = Recorder()
+    unit._maybe_assist_watchdog = Recorder()
+    unit._check_stuck = Recorder()
+    return unit
+
+
+def test_callback_logs_transition_and_tracks_action():
+    unit = _make_unit_action()
+
+    unit._on_hw_status_callback({"result": V1_BUSY})
+    assert unit._current_action == "preload(slot 0)"
+    assert any("Ace_1: idle -> preload(slot 0)" in m
+               for m in unit.logger.lines["info"])
+
+    unit._on_hw_status_callback({"result": V1_IDLE})
+    assert unit._current_action == ""
+    assert any("preload(slot 0) -> idle" in m for m in unit.logger.lines["info"])
+
+
+def test_callback_no_duplicate_log_when_action_unchanged():
+    unit = _make_unit_action()
+    unit._on_hw_status_callback({"result": ACE2_BUSY})
+    n = len(unit.logger.lines["info"])
+    unit._on_hw_status_callback({"result": ACE2_BUSY})   # same action
+    assert len(unit.logger.lines["info"]) == n           # no new transition line
+
+
+def test_callback_tracks_action_even_during_operation():
+    unit = _make_unit_action(operation_active=True)
+
+    unit._on_hw_status_callback({"result": ACE2_BUSY})
+
+    assert unit._current_action == "feeding(slot 0)"     # logged despite op-active
+    assert unit._sync_slot_states.call_count == 0        # but sync still skipped
+
+
+def test_callback_temp_reply_does_not_touch_action():
+    unit = _make_unit_action()
+    unit._current_action = "feeding(slot 0)"
+    # A get_temp reply (no slots) routes to the temp cache and returns early.
+    unit._on_hw_status_callback({"result": {"ptc1_temp": 55.0}})
+    assert unit._current_action == "feeding(slot 0)"     # unchanged
+
+
+# ── cmd_ACE_STATUS ────────────────────────────────────────────────────────────
+
+def _status_unit(status_result):
+    unit = afcACE.__new__(afcACE)
+    ace = FakeAce()
+    ace.get_status = Recorder(result=status_result)
+    unit._ace = ace
+    return unit
+
+
+def test_cmd_ace_status_reports_busy_action():
+    unit = _status_unit(ACE2_BUSY)
+    gcmd = FakeGcmd()
+    unit.cmd_ACE_STATUS(gcmd)
+    assert any("action: feeding(slot 0)" in r for r in gcmd.responses)
+
+
+def test_cmd_ace_status_reports_idle():
+    unit = _status_unit(V1_IDLE)
+    gcmd = FakeGcmd()
+    unit.cmd_ACE_STATUS(gcmd)
+    assert any("action: idle" in r for r in gcmd.responses)
+
+
+def test_cmd_ace_status_not_connected():
+    unit = _status_unit(V1_IDLE)
+    unit._ace.connected = False
+    gcmd = FakeGcmd()
+    unit.cmd_ACE_STATUS(gcmd)
+    assert gcmd.responses == ["ACE not connected"]
+
+
+# ── get_status (Moonraker-queryable unit state) ───────────────────────────────
+
+def _status_obj_unit(hw=None, action="", inventory=None, connected=True):
+    unit = afcACE.__new__(afcACE)
+    unit.lanes = {}          # empty -> base get_status returns empty aggregates
+    unit._cached_hw_status = hw or {}
+    unit._cached_temp_info = {}
+    unit._hw_status_time = None      # no heartbeat yet -> age/stale unset
+    unit._current_action = action
+    unit._ace = FakeAce(connected=connected)
+    unit._slot_inventory = (inventory if inventory is not None
+                            else [{} for _ in range(afcACE.SLOTS_PER_UNIT)])
+    return unit
+
+
+def test_get_status_adds_ace_state():
+    hw = {"status": "busy", "temp": 28, "dryer_status": {"status": "stop"}}
+    inv = ([{"status": "ready", "rfid": 2, "sku": "HPL19-107",
+             "material": "PLA", "uid": "BB2613B0102474", "color": [137, 168, 79]}]
+           + [{} for _ in range(afcACE.SLOTS_PER_UNIT - 1)])
+    unit = _status_obj_unit(hw=hw, action="feeding(slot 0)", inventory=inv)
+
+    st = unit.get_status()
+
+    # base structure preserved
+    assert st["lanes"] == [] and "hubs" in st and "buffers" in st
+    # ACE live state
+    assert st["ace_connected"] is True
+    assert st["ace_status"] == "busy"
+    assert st["ace_action"] == "feeding(slot 0)"
+    assert st["ace_temp"] == 28
+    assert st["ace_dryer"] == "stop"
+    assert len(st["ace_slots"]) == afcACE.SLOTS_PER_UNIT
+    s0 = st["ace_slots"][0]
+    assert (s0["sku"], s0["material"], s0["uid"], s0["rfid"]) == \
+        ("HPL19-107", "PLA", "BB2613B0102474", 2)
+    assert s0["color"] == [137, 168, 79]
+
+
+def test_get_status_humidity_only_when_present():
+    ace2 = _status_obj_unit(hw={"status": "ready", "temp": 26, "humidity": 31})
+    assert ace2.get_status()["ace_humidity"] == 31
+    v1 = _status_obj_unit(hw={"status": "ready", "temp": 26})  # V1 omits humidity
+    assert "ace_humidity" not in v1.get_status()
+
+
+def test_get_status_disconnected_and_empty():
+    unit = _status_obj_unit(connected=False)
+    st = unit.get_status()
+    assert st["ace_connected"] is False
+    assert st["ace_action"] == ""
+    assert st["ace_temp"] is None
+    assert len(st["ace_slots"]) == afcACE.SLOTS_PER_UNIT
+
+
+def test_get_status_falls_back_to_temp_cache_for_ace2():
+    # ACE2's get_status payload has no temp/humidity (they arrive via get_temp
+    # into _cached_temp_info); env channels must still surface.
+    unit = _status_obj_unit(hw={"status": "ready"})   # no temp/humidity in status
+    unit._cached_temp_info = {"env_temp": 24.5, "env_humidity": 38}
+    st = unit.get_status()
+    assert st["ace_temp"] == 24.5
+    assert st["ace_humidity"] == 38
+
+
+def test_get_status_reports_stale_when_cache_ages():
+    unit = _status_obj_unit(hw={"status": "ready"})
+    unit.afc = types.SimpleNamespace(
+        reactor=types.SimpleNamespace(monotonic=lambda: 100.0))
+    unit._hw_status_time = 100.0                       # fresh -> not stale
+    assert unit.get_status()["ace_status_stale"] is False
+    unit._hw_status_time = 100.0 - 20.0                # 20s old (> 3 heartbeats)
+    st = unit.get_status()
+    assert st["ace_status_stale"] is True
+    assert st["ace_status_age"] >= 20.0
+
+
+# ── ACE2 _decode_status now indexes slots (so _derive_action can tag them) ─────
+
+
+
+def test_ace2_decode_status_indexes_and_tags_busy_slot():
+    # One real slot: slot_state=1 (feeding), filament_state=1 (present); padded.
+    slot0 = pb_uint32(1, 1) + pb_uint32(2, 1)
+    status = _decode_status({9: [(2, slot0)]})
+    assert [s["index"] for s in status["slots"]] == [0, 1, 2, 3]
+    assert status["slots"][0]["slot_status"] == "feeding"
+    # The whole point: the ACE2 action is now slot-tagged like the V1's.
+    assert afcACE._derive_action(status) == "feeding(slot 0)"
+
+
+def test_ace2_decode_status_pads_slots_with_index():
+    status = _decode_status({})          # no field-9 slots -> 4 padded
+    assert [s["index"] for s in status["slots"]] == [0, 1, 2, 3]
+
+
+# ── Unit tests for ACE sensor/state helpers in extras/AFC_ACE.py and the ACE2 ───
+#
+# was tests/test_AFC_ACE_sensors.py
+# ── Fakes ─────────────────────────────────────────────────────────────────────
+
+class _U1Sensor:
+    """A U1 motion sensor: exposes the raw physical switch state."""
+
+    def __init__(self, buttun_state):
+        self.runout_buttun_state = buttun_state
+
+
+class _PlainSensor:
+    """A plain switch sensor: no runout_buttun_state attribute."""
+
+
+class _Extruder_sensors:
+    """AFC_extruder stand-in with the two possible sensor attributes; omit
+    either by passing the _MISSING sentinel."""
+
+    _MISSING = object()
+
+    def __init__(self, filament_sensor_obj=None, fila_tool_start=None):
+        if filament_sensor_obj is not self._MISSING:
+            self.filament_sensor_obj = filament_sensor_obj
+        if fila_tool_start is not self._MISSING:
+            self.fila_tool_start = fila_tool_start
+
+
+def _make_unit_sensors():
+    unit = afcACE.__new__(afcACE)
+    unit.logger = FakeLogger()
+    return unit
+
+
+def _sensor_lane(ext, pre_sensor=False):
+    lane = FakeLane("lane0", extruder_obj=ext)
+    lane.get_toolhead_pre_sensor_state = Recorder(result=pre_sensor)
+    return lane
+
+
+# ── _toolhead_sensor_triggered ────────────────────────────────────────────────
+
+def test_toolhead_sensor_uses_u1_button_state_true():
+    unit = _make_unit_sensors()
+    lane = _sensor_lane(_Extruder_sensors(fila_tool_start=_U1Sensor(1)))
+
+    assert unit._toolhead_sensor_triggered(lane) is True
+    assert not lane.get_toolhead_pre_sensor_state.called  # no fallback
+
+
+def test_toolhead_sensor_uses_u1_button_state_false():
+    unit = _make_unit_sensors()
+    lane = _sensor_lane(_Extruder_sensors(fila_tool_start=_U1Sensor(0)))
+
+    assert unit._toolhead_sensor_triggered(lane) is False
+    assert not lane.get_toolhead_pre_sensor_state.called
+
+
+def test_toolhead_sensor_filament_sensor_obj_takes_priority():
+    unit = _make_unit_sensors()
+    ext = _Extruder_sensors(filament_sensor_obj=_U1Sensor(1),
+                    fila_tool_start=_U1Sensor(0))
+    lane = _sensor_lane(ext)
+
+    assert unit._toolhead_sensor_triggered(lane) is True
+
+
+def test_toolhead_sensor_plain_sensor_falls_back():
+    """A sensor without runout_buttun_state -> normal pre-sensor read."""
+    unit = _make_unit_sensors()
+    lane = _sensor_lane(_Extruder_sensors(fila_tool_start=_PlainSensor()),
+                        pre_sensor=True)
+
+    assert unit._toolhead_sensor_triggered(lane) is True
+    assert lane.get_toolhead_pre_sensor_state.call_count == 1
+
+
+def test_toolhead_sensor_no_sensor_objects_falls_back():
+    unit = _make_unit_sensors()
+    lane = _sensor_lane(_Extruder_sensors(filament_sensor_obj=_Extruder_sensors._MISSING,
+                                  fila_tool_start=_Extruder_sensors._MISSING),
+                        pre_sensor=False)
+
+    assert unit._toolhead_sensor_triggered(lane) is False
+    assert lane.get_toolhead_pre_sensor_state.call_count == 1
+
+
+# ── Virtual hub semantics ─────────────────────────────────────────────────────
+
+def test_is_virtual_hub_all_branches():
+    unit = _make_unit_sensors()
+
+    lane = FakeLane("lane0", hub_obj=None)
+    assert unit._is_virtual_hub(lane) is False
+
+    class _RealHub:
+        pass  # no is_virtual_pin attribute
+
+    lane = FakeLane("lane0", hub_obj=_RealHub())
+    assert unit._is_virtual_hub(lane) is False
+
+    lane = FakeLane("lane0", hub_obj=FakeHub(virtual=True))
+    assert unit._is_virtual_hub(lane) is True
+
+    lane = FakeLane("lane0", hub_obj=FakeHub(virtual=False))
+    assert unit._is_virtual_hub(lane) is False
+
+
+def test_virtual_hub_occupancy_derives_from_tool_loaded():
+    """The virtual hub reads 'loaded' only while filament is threaded THROUGH
+    it to a toolhead — a staged-but-not-loaded lane stays clear so its own
+    load doesn't trip 'Hub not clear'."""
+    unit = _make_unit_sensors()
+
+    lane = FakeLane("lane0", hub_obj=FakeHub(virtual=True), tool_loaded=False)
+    unit._set_hub_state(lane, True)   # the staged flag is NOT the live signal
+    assert lane._load_state is False
+
+    lane = FakeLane("lane0", hub_obj=FakeHub(virtual=True), tool_loaded=True)
+    unit._set_hub_state(lane, False)
+    assert lane._load_state is True
+
+
+def test_real_hub_left_alone():
+    unit = _make_unit_sensors()
+    lane = FakeLane("lane0", hub_obj=None)
+    lane._load_state = "sentinel"
+
+    unit._set_hub_state(lane, True)
+
+    assert lane._load_state == "sentinel"
+
+
+# ── _parse_ace_params ─────────────────────────────────────────────────────────
+
+def test_parse_params_real_json():
+    assert afcACE._parse_ace_params('{"index": 0, "type": "PLA"}') == {
+        "index": 0, "type": "PLA"}
+
+
+def test_parse_params_console_stripped_quotes():
+    """The gcode console strips JSON double-quotes — the quote-less form must
+    parse with int/float/bool/string inference."""
+    result = afcACE._parse_ace_params('{index:0,length:50.5,type:PLA,dry:true}')
+    assert result == {"index": 0, "length": 50.5, "type": "PLA", "dry": True}
+
+
+def test_parse_params_false_bool():
+    assert afcACE._parse_ace_params('{dry:false}') == {"dry": False}
+
+
+def test_parse_params_list_values():
+    result = afcACE._parse_ace_params('{index:0,color:[255,0,0]}')
+    assert result == {"index": 0, "color": [255, 0, 0]}
+
+
+def test_parse_params_empty_returns_none():
+    assert afcACE._parse_ace_params("") is None
+    assert afcACE._parse_ace_params(None) is None
+    assert afcACE._parse_ace_params("   ") is None
+
+
+# ── ACE2 _apply_feed_check ────────────────────────────────────────────────────
+
+def _make_ace2(ace=None):
+    unit = afcACE2.__new__(afcACE2)
+    unit.name = "ACE_1"
+    unit.logger = FakeLogger()
+    unit.feed_check_length = 200
+    unit.feed_error_length = 190
+    unit._ace = ace
+    return unit
+
+
+def test_feed_check_pushes_configured_window():
+    unit = _make_ace2(ace=FakeAce())
+    unit._apply_feed_check()
+    assert unit._ace.send_command_async.calls == [(
+        ("set_feed_check", {"check_length": 200, "error_length": 190}), {})]
+    assert len(unit.logger.lines["info"]) == 1
+
+
+def test_feed_check_noop_without_connection():
+    unit = _make_ace2(ace=None)
+    unit._apply_feed_check()  # must not raise
+    assert unit.logger.lines["info"] == []
+
+
+def test_feed_check_error_is_nonfatal():
+    ace = FakeAce()
+    ace.send_command_async = Recorder(raises=RuntimeError("serial down"))
+    unit = _make_ace2(ace=ace)
+
+    unit._apply_feed_check()  # swallowed with a warning
+
+    assert len(unit.logger.lines["warning"]) == 1
+
+
+# ── Unit tests for the ACE get_temp caching path (extras/AFC_ACE.py + AFC_ACE2.py): ───
+#
+# was tests/test_AFC_ACE_temp_cache.py
+# ── _on_hw_status_callback routing ────────────────────────────────────────────
+
+def _make_unit_temp_cache(operation_active=False):
+    unit = afcACE.__new__(afcACE)
+    unit.name = "Ace_1"
+    unit.logger = FakeLogger()
+    unit._cached_hw_status = {}
+    unit._cached_temp_info = {}
+    unit._current_action = ""
+    unit._operation_active = operation_active
+    unit._sync_slot_states = Recorder()
+    unit._maybe_assist_watchdog = Recorder()
+    unit._check_stuck = Recorder()
+    return unit
+
+
+def test_status_reply_updates_status_cache_and_syncs():
+    unit = _make_unit_temp_cache()
+    status = {"status": "ready", "slots": [{"status": "ready"}]}
+
+    unit._on_hw_status_callback({"result": status})
+
+    assert unit._cached_hw_status == status
+    assert unit._cached_temp_info == {}          # untouched
+    assert unit._sync_slot_states.call_count == 1
+    assert unit._sync_slot_states.last_args == (status,)
+    assert unit._maybe_assist_watchdog.call_count == 1
+    assert unit._check_stuck.call_count == 1
+
+
+def test_temp_reply_updates_temp_cache_only():
+    unit = _make_unit_temp_cache()
+    unit._cached_hw_status = {"status": "ready", "slots": []}
+    prev_status = unit._cached_hw_status
+    temp = {"box1_temp": 0.0, "ptc1_temp": 55.0, "env_temp": 27.0,
+            "env_humidity": 30.0}
+
+    unit._on_hw_status_callback({"result": temp})
+
+    assert unit._cached_temp_info == temp
+    assert unit._cached_hw_status is prev_status  # status cache NOT overwritten
+    # No slot-state work runs on a thermal reply.
+    assert unit._sync_slot_states.call_count == 0
+    assert unit._maybe_assist_watchdog.call_count == 0
+    assert unit._check_stuck.call_count == 0
+
+
+def test_temp_reply_detected_by_box_or_env_only():
+    # A reply with box1_temp but no ptc/env still routes to the temp cache.
+    unit = _make_unit_temp_cache()
+    unit._on_hw_status_callback({"result": {"box1_temp": 24.0}})
+    assert unit._cached_temp_info == {"box1_temp": 24.0}
+    assert unit._sync_slot_states.call_count == 0
+
+
+def test_status_reply_with_operation_active_caches_but_skips_sync():
+    unit = _make_unit_temp_cache(operation_active=True)
+    status = {"status": "busy", "slots": []}
+
+    unit._on_hw_status_callback({"result": status})
+
+    assert unit._cached_hw_status == status      # still cached
+    assert unit._sync_slot_states.call_count == 0  # but sync suppressed
+
+
+def test_non_dict_response_ignored():
+    unit = _make_unit_temp_cache()
+    unit._on_hw_status_callback("not a dict")
+    unit._on_hw_status_callback({"result": "not a dict"})
+    assert unit._cached_hw_status == {}
+    assert unit._cached_temp_info == {}
+    assert unit._sync_slot_states.call_count == 0
+
+
+def test_bare_status_without_result_wrapper():
+    # Some callers pass the status dict directly (no 'result' envelope).
+    unit = _make_unit_temp_cache()
+    status = {"slots": [], "status": "ready"}
+    unit._on_hw_status_callback(status)
+    assert unit._cached_hw_status == status
+    assert unit._sync_slot_states.call_count == 1
+
+
+# ── _poll_extras ──────────────────────────────────────────────────────────────
+
+def test_base_poll_extras_is_noop():
+    conn = ACEConnection.__new__(ACEConnection)
+    conn.send_command_async = Recorder()
+    # Should not raise and should not send anything (V1 has no get_temp).
+    assert conn._poll_extras() is None
+    assert conn.send_command_async.call_count == 0
+
+
+def test_ace2_poll_extras_sends_get_temp():
+    conn = ACE2Connection.__new__(ACE2Connection)
+    conn.send_command_async = Recorder()
+
+    conn._poll_extras()
+
+    # Polls both the thermal channels and the per-lane buffer/sensor state.
+    assert conn.send_command_async.call_count == 2
+    methods = [c[0][0] for c in conn.send_command_async.calls]
+    assert methods == ["get_temp", "get_sensor_state"]
+
+
+# ── Unit tests for the startup-prep RFID inventory sweep gating (extras/AFC_ACE.py ───
+#
+# was tests/test_AFC_ACE_sync_inventory.py
+class _FakeConn:
+    """ACE serial connection fake that records each get_filament_info call and
+    returns a canned per-slot payload."""
+
+    def __init__(self, connected=True, payloads=None):
+        self.connected = connected
+        self._payloads = payloads or {}
+        self.filament_calls = []
+
+    def get_filament_info(self, slot):
+        self.filament_calls.append(slot)
+        return self._payloads.get(slot, {"index": slot})
+
+
+def _make_v1(conn):
+    unit = afcACE.__new__(afcACE)
+    unit._ace = conn
+    unit.name = "Ace_1"
+    unit.logger = FakeLogger()
+    unit._slot_inventory = [{} for _ in range(afcACE.SLOTS_PER_UNIT)]
+    # _store_slot_rfid runs for real; FakeLogger absorbs its debug/info lines.
+    return unit
+
+
+def _make_v2(conn):
+    unit = afcACE2.__new__(afcACE2)
+    unit._ace = conn
+    unit.name = "Ace2_1"
+    unit.logger = FakeLogger()
+    unit._slot_inventory = [{} for _ in range(afcACE2.SLOTS_PER_UNIT)]
+    return unit
+
+
+# ── class flag ────────────────────────────────────────────────────────────────
+
+def test_v1_uses_firmware_rfid_true():
+    assert afcACE._uses_firmware_rfid is True
+
+
+def test_v2_uses_firmware_rfid_false():
+    assert afcACE2._uses_firmware_rfid is False
+
+
+# ── V1 sweeps the firmware ──────────────────────────────────────────────────────
+
+def test_v1_sync_inventory_reads_every_slot():
+    conn = _FakeConn(connected=True)
+    unit = _make_v1(conn)
+
+    unit._sync_inventory()
+
+    assert conn.filament_calls == list(range(afcACE.SLOTS_PER_UNIT))
+
+
+def test_v1_sync_inventory_stores_payload():
+    conn = _FakeConn(
+        connected=True,
+        payloads={0: {"index": 0, "sku": "HPL19-107", "type": "PLA"}})
+    unit = _make_v1(conn)
+
+    unit._sync_inventory()
+
+    assert unit._slot_inventory[0]["sku"] == "HPL19-107"
+    assert unit._slot_inventory[0]["material"] == "PLA"
+
+
+def test_v1_sync_inventory_skips_when_disconnected():
+    conn = _FakeConn(connected=False)
+    unit = _make_v1(conn)
+
+    unit._sync_inventory()
+
+    assert conn.filament_calls == []
+
+
+def test_v1_sync_inventory_skips_when_no_conn():
+    unit = _make_v1(_FakeConn())
+    unit._ace = None
+
+    unit._sync_inventory()  # must not raise
+
+
+# ── V2 never touches the firmware ───────────────────────────────────────────────
+
+def test_v2_sync_inventory_skips_firmware_even_when_connected():
+    conn = _FakeConn(connected=True,
+                     payloads={0: {"index": 0, "sku": "HPL19-107"}})
+    unit = _make_v2(conn)
+
+    unit._sync_inventory()
+
+    # The whole point: no firmware get_filament_info sweep on the ACE 2.
+    assert conn.filament_calls == []
+    # And the slot cache is left untouched by the (skipped) sweep.
+    assert unit._slot_inventory[0] == {}
+
+
+# ── Tests for the concurrent (overlapping) ACE unload retract in extras/AFC_ACE.py ───
+#
+# was tests/test_AFC_ACE_unload_overlap.py
+class _Extruder_unload_overlap:
+    def __init__(self, tool_stn_unload, tool_unload_speed=25.0):
+        self.tool_stn_unload = tool_stn_unload
+        self.tool_unload_speed = tool_unload_speed
+
+
+class _DeltaTime:
+    def log_with_time(self, msg, debug=True):
+        pass
+
+
+class _AFC:
+    def __init__(self, events):
+        self._events = events
+        self.error = FakeError()
+        self.error.handle_lane_failure = Recorder()
+        self.function = FakeFunction()
+        self.function.log_toolhead_pos = Recorder()
+        self.afcDeltaTime = _DeltaTime()
+        self.move_calls = []
+
+    def move_e_pos(self, e_amount, speed, log_string="", wait_tool=False):
+        self.move_calls.append(
+            {"e_amount": e_amount, "speed": speed, "wait_tool": wait_tool})
+        self._events.append(("move", wait_tool))
+
+
+def _make_ace_unload_overlap(events, tool_stn_unload=60.0):
+    unit = afcACE.__new__(afcACE)
+    unit.afc = _AFC(events)
+    unit.logger = FakeLogger()
+    unit.serial_port = "/dev/ttyACM0"
+    unit.retract_speed = 50.0
+    ace = FakeAce(connected=True)
+
+    def _unwind(*a, **k):
+        events.append(("unwind",))
+    ace.unwind_filament = _unwind
+    unit._ace = ace
+    unit._hub_load_suppressed = set()
+    unit._get_slot = Recorder(result=3)
+    unit._wait_for_ace_ready = Recorder()
+    unit._wait_for_feed_complete = Recorder()
+    unit._set_hub_state = Recorder()
+    unit.lane_tool_unloaded = Recorder()
+
+    def _stop(slot):
+        events.append(("stop_assist", slot))
+    unit._stop_feed_assist = _stop
+    return unit, _Extruder_unload_overlap(tool_stn_unload)
+
+
+def _idx(events, tag):
+    return next(i for i, e in enumerate(events) if e[0] == tag)
+
+
+def test_two_retracts_first_blocks_second_overlaps_unwind():
+    events = []
+    unit, ext = _make_ace_unload_overlap(events, tool_stn_unload=60.0)
+    lane = FakeLane("lane3", hub_obj=FakeHub())
+
+    assert unit._ace_unload_inner(lane, ext) is True
+
+    # assist stopped, THEN two extruder retracts, THEN the ACE rollback — both
+    # retracts precede the rollback so the second (async) one overlaps it.
+    moves = [i for i, e in enumerate(events) if e[0] == "move"]
+    assert len(moves) == 2
+    assert _idx(events, "stop_assist") < moves[0] < moves[1] < _idx(events, "unwind")
+    assert len(unit.afc.move_calls) == 2
+    first, second = unit.afc.move_calls
+    assert first["wait_tool"] is True            # first retract blocks (freed slack)
+    assert first["e_amount"] == -30.0            # -tool_stn_unload / 2
+    assert first["speed"] == ext.tool_unload_speed
+    assert second["wait_tool"] is False          # second retract overlaps the unwind
+    assert second["e_amount"] == -60.0           # full -tool_stn_unload
+    assert second["speed"] == ext.tool_unload_speed
+
+
+def test_no_retract_move_when_tool_stn_unload_zero_but_still_unwinds():
+    events = []
+    unit, ext = _make_ace_unload_overlap(events, tool_stn_unload=0.0)
+    assert unit._ace_unload_inner(FakeLane("lane3", hub_obj=FakeHub()), ext) is True
+
+    # No extruder move when disabled, but the ACE rollback still runs.
+    assert unit.afc.move_calls == []
+    assert any(e[0] == "unwind" for e in events)
+
+
+# ── Tests for AFC_ACE.eject_lane's reload-suppression (extras/AFC_ACE.py) ─────
+#
+# was tests/test_AFC_ACE_eject.py
+def _make_ace_eject(connected=True):
+    unit = afcACE.__new__(afcACE)
+    unit.logger = FakeLogger()
+    unit.retract_speed = 50.0
+    unit.eject_buffer = 475.0
+    unit._ace = FakeAce(connected=connected)
+    unit._ace.unwind_filament = Recorder()
+    unit._hub_load_suppressed = set()
+    unit._get_slot = Recorder(result=3)
+    unit._operation = lambda: contextlib.nullcontext()
+    unit._stop_feed_assist = Recorder()
+    unit._wait_for_ace_ready = Recorder()
+    unit._wait_for_feed_complete = Recorder()
+    unit._set_hub_state = Recorder()
+    return unit
+
+
+def _hub_staged_lane():
+    lane = FakeLane("lane3", hub_obj=FakeHub())
+    lane.dist_hub = 100.0
+    lane.tool_loaded = False
+    lane.loaded_to_hub = True
+    return lane
+
+
+def test_eject_suppresses_auto_reload():
+    unit = _make_ace_eject()
+    lane = _hub_staged_lane()
+    unit.eject_lane(lane)
+    # The fix: the ejected lane is suppressed so the ready-slot sync won't
+    # immediately pull the filament back in while the spool is still present.
+    assert "lane3" in unit._hub_load_suppressed
+
+
+def test_eject_clears_hub_state():
+    unit = _make_ace_eject()
+    lane = _hub_staged_lane()
+    unit.eject_lane(lane)
+    assert lane.loaded_to_hub is False
+    # _set_hub_state(lane, False) was called — hub signal cleared.
+    assert unit._set_hub_state.calls
+    assert unit._set_hub_state.last_args[1] is False
+
+
+def test_eject_retracts_hub_stage_distance():
+    unit = _make_ace_eject()
+    lane = _hub_staged_lane()
+    unit.eject_lane(lane)
+    # Hub-staged (not tool-loaded): dist_hub (100) + eject_buffer (475) at
+    # retract_speed (50).
+    assert unit._ace.unwind_filament.calls
+    args = unit._ace.unwind_filament.last_args
+    assert args[1] == 575.0
+    assert args[2] == 50.0
+
+
+def test_eject_noop_when_disconnected():
+    unit = _make_ace_eject(connected=False)
+    lane = _hub_staged_lane()
+    unit.eject_lane(lane)
+    # Nothing happens when the ACE isn't connected — no suppression, no retract,
+    # and the caller's loaded_to_hub is left untouched.
+    assert "lane3" not in unit._hub_load_suppressed
+    assert not unit._ace.unwind_filament.calls
+    assert lane.loaded_to_hub is True
+
+
+# ── Tests for the shared-reader RFID ambiguity guard in extras/AFC_ACE.py / ───
+#
+# was tests/test_AFC_ACE_shared_reader.py
+def _inv(cls):
+    return [{} for _ in range(cls.SLOTS_PER_UNIT)]
+
+
+def test_base_ace_has_no_shared_reader_sibling():
+    unit = afcACE.__new__(afcACE)
+    assert unit._reader_sibling_slot(0) is None
+    unit._slot_inventory = _inv(afcACE)
+    unit._slot_inventory[0] = {"sku": "X"}
+    unit._slot_inventory[1] = {"sku": "X"}
+    assert unit._shared_rfid_ambiguous(0) is False   # per-slot reader: never shared
+
+
+def test_ace2_reader_sibling_pairs():
+    unit = afcACE2.__new__(afcACE2)
+    assert unit._reader_sibling_slot(0) == 1
+    assert unit._reader_sibling_slot(1) == 0
+    assert unit._reader_sibling_slot(2) == 3
+    assert unit._reader_sibling_slot(3) == 2
+
+
+def test_ace2_ambiguous_when_sibling_reports_same_sku():
+    unit = afcACE2.__new__(afcACE2)
+    unit._slot_inventory = _inv(afcACE2)
+    unit._slot_inventory[0] = {"sku": "HPL19-107"}
+    unit._slot_inventory[1] = {"sku": "HPL19-107"}   # slot 1 read slot 0's tag
+    assert unit._shared_rfid_ambiguous(1) is True
+    assert unit._shared_rfid_ambiguous(0) is True
+
+
+def test_ace2_ambiguous_when_sibling_reports_same_uid():
+    unit = afcACE2.__new__(afcACE2)
+    unit._slot_inventory = _inv(afcACE2)
+    unit._slot_inventory[2] = {"sku": "", "uid": "deadbeef"}
+    unit._slot_inventory[3] = {"sku": "", "uid": "deadbeef"}
+    assert unit._shared_rfid_ambiguous(2) is True
+
+
+def test_ace2_not_ambiguous_when_sibling_differs():
+    unit = afcACE2.__new__(afcACE2)
+    unit._slot_inventory = _inv(afcACE2)
+    unit._slot_inventory[2] = {"sku": "BAMBU-A", "uid": "aa"}
+    unit._slot_inventory[3] = {"sku": "BAMBU-B", "uid": "bb"}
+    assert unit._shared_rfid_ambiguous(2) is False
+    assert unit._shared_rfid_ambiguous(3) is False
+
+
+def test_ace2_not_ambiguous_when_sibling_empty():
+    unit = afcACE2.__new__(afcACE2)
+    unit._slot_inventory = _inv(afcACE2)
+    unit._slot_inventory[0] = {"sku": "HPL19-107"}
+    unit._slot_inventory[1] = {}                       # empty sibling
+    assert unit._shared_rfid_ambiguous(0) is False
+

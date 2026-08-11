@@ -1,41 +1,18 @@
 """
-Branch-coverage tests for extras/AFC_ACE2.py (the ACE 2 Pro V2 serial
-transport/protocol), covering the paths the other ACE2 test files leave
-untested:
+Tests for the ACE 2 Pro unit, extras/AFC_ACE2.py.
 
-  protobuf encode/decode helpers   — pb_varint (negative reject), pb_bool
-                                      (falsy), pb_decode_varint (truncation),
-                                      pb_decode (64/32-bit + unsupported wire
-                                      types), _fval / _fstr, dump_fields
-  method_to_v2                     — every remaining method mapping + raw
-                                      (valid/invalid/empty hex) + unknown fallback
-  _decode_status                   — GET_STATUS slot/dryer/busy decode
-  v2_response_to_v1                — DISCOVER_DEVICE, GET_INFO, GET_STATUS,
-                                      GET_FEED_INFO, GET_FILAMENT_INFO /
-                                      FILAMENT_IDENTIFY, MFRC522_REG_READ,
-                                      the decode-failure guard
-  decode_frames                    — framing, resync, oversize, CRC, end-marker,
-                                      request-skip, partial-frame edge cases
-  ACE2Connection                   — _pre_info_handshake, _poll_extras,
-                                      send_command (not-connected / encode /
-                                      write / timeout / error-code / non-dict),
-                                      send_command_async, _response_matches_pending,
-                                      _parse_frames, enable_rfid / disable_rfid
-  afcACE2                          — _apply_feed_check, _handle_encoder_jam,
-                                      _make_connection, _reader_sibling_slot
-
-Style: typed local fakes (matching the sibling ACE2 tests), full state
-verification, every branch driven both ways.
+Init and wire identification, the raw frame path, buffer handling, material
+reporting, the stuck-lane case, and a branch-coverage sweep over the rest.
+Consolidated from seven files. A module-level helper two files both defined
+carries its old file's tag, because those were different implementations that
+happened to share a name. Section banners name the file each block came from.
 """
 
 from __future__ import annotations
-
 import logging
 import struct
 from typing import Any, List, Optional, Tuple
-
 import pytest
-
 from extras.AFC_ACE2 import (
     Cmd,
     ACE2Connection,
@@ -66,10 +43,44 @@ from extras.AFC_ACE2 import (
     FEED_MODE_ASSIST,
 )
 from extras.AFC_ACE import ACESerialError, ACETimeoutError
-
 from tests.ace_helpers import FakeAFC, FakeLogger, Recorder
+import types
+import extras.AFC_ACE2 as ace2mod
+from extras.AFC_ACE2 import afcACE2, ACE2_ENCODER_SCALE
+import collections
+from extras.AFC_ACE2 import ACE2Connection, encode_request
+from extras.AFC_ACE2 import PREAMBLE, FLAG_REQUEST
+from extras.AFC_ACE import ACETimeoutError
+from extras.AFC_ACE2 import (
+    Cmd,
+    encode_frame,
+    encode_request,
+    v2_response_to_v1,
+    dump_fields,
+    pb_decode,
+    pb_uint32,
+    crc16_kermit,
+    PREAMBLE,
+    END_MARKER,
+    FLAG_REQUEST,
+    MAX_PAYLOAD_LEN,
+)
+from extras.AFC_ACE2 import v2_response_to_v1, pb_uint32, Cmd
+from extras.AFC_ACE import _derive_buffer_state
+from extras.AFC_ACE2 import (
+    Cmd,
+    method_to_v2,
+    v2_response_to_v1,
+    pb_string,
+    pb_uint32,
+    pb_decode,
+)
+from extras.AFC_ACE2 import afcACE2
 
 
+# ── Branch-coverage tests for extras/AFC_ACE2.py (the ACE 2 Pro V2 serial ─────
+#
+# was tests/test_AFC_ACE2_coverage.py
 # ── Local fakes ───────────────────────────────────────────────────────────────
 
 class RecordingLogger:
@@ -136,7 +147,7 @@ class FakeSerial:
         pass
 
 
-def _make_conn(next_id: int = 0,
+def _make_conn_coverage(next_id: int = 0,
                logger: Optional[Any] = None) -> ACE2Connection:
     """Build a connected ACE2Connection through its real __init__, then attach
     test doubles for the serial/reactor and mark it connected."""
@@ -150,7 +161,7 @@ def _make_conn(next_id: int = 0,
     return conn
 
 
-def _wire_seq(frame: bytes) -> int:
+def _wire_seq_coverage(frame: bytes) -> int:
     inner = frame[len(PREAMBLE):]
     return inner[1] | (inner[2] << 8)
 
@@ -171,7 +182,7 @@ def _pb_double(field: int, value: float) -> bytes:
     return bytes([(field << 3) | 1]) + struct.pack('<d', value)
 
 
-def _pb_float(field: int, value: float) -> bytes:
+def _pb_float_coverage(field: int, value: float) -> bytes:
     """Encode a protobuf fixed32 float field (wire type 5)."""
     return bytes([(field << 3) | 5]) + struct.pack('<f', value)
 
@@ -237,7 +248,7 @@ class TestPbDecode:
         assert pb_decode(pb_string(2, "AB")) == {2: [(2, b"AB")]}
 
     def test_float_field(self) -> None:
-        fields = pb_decode(_pb_float(3, 1.5))
+        fields = pb_decode(_pb_float_coverage(3, 1.5))
         assert fields[3][0][0] == 5
         assert fields[3][0][1] == pytest.approx(1.5)
 
@@ -691,20 +702,20 @@ class TestDecodeFrames:
 
 class TestSendCommand:
     def test_not_connected_flag_raises(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._connected = False  # A alone true (serial still present)
         with pytest.raises(ACESerialError, match="not connected"):
             conn.send_command("get_status")
         assert conn._serial.frames == []
 
     def test_serial_none_raises(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._serial = None  # B alone true (connected still True)
         with pytest.raises(ACESerialError, match="not connected"):
             conn.send_command("get_status")
 
     def test_encode_failure_raises_serial_error(self) -> None:
-        conn = _make_conn(logger=RecordingLogger())
+        conn = _make_conn_coverage(logger=RecordingLogger())
         # A >100-byte material name overflows MAX_PAYLOAD_LEN in encode_frame.
         with pytest.raises(ACESerialError, match="encode failed"):
             conn.send_command("set_material_name", {"name": "x" * 200})
@@ -712,7 +723,7 @@ class TestSendCommand:
         assert conn._logger.messages == []
 
     def test_write_failure_reconnects_and_raises(self) -> None:
-        conn = _make_conn(logger=RecordingLogger())
+        conn = _make_conn_coverage(logger=RecordingLogger())
         conn._serial = FakeSerial(write_error=OSError("cable"))
         with pytest.raises(ACESerialError, match="write failed"):
             conn.send_command("get_status")
@@ -722,7 +733,7 @@ class TestSendCommand:
         assert conn._logger.messages == []
 
     def test_timeout_raises_and_tracks(self) -> None:
-        conn = _make_conn(next_id=5, logger=RecordingLogger())
+        conn = _make_conn_coverage(next_id=5, logger=RecordingLogger())
         # No echo -> completion.wait returns None -> timeout.
         with pytest.raises(ACETimeoutError, match="timed out"):
             conn.send_command("get_status", timeout=0.0)
@@ -732,10 +743,10 @@ class TestSendCommand:
             ("debug", "ACE2 TX: id=5 get_status {}")]
 
     def test_success_returns_result_and_logs_tx(self) -> None:
-        conn = _make_conn(next_id=5, logger=RecordingLogger())
+        conn = _make_conn_coverage(next_id=5, logger=RecordingLogger())
 
         def _echo(frame: bytes) -> None:
-            rid = _wire_seq(frame)
+            rid = _wire_seq_coverage(frame)
             conn._handle_response(
                 {"id": rid, "_cmd": Cmd.GET_STATUS, "code": 0,
                  "result": {"ok": 1}})
@@ -746,10 +757,10 @@ class TestSendCommand:
             ("debug", "ACE2 TX: id=5 get_status {}")]
 
     def test_error_code_raises(self) -> None:
-        conn = _make_conn(next_id=5)
+        conn = _make_conn_coverage(next_id=5)
 
         def _echo(frame: bytes) -> None:
-            rid = _wire_seq(frame)
+            rid = _wire_seq_coverage(frame)
             conn._handle_response(
                 {"id": rid, "_cmd": Cmd.GET_STATUS, "code": 2,
                  "msg": "error_2", "result": {}})
@@ -759,10 +770,10 @@ class TestSendCommand:
             conn.send_command("get_status")
 
     def test_non_dict_result_returned_verbatim(self) -> None:
-        conn = _make_conn(next_id=5)
+        conn = _make_conn_coverage(next_id=5)
 
         def _echo(frame: bytes) -> None:
-            rid = _wire_seq(frame)
+            rid = _wire_seq_coverage(frame)
             conn._pending[rid].complete(4242)  # non-dict completion value
 
         conn._serial.on_write = _echo
@@ -773,20 +784,20 @@ class TestSendCommand:
 
 class TestSendCommandAsync:
     def test_not_connected_flag_returns_early(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._connected = False
         conn.send_command_async("get_status")
         assert conn._serial.frames == []
         assert list(conn._async_ids) == []
 
     def test_serial_none_returns_early(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._serial = None
         conn.send_command_async("get_status")  # must not raise
         assert list(conn._async_ids) == []
 
     def test_success_writes_frame_and_tracks_id(self) -> None:
-        conn = _make_conn(next_id=0, logger=RecordingLogger())
+        conn = _make_conn_coverage(next_id=0, logger=RecordingLogger())
         conn.send_command_async("get_status")
         assert conn._serial.frames == [encode_request(0, "get_status", {})]
         assert list(conn._async_ids) == [0]
@@ -794,7 +805,7 @@ class TestSendCommandAsync:
             ("debug", "ACE2 TX (async): id=0 get_status")]
 
     def test_encode_failure_logged_and_swallowed(self) -> None:
-        conn = _make_conn(next_id=0, logger=RecordingLogger())
+        conn = _make_conn_coverage(next_id=0, logger=RecordingLogger())
         conn.send_command_async("set_material_name", {"name": "x" * 200})
         assert conn._serial.frames == []
         assert len(conn._logger.messages) == 1
@@ -803,7 +814,7 @@ class TestSendCommandAsync:
         assert msg.startswith("ACE2 async encode failed:")
 
     def test_write_failure_reconnects_and_logs(self) -> None:
-        conn = _make_conn(next_id=0, logger=RecordingLogger())
+        conn = _make_conn_coverage(next_id=0, logger=RecordingLogger())
         conn._serial = FakeSerial(write_error=OSError("cable"))
         conn.send_command_async("get_status")  # must not raise
         assert len(conn._logger.messages) == 1
@@ -816,27 +827,27 @@ class TestSendCommandAsync:
 
 class TestResponseMatchesPending:
     def test_no_recorded_opcode_accepts(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         # id not in _pending_cmd -> expected None -> accept.
         assert conn._response_matches_pending(9, {"_cmd": 6}) is True
 
     def test_non_dict_response_accepts(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._pending_cmd[9] = 6
         assert conn._response_matches_pending(9, "not-a-dict") is True
 
     def test_dict_without_cmd_accepts(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._pending_cmd[9] = 6
         assert conn._response_matches_pending(9, {"code": 0}) is True
 
     def test_matching_opcode_accepts(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._pending_cmd[9] = 6
         assert conn._response_matches_pending(9, {"_cmd": 6}) is True
 
     def test_mismatched_opcode_rejected(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn._pending_cmd[9] = 6
         assert conn._response_matches_pending(9, {"_cmd": 8}) is False
 
@@ -845,7 +856,7 @@ class TestResponseMatchesPending:
 
 class TestParseFrames:
     def test_complete_frame_routed_and_buffer_consumed(self) -> None:
-        conn = _make_conn(logger=RecordingLogger())
+        conn = _make_conn_coverage(logger=RecordingLogger())
         payload = pb_uint32(1, 21)
         conn._pending[7] = FakeCompletion()
         conn._pending_cmd[7] = Cmd.GET_TEMP
@@ -859,7 +870,7 @@ class TestParseFrames:
         assert conn._logger.messages == [("debug", f"ACE2 RX: {expected}")]
 
     def test_partial_frame_retained_in_buffer(self) -> None:
-        conn = _make_conn(logger=RecordingLogger())
+        conn = _make_conn_coverage(logger=RecordingLogger())
         # Header claims a 5-byte payload but the bytes aren't all present yet.
         header = bytes(PREAMBLE) + bytes([FLAG_RESPONSE, 0, 0, Cmd.GET_TEMP, 5])
         conn._read_buffer = header + b'\x00' * 3
@@ -872,14 +883,14 @@ class TestParseFrames:
 
 class TestPreInfoHandshake:
     def test_sends_discover_device(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn.send_command = Recorder(result={})
         conn._pre_info_handshake()
         assert conn.send_command.last_args == ("discover_device",)
         assert conn.send_command.last_kwargs == {"timeout": 3.0}
 
     def test_exception_is_swallowed_and_logged(self) -> None:
-        conn = _make_conn(logger=RecordingLogger())
+        conn = _make_conn_coverage(logger=RecordingLogger())
         conn.send_command = Recorder(raises=RuntimeError("no reply"))
         conn._pre_info_handshake()  # must not raise
         assert len(conn._logger.messages) == 1
@@ -892,7 +903,7 @@ class TestPreInfoHandshake:
 
 class TestPollExtras:
     def test_polls_temp_and_sensor_state(self) -> None:
-        conn = _make_conn()
+        conn = _make_conn_coverage()
         conn.send_command_async = Recorder()
         conn._poll_extras()
         assert [c[0] for c in conn.send_command_async.calls] == [
@@ -903,7 +914,7 @@ class TestPollExtras:
 
 class TestEnableRfid:
     def test_enables_every_slot(self) -> None:
-        conn = _make_conn(next_id=0)
+        conn = _make_conn_coverage(next_id=0)
         conn.enable_rfid()
         expected = [
             encode_request(i, "set_rfid_enable", {"index": i, "enable": True})
@@ -914,7 +925,7 @@ class TestEnableRfid:
 
 class TestDisableRfid:
     def test_disables_every_slot(self) -> None:
-        conn = _make_conn(next_id=0)
+        conn = _make_conn_coverage(next_id=0)
         conn.disable_rfid()
         expected = [
             encode_request(i, "set_rfid_enable", {"index": i, "enable": False})
@@ -1063,3 +1074,811 @@ class TestReaderSiblingSlot:
 
 def test_encoder_scale_constant() -> None:
     assert ACE2_ENCODER_SCALE == pytest.approx(1.2342)
+
+
+# ── init ──────────────────────────────────────────────────────────────────────
+#
+# was tests/test_AFC_ACE2_init.py
+# Construction tests for extras/AFC_ACE2.py.
+#
+# The ACE 2 Pro inherits nearly everything from the V1 ACE and overrides a
+# handful of values that are wrong for the newer hardware. Those overrides are
+# the whole point of the subclass, and each one is a field failure if it
+# regresses:
+#
+#   * 230400 baud. At the V1's 115200 the unit never sees a valid frame and
+#     never replies -- it looks dead rather than misconfigured.
+#   * the encoder feed-check window, where an unreachable threshold makes EVERY
+#     feed raise FEED_ERROR.
+#   * stuck-spool detection defaulting ON, because unlike the V1 the ACE2 has a
+#     real encoder and reports a true mechanical-jam state.
+#
+# The parent's __init__ needs the whole Klipper/AFC stack, so it is stubbed:
+# what is under test here is the subclass's own configuration.
+
+
+
+
+
+class _ConfigError(Exception):
+    pass
+
+
+class _Config:
+    def __init__(self, **opts):
+        self._o = opts
+        self.error = _ConfigError
+
+    def get_name(self):
+        return "AFC_ACE2 Ace2_1"
+
+    def get(self, key, default=None):
+        return self._o.get(key, default)
+
+    def getint(self, key, default=None, **kw):
+        v = self._o.get(key, default)
+        return int(v) if v is not None else None
+
+    def getfloat(self, key, default=None, **kw):
+        v = self._o.get(key, default)
+        return float(v) if v is not None else None
+
+    def getboolean(self, key, default=None, **kw):
+        v = self._o.get(key, default)
+        return default if v is None else bool(v)
+
+
+@pytest.fixture(autouse=True)
+def _stub_parent(monkeypatch):
+    """Neutralise afcACE.__init__ -- the parent needs a printer, a serial port
+    and lanes; the subclass's own configuration does not."""
+    monkeypatch.setattr(ace2mod.afcACE, "__init__",
+                        lambda self, config: None)
+
+
+def _make(**opts):
+    obj = afcACE2.__new__(afcACE2)
+    afcACE2.__init__(obj, _Config(**opts))
+    return obj
+
+
+class TestDefaults:
+    def test_type_defaults_to_ace2(self):
+        assert _make().type == "ACE2"
+
+    def test_type_can_be_overridden(self):
+        assert _make(type="ACE2_custom").type == "ACE2_custom"
+
+    def test_baud_defaults_to_230400_not_the_v1_115200(self):
+        # The single most consequential override: at 115200 the ACE2 never
+        # sees a valid frame and never answers, which reads as dead hardware.
+        assert _make().baud_rate == 230400
+
+    def test_baud_can_be_overridden(self):
+        assert _make(baud_rate=115200).baud_rate == 115200
+
+    def test_dryer_ceiling_is_70_not_the_v1_55(self):
+        assert _make().max_dryer_temperature == 70.0
+
+    def test_dryer_ceiling_can_be_overridden(self):
+        assert _make(max_dryer_temperature=60).max_dryer_temperature == 60.0
+
+    def test_stuck_detection_defaults_on_for_the_encoder_equipped_ace2(self):
+        # The parent reads the same key defaulting False; the ACE2 has a real
+        # encoder reporting a true jam state, so it defaults True here.
+        assert _make()._stuck_detection is True
+
+    def test_stuck_detection_can_be_disabled(self):
+        assert _make(stuck_spool_detection=False)._stuck_detection is False
+
+    def test_feed_check_window_defaults(self):
+        obj = _make()
+        assert (obj.feed_check_length, obj.feed_error_length) == (200, 185)
+
+
+class TestFeedCheckValidation:
+    """The encoder can only ever reach feed_error_length * 1.2342. A
+    feed_check_length at or above that is unreachable, so EVERY feed would
+    raise FEED_ERROR -- a misconfiguration that presents as broken hardware."""
+
+    def test_the_default_pair_is_valid(self):
+        _make()                       # must not raise
+
+    def test_an_unreachable_threshold_is_rejected(self):
+        # 185 * 1.2342 = 228.3; asking for 229 can never be satisfied.
+        with pytest.raises(_ConfigError) as e:
+            _make(feed_check_length=229, feed_error_length=185)
+        assert "can never reach it" in str(e.value)
+
+    def test_exactly_at_the_ceiling_is_rejected(self):
+        err = int(100)
+        unreachable = int(err * ACE2_ENCODER_SCALE)      # 123
+        with pytest.raises(_ConfigError):
+            _make(feed_check_length=unreachable + 1, feed_error_length=err)
+
+    def test_just_under_the_ceiling_is_accepted(self):
+        obj = _make(feed_check_length=120, feed_error_length=100)
+        assert obj.feed_check_length == 120
+
+    def test_the_message_names_the_section_and_both_numbers(self):
+        with pytest.raises(_ConfigError) as e:
+            _make(feed_check_length=250, feed_error_length=185)
+        msg = str(e.value)
+        assert "AFC_ACE2 Ace2_1" in msg and "250" in msg
+        assert "tolerance_mm" in msg          # tells the operator what to change
+
+    def test_lowering_feed_check_widens_tolerance_without_moving_the_check(self):
+        # The documented tuning knob: same checkpoint, larger slip allowance.
+        wide = _make(feed_check_length=100, feed_error_length=185)
+        assert wide.feed_error_length == 185 and wide.feed_check_length == 100
+
+
+class TestLoader:
+    def test_load_config_prefix_builds_the_unit(self):
+        obj = ace2mod.load_config_prefix(_Config())
+        assert isinstance(obj, afcACE2)
+        assert obj.baud_rate == 230400
+
+
+# ── Regression test for the ACE2 16-bit wire-id wrap bug (extras/AFC_ACE2.py) ───
+#
+# was tests/test_AFC_ACE2_wire_id.py
+WRAPPED_wire_id = 86480          # a real post-wrap counter value seen on hardware
+MASKED_wire_id = WRAPPED_wire_id & 0xFFFF  # 20944
+
+
+# ── Fakes ─────────────────────────────────────────────────────────────────────
+
+class _FakeSerial:
+    def __init__(self):
+        self.frames = []
+        self.on_write = None
+
+    def write(self, frame):
+        self.frames.append(bytes(frame))
+        if self.on_write is not None:
+            self.on_write(bytes(frame))
+
+    def flush(self):
+        pass
+
+
+class _FakeCompletion:
+    def __init__(self):
+        self._value = None
+
+    def complete(self, value):
+        self._value = value
+
+    def wait(self, deadline):
+        return self._value
+
+
+class _FakeReactor:
+    def monotonic(self):
+        return 0.0
+
+    def completion(self):
+        return _FakeCompletion()
+
+
+class _FakeLogger:
+    def __init__(self):
+        self.debug_lines = []
+
+    def debug(self, msg, *a, **k):
+        self.debug_lines.append(msg)
+
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+    def error(self, *a, **k):
+        pass
+
+
+def _make_conn_wire_id(next_id):
+    conn = ACE2Connection.__new__(ACE2Connection)
+    conn._connected = True
+    conn._serial = _FakeSerial()
+    conn._reactor = _FakeReactor()
+    conn._logger = _FakeLogger()
+    conn._pending = {}
+    conn._pending_cmd = {}
+    conn._async_ids = collections.deque(maxlen=256)
+    conn._next_request_id = next_id
+    conn.status_callback = None
+    conn._track_timeout = lambda: None
+    conn._track_unsolicited = lambda: None
+    return conn
+
+
+def _wire_seq_wire_id(frame):
+    """Extract the 16-bit sequence id from an encoded request frame."""
+    inner = frame[len(PREAMBLE):]
+    assert inner[0] == FLAG_REQUEST
+    return inner[1] | (inner[2] << 8)
+
+
+# ── The wire id itself ────────────────────────────────────────────────────────
+
+def test_encode_masks_id_to_16_bits():
+    frame = encode_request(WRAPPED_wire_id, "get_status", {})
+    assert _wire_seq_wire_id(frame) == MASKED_wire_id
+
+
+# ── send_command round trip after the counter wraps ───────────────────────────
+
+def test_send_command_completes_after_wrap():
+    conn = _make_conn_wire_id(next_id=WRAPPED_wire_id)
+
+    def _echo(frame):
+        # The unit replies with exactly the 16-bit id it received.
+        rid = _wire_seq_wire_id(frame)
+        conn._handle_response({"id": rid, "code": 0, "result": {"ok": 1}})
+
+    conn._serial.on_write = _echo
+
+    result = conn.send_command("get_status", timeout=1.0)
+
+    # The pending completion matched the echoed (masked) id and completed.
+    assert result == {"ok": 1}
+    assert conn._pending == {}  # popped after completion
+    assert _wire_seq_wire_id(conn._serial.frames[0]) == MASKED_wire_id
+
+
+def test_reply_with_mismatched_opcode_is_dropped():
+    # A stale reply landing on a reused 16-bit id but carrying a DIFFERENT
+    # opcode must not complete the pending request (it would hand the caller
+    # another command's data). It's dropped; the request then times out.
+    conn = _make_conn_wire_id(next_id=WRAPPED_wire_id)
+
+    def _wrong_opcode(frame):
+        rid = _wire_seq_wire_id(frame)
+        # get_status is opcode 6; reply tagged as opcode 8 (feed) must be rejected.
+        conn._handle_response({"id": rid, "_cmd": 8, "code": 0,
+                               "result": {"stale": 1}})
+
+    conn._serial.on_write = _wrong_opcode
+    with pytest.raises(ACETimeoutError):
+        conn.send_command("get_status", timeout=0.0)
+    assert conn._pending == {} and conn._pending_cmd == {}
+
+
+def test_reply_with_matching_opcode_completes():
+    conn = _make_conn_wire_id(next_id=WRAPPED_wire_id)
+
+    def _right_opcode(frame):
+        rid = _wire_seq_wire_id(frame)
+        conn._handle_response({"id": rid, "_cmd": 6, "code": 0,
+                               "result": {"ok": 1}})
+
+    conn._serial.on_write = _right_opcode
+    assert conn.send_command("get_status", timeout=1.0) == {"ok": 1}
+
+
+def test_send_command_pending_keyed_by_masked_id():
+    conn = _make_conn_wire_id(next_id=WRAPPED_wire_id)
+    captured = {}
+
+    def _capture(frame):
+        captured["keys"] = list(conn._pending.keys())
+
+    conn._serial.on_write = _capture
+    # No echo -> the command times out; we only care that the pending key was
+    # the masked id at write time.
+    with pytest.raises(ACETimeoutError):
+        conn.send_command("get_status", timeout=0.0)
+
+    assert captured["keys"] == [MASKED_wire_id]  # NOT [86480]
+
+
+# ── send_command_async round trip after wrap ──────────────────────────────────
+
+def test_async_id_tracked_masked_and_recognised():
+    conn = _make_conn_wire_id(next_id=WRAPPED_wire_id)
+
+    conn.send_command_async("get_status")
+
+    assert list(conn._async_ids) == [MASKED_wire_id]
+    assert _wire_seq_wire_id(conn._serial.frames[0]) == MASKED_wire_id
+
+    # The echoed reply with the masked id is recognised (removed from
+    # _async_ids), NOT logged as an unknown request.
+    conn._handle_response({"id": MASKED_wire_id, "code": 0, "result": {"status": "ready"}})
+
+    assert list(conn._async_ids) == []
+    assert not any("unknown request" in m for m in conn._logger.debug_lines)
+
+
+def test_pre_wrap_ids_unaffected():
+    """Below 65536 the masking is a no-op — behaviour is unchanged."""
+    conn = _make_conn_wire_id(next_id=5)
+    conn.send_command_async("get_status")
+    assert list(conn._async_ids) == [5]
+    assert _wire_seq_wire_id(conn._serial.frames[0]) == 5
+
+
+# ── Unit tests for the ACE2 explicit-opcode frame builder and response decoding ───
+#
+# was tests/test_AFC_ACE2_raw.py
+WRAPPED_raw = 86480            # a real post-wrap counter value seen on hardware
+MASKED_raw = WRAPPED_raw & 0xFFFF  # 20944
+
+
+# ── frame helpers ─────────────────────────────────────────────────────────────
+
+def _split_request(frame):
+    """Return (flags, seq, cmd, payload) from an encoded request/raw frame."""
+    assert frame[:len(PREAMBLE)] == PREAMBLE
+    assert frame[-1] == END_MARKER
+    inner = frame[len(PREAMBLE):]
+    flags = inner[0]
+    seq = inner[1] | (inner[2] << 8)
+    cmd = inner[3]
+    payload_len = inner[4]
+    payload = inner[5:5 + payload_len]
+    # CRC covers flags..payload; the two bytes after payload are the CRC.
+    crc_bytes = inner[5 + payload_len:5 + payload_len + 2]
+    crc_in = crc_bytes[0] | (crc_bytes[1] << 8)
+    assert crc_in == crc16_kermit(bytes(inner[:5 + payload_len]))
+    return flags, seq, cmd, bytes(payload)
+
+
+def _pb_float_raw(field, value):
+    """Encode a protobuf fixed32 float field (wire type 5)."""
+    return bytes([(field << 3) | 5]) + struct.pack('<f', value)
+
+
+# ── encode_frame ──────────────────────────────────────────────────────────────
+
+def test_encode_frame_structure():
+    frame = encode_frame(7, Cmd.GET_TEMP, b'')
+    flags, seq, cmd, payload = _split_request(frame)
+    assert flags == FLAG_REQUEST
+    assert seq == 7
+    assert cmd == Cmd.GET_TEMP
+    assert payload == b''
+
+
+def test_encode_frame_embeds_payload():
+    body = bytes([0x01, 0x02, 0x03])
+    frame = encode_frame(9, 20, body)
+    flags, seq, cmd, payload = _split_request(frame)
+    assert cmd == 20
+    assert payload == body
+
+
+def test_encode_frame_masks_seq_to_16_bits():
+    frame = encode_frame(WRAPPED_raw, Cmd.GET_STATUS, b'')
+    _flags, seq, _cmd, _payload = _split_request(frame)
+    assert seq == MASKED_raw
+
+
+def test_encode_frame_rejects_oversized_payload():
+    with pytest.raises(ValueError):
+        encode_frame(1, 20, b'\x00' * (MAX_PAYLOAD_LEN + 1))
+
+
+def test_encode_request_delegates_to_encode_frame():
+    # get_temp maps to (GET_TEMP, b'') so both builders must agree byte-for-byte.
+    assert encode_request(42, "get_temp", {}) == encode_frame(42, Cmd.GET_TEMP, b'')
+    # get_info likewise.
+    assert encode_request(42, "get_info", {}) == encode_frame(42, Cmd.GET_INFO, b'')
+
+
+# ── v2_response_to_v1: GET_TEMP channel mapping ───────────────────────────────
+
+def test_get_temp_decode_maps_all_channels_varint():
+    payload = b''.join(
+        pb_uint32(i, v) for i, v in (
+            (1, 21), (2, 22), (3, 23), (4, 24), (5, 25), (6, 40)))
+    ret = v2_response_to_v1(Cmd.GET_TEMP, 3, payload)
+    assert ret['code'] == 0
+    assert ret['result'] == {
+        'box1_temp': 21, 'box2_temp': 22,
+        'ptc1_temp': 23, 'ptc2_temp': 24,
+        'env_temp': 25, 'env_humidity': 40,
+    }
+
+
+def test_get_temp_decode_float_channels():
+    payload = b''.join(
+        _pb_float_raw(i, v) for i, v in (
+            (1, 30.5), (2, 31.5), (3, 55.0), (4, 60.0), (5, 24.25), (6, 41.5)))
+    ret = v2_response_to_v1(Cmd.GET_TEMP, 1, payload)
+    r = ret['result']
+    assert r['box1_temp'] == pytest.approx(30.5)
+    assert r['ptc1_temp'] == pytest.approx(55.0)
+    assert r['env_temp'] == pytest.approx(24.25)
+    assert r['env_humidity'] == pytest.approx(41.5)
+
+
+def test_get_temp_missing_channels_default_zero():
+    # Only box1 present; the rest default to 0.0.
+    ret = v2_response_to_v1(Cmd.GET_TEMP, 1, pb_uint32(1, 27))
+    assert ret['result']['box1_temp'] == 27
+    assert ret['result']['ptc2_temp'] == 0.0
+    assert ret['result']['env_humidity'] == 0.0
+
+
+# ── v2_response_to_v1: generic else branch (raw opcode probing) ───────────────
+
+def test_unmapped_opcode_surfaces_raw_fields():
+    # Opcode 20 has no dedicated decoder; field 1 == 0 means "not an error".
+    payload = pb_uint32(1, 0) + pb_uint32(5, 99)
+    ret = v2_response_to_v1(20, 11, payload)
+    assert ret['code'] == 0
+    assert ret['msg'] == 'success'
+    assert ret['result'] == {'raw_fields': dump_fields(pb_decode(payload))}
+    assert ret['result']['raw_fields'] == {1: 0, 5: 99}
+
+
+def test_non_error_opcode_does_not_extract_field1_as_error():
+    # A generic opcode NOT in _ERROR_CODE_OPCODES must NOT treat field 1 as an
+    # error code — field 1 there is data (e.g. a sensor bitmask, step count, or
+    # slot echo). Treating it as a code made send_command raise on a good ack
+    # (the GET_SENSOR_STATE 'error_70928' class of bug). Opcode 20 is unmapped.
+    payload = pb_uint32(1, 400)
+    ret = v2_response_to_v1(20, 11, payload)
+    assert ret['code'] == 0
+    assert ret['msg'] == 'success'
+    # raw_fields still present so a probe/diagnostic sees the reply.
+    assert ret['result'] == {'raw_fields': {1: 400}}
+
+
+def test_feed_family_opcode_still_extracts_error_code():
+    # The feed/rollback family DOES report status in field 1 (0 ok, non-zero
+    # error). _start_feed_assist and the load sequence rely on send_command
+    # raising on error_2, so this path must keep mapping field 1 -> code.
+    for op in (Cmd.FEED_OR_ROLLBACK, Cmd.STOP_FEED_OR_ROLLBACK, Cmd.UPDATE_SPEED):
+        ret = v2_response_to_v1(op, 11, pb_uint32(1, 2))
+        assert ret['code'] == 2
+        assert ret['msg'] == 'error_2'
+    # a clean (code 0) feed ack does not raise
+    ok = v2_response_to_v1(Cmd.FEED_OR_ROLLBACK, 11, pb_uint32(1, 0))
+    assert ok['code'] == 0 and ok['msg'] == 'success'
+
+
+def test_unmapped_opcode_empty_payload_no_raw_fields():
+    # Empty payload short-circuits before decode; result stays the empty default.
+    ret = v2_response_to_v1(20, 11, b'')
+    assert ret['code'] == 0
+    assert ret['result'] == {}
+
+
+# ── Tests for the ACE2 per-lane buffer sensors: ───────────────────────────────
+#
+# was tests/test_AFC_ACE2_buffer.py
+# ── GET_SENSOR_STATE decode ───────────────────────────────────────────────────
+
+def _decode(mask):
+    return v2_response_to_v1(Cmd.GET_SENSOR_STATE, 1, pb_uint32(1, mask))['result']
+
+
+def test_decode_slot_bit_offsets():
+    # slot0 buf_back(3), slot1 empty(5), slot2 insert(8), slot3 buf_rst(14),
+    # shared buf_feed(16)
+    mask = (1 << 3) | (1 << 5) | (1 << 8) | (1 << 14) | (1 << 16)
+    r = _decode(mask)
+    ss = r['slot_sensors']
+    assert ss[0] == {'insert': False, 'empty': False,
+                    'buf_rst': False, 'buf_back': True}
+    assert ss[1]['empty'] is True and ss[1]['buf_back'] is False
+    assert ss[2]['insert'] is True
+    assert ss[3]['buf_rst'] is True and ss[3]['buf_back'] is False
+    assert r['buf_feed'] is True
+    assert r['sensor_bitmask'] == mask
+
+
+def test_decode_all_clear():
+    r = _decode(0)
+    assert len(r['slot_sensors']) == 4
+    assert all(not any(s.values()) for s in r['slot_sensors'])
+    assert r['buf_feed'] is False
+
+
+def test_decode_keeps_raw_sensor_list():
+    r = _decode(1 << 16)
+    assert len(r['sensors']) == 17
+    assert r['sensors'][16] is True
+
+
+# ── _derive_buffer_state (hardware-confirmed mapping) ─────────────────────────
+
+def test_state_advancing_on_buf_back():
+    # BUF_BACK = retracted (tension / "feed me").
+    assert _derive_buffer_state(
+        {'insert': True, 'empty': False, 'buf_rst': False, 'buf_back': True}
+    ) == 'advancing'
+
+
+def test_state_rest_on_buf_rst():
+    assert _derive_buffer_state(
+        {'insert': True, 'empty': False, 'buf_rst': True, 'buf_back': False}
+    ) == 'rest'
+
+
+def test_state_neutral_when_extended():
+    # Neither per-slot switch set = buffer extended = normal loaded/feeding.
+    assert _derive_buffer_state(
+        {'insert': True, 'empty': False, 'buf_rst': False, 'buf_back': False}
+    ) == 'neutral'
+
+
+def test_state_buf_back_wins_over_rst():
+    # Should never both be set, but buf_back (actionable) takes precedence.
+    assert _derive_buffer_state({'buf_rst': True, 'buf_back': True}) == 'advancing'
+
+
+def test_state_empty_without_data():
+    assert _derive_buffer_state(None) == ''
+    assert _derive_buffer_state({}) == ''
+
+
+def test_state_decode_roundtrip():
+    # A decoded slot with buf_back set derives to 'advancing'.
+    r = _decode(1 << 3)          # slot0 buf_back
+    assert _derive_buffer_state(r['slot_sensors'][0]) == 'advancing'
+    assert _derive_buffer_state(r['slot_sensors'][1]) == 'neutral'
+
+
+# ── Unit tests for the ACE2 material-name and sensor-state protocol additions ───
+#
+# was tests/test_AFC_ACE2_material.py
+# ── pb_string ─────────────────────────────────────────────────────────────────
+
+def test_pb_string_encodes_tag_len_and_bytes():
+    out = pb_string(2, "AB")
+    # field 2, wire type 2 -> tag 0x12; length 2; then 'AB'
+    assert out == bytes([0x12, 0x02]) + b"AB"
+
+
+def test_pb_string_accepts_bytes():
+    assert pb_string(1, b"\x01\x02") == bytes([0x0A, 0x02, 0x01, 0x02])
+
+
+def test_pb_string_roundtrips_through_pb_decode():
+    fields = pb_decode(pb_string(2, "hello"))
+    assert fields[2][0][1] == b"hello"
+
+
+# ── method_to_v2 mappings ─────────────────────────────────────────────────────
+
+def test_method_get_material_info():
+    cmd, payload = method_to_v2("get_material_info", {"index": 3})
+    assert cmd == Cmd.GET_MATERIAL_INFO == 16
+    assert payload == pb_uint32(1, 3)
+
+
+def test_method_get_material_info_defaults_slot_zero():
+    cmd, payload = method_to_v2("get_material_info", {})
+    assert cmd == 16
+    assert payload == pb_uint32(1, 0)
+
+
+def test_method_set_material_name():
+    cmd, payload = method_to_v2("set_material_name", {"index": 2, "name": "PLA"})
+    assert cmd == Cmd.SET_MATERIAL_NAME == 18
+    # field1 = slot, field2 = name string — the layout confirmed on hardware.
+    assert payload == pb_uint32(1, 2) + pb_string(2, "PLA")
+
+
+def test_method_set_material_name_defaults():
+    cmd, payload = method_to_v2("set_material_name", {})
+    assert cmd == 18
+    assert payload == pb_uint32(1, 0) + pb_string(2, "")
+
+
+def test_method_get_sensor_state_aliases():
+    for name in ("get_sensor_state", "get_key_state"):
+        cmd, payload = method_to_v2(name, {})
+        assert cmd == Cmd.GET_SENSOR_STATE == 73
+        assert payload == b""
+
+
+# ── v2_response_to_v1: GET_MATERIAL_INFO ──────────────────────────────────────
+
+def _material_payload(slot, name, status=0):
+    # response shape observed live: field1=slot, field2={field1=name}, field3=status
+    inner = pb_string(1, name)                 # nested {1: name}
+    payload = pb_uint32(1, slot) + pb_string(2, inner)
+    if status:
+        payload += pb_uint32(3, status)
+    return payload
+
+
+def test_get_material_info_decode_extracts_name():
+    payload = _material_payload(0, "S0395MB251230046650C3")
+    ret = v2_response_to_v1(Cmd.GET_MATERIAL_INFO, 5, payload)
+    assert ret['code'] == 0
+    assert ret['result']['index'] == 0
+    assert ret['result']['material_name'] == "S0395MB251230046650C3"
+    assert ret['result']['status'] == 0
+    assert 'raw' in ret['result']
+
+
+def test_get_material_info_decode_with_status_and_slot():
+    payload = _material_payload(3, "PETG", status=1)
+    ret = v2_response_to_v1(Cmd.GET_MATERIAL_INFO, 5, payload)
+    assert ret['result']['index'] == 3
+    assert ret['result']['material_name'] == "PETG"
+    assert ret['result']['status'] == 1
+
+
+def test_get_material_info_empty_name():
+    # Only slot index present, no nested name field -> empty name, no crash.
+    ret = v2_response_to_v1(Cmd.GET_MATERIAL_INFO, 5, pb_uint32(1, 1))
+    assert ret['result']['index'] == 1
+    assert ret['result']['material_name'] == ""
+
+
+# ── v2_response_to_v1: GET_SENSOR_STATE ───────────────────────────────────────
+
+def test_get_sensor_state_decodes_bitmask_not_error():
+    # 70928 is the real 17-channel bitmask seen live; must NOT become an error.
+    ret = v2_response_to_v1(Cmd.GET_SENSOR_STATE, 9, pb_uint32(1, 70928))
+    assert ret['code'] == 0                        # not mis-read as error_70928
+    assert ret['msg'] == 'success'
+    assert ret['result']['sensor_bitmask'] == 70928
+    sensors = ret['result']['sensors']
+    assert len(sensors) == 17
+    # Verify the boolean list matches the mask bit-for-bit.
+    assert sensors == [bool(70928 & (1 << i)) for i in range(17)]
+
+
+def test_get_sensor_state_zero_mask_all_false():
+    ret = v2_response_to_v1(Cmd.GET_SENSOR_STATE, 9, pb_uint32(1, 0))
+    assert ret['result']['sensor_bitmask'] == 0
+    assert ret['result']['sensors'] == [False] * 17
+
+
+def test_get_sensor_state_individual_bits():
+    # bit 0 and bit 4 set -> mask 0x11 = 17
+    ret = v2_response_to_v1(Cmd.GET_SENSOR_STATE, 9, pb_uint32(1, 0x11))
+    sensors = ret['result']['sensors']
+    assert sensors[0] is True
+    assert sensors[4] is True
+    assert sensors[1] is False
+    assert sum(sensors) == 2
+
+
+# ── Unit tests for the ACE2 firmware-odometer stuck detection in ──────────────
+#
+# was tests/test_AFC_ACE2_stuck.py
+def _make_unit(active_lane="lane0", printing=True, paused=False,
+               slot_map=None):
+    unit = afcACE2.__new__(afcACE2)
+    unit.logger = FakeLogger()
+    unit._stuck_detection = True
+    unit._stuck_tripped = False
+    unit._slot_map = slot_map if slot_map is not None else {"lane0": 0, "lane1": 1}
+    unit._active_assist_lane = Recorder(result=active_lane)
+    unit.afc = FakeAFC()
+    unit.afc.function.in_print_flag = printing
+    unit.afc.function.paused = paused
+    return unit
+
+
+def _status(slot_statuses):
+    return {"slots": [{"slot_status": s} for s in slot_statuses]}
+
+
+# ── Firing + latch ────────────────────────────────────────────────────────────
+
+def test_jam_on_active_slot_schedules_handler_once():
+    unit = _make_unit()
+
+    unit._check_stuck(_status(["stuck_error", "ready"]))
+    unit._check_stuck(_status(["stuck_error", "ready"]))  # next heartbeat
+
+    assert unit._stuck_tripped is True
+    # one-shot: handler deferred exactly once despite repeated heartbeats
+    assert unit.afc.reactor.register_callback.call_count == 1
+
+
+def test_all_jam_states_trip():
+    for state in afcACE2._ENCODER_JAM_STATES:
+        unit = _make_unit()
+        unit._check_stuck(_status([state]))
+        assert unit._stuck_tripped is True, state
+        assert unit.afc.reactor.register_callback.call_count == 1, state
+
+
+def test_recovery_rearms_latch():
+    unit = _make_unit()
+
+    unit._check_stuck(_status(["tangled_error"]))
+    assert unit._stuck_tripped is True
+
+    unit._check_stuck(_status(["ready"]))        # recovered
+    assert unit._stuck_tripped is False
+
+    unit._check_stuck(_status(["stuck_error"]))  # a new jam fires again
+    assert unit._stuck_tripped is True
+    assert unit.afc.reactor.register_callback.call_count == 2
+
+
+def test_healthy_slot_never_trips():
+    unit = _make_unit()
+    unit._check_stuck(_status(["ready"]))
+    assert unit._stuck_tripped is False
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_idle_slot_error_never_trips():
+    """Only the active assist lane's slot is consulted — a stale error on an
+    idle slot can't pause a healthy print."""
+    unit = _make_unit(active_lane="lane0")
+
+    unit._check_stuck(_status(["ready", "stuck_error"]))  # error on slot 1
+
+    assert unit._stuck_tripped is False
+    assert not unit.afc.reactor.register_callback.called
+
+
+# ── Gate branches ─────────────────────────────────────────────────────────────
+
+def test_detection_disabled_by_config():
+    unit = _make_unit()
+    unit._stuck_detection = False
+    unit._stuck_tripped = True  # must stay untouched — gate is before resets
+
+    unit._check_stuck(_status(["stuck_error"]))
+
+    assert unit._stuck_tripped is True
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_not_printing_resets_and_skips():
+    unit = _make_unit(printing=False)
+    unit._stuck_tripped = True
+
+    unit._check_stuck(_status(["stuck_error"]))
+
+    assert unit._stuck_tripped is False
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_paused_print_resets_and_skips():
+    unit = _make_unit(paused=True)
+    unit._stuck_tripped = True
+
+    unit._check_stuck(_status(["stuck_error"]))
+
+    assert unit._stuck_tripped is False
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_no_active_lane_resets_and_skips():
+    unit = _make_unit(active_lane=None)
+    unit._stuck_tripped = True
+
+    unit._check_stuck(_status(["stuck_error"]))
+
+    assert unit._stuck_tripped is False
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_active_lane_missing_from_slot_map_skips():
+    unit = _make_unit(active_lane="ghost")
+
+    unit._check_stuck(_status(["stuck_error"]))
+
+    assert unit._stuck_tripped is False
+    assert not unit.afc.reactor.register_callback.called
+
+
+def test_malformed_status_is_ignored():
+    unit = _make_unit()
+
+    unit._check_stuck({})                          # no slots key
+    unit._check_stuck({"slots": "garbage"})        # not a list
+    unit._check_stuck(_status([]))                 # index out of range
+    unit._check_stuck({"slots": ["not-a-dict"]})   # slot entry not a dict
+
+    assert unit._stuck_tripped is False
+    assert not unit.afc.reactor.register_callback.called
+

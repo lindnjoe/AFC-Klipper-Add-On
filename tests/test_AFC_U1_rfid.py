@@ -1,30 +1,29 @@
 """
-Branch-coverage unit tests for extras/AFC_U1_rfid.py.
+Tests for the Snapmaker U1 RFID path, extras/AFC_U1_rfid.py.
 
-Complements tests/test_AFC_U1_rfid_scanner.py (which covers the standalone
-scanner stable-read gate). Here every remaining method gets its own test class,
-built through the real AFC_U1_RFID.__init__ (dependencies mocked via
-tests.conftest), with exact-log-list and new-attribute-value assertions and
-both-way branch coverage.
+The scanner that takes decoded tags from the U1's own daemon over a webhook,
+and a branch-coverage sweep over the module around it.
+Consolidated from two files; banners name the file each block came from.
 """
 
 from __future__ import annotations
-
 from unittest.mock import patch
-
 import pytest
-
 from configfile import error as ConfigError
 from extras.AFC_U1_rfid import (
     AFC_U1_RFID, load_config, POLL_INTERVAL, _BACKOFF_INTERVAL,
     _MAX_CONSECUTIVE_FAILURES, _BACKOFF_RESET_CYCLES,
 )
 from tests.conftest import MockAFC, MockConfig, MockGcode, MockLogger, MockPrinter
+from extras.AFC_U1_rfid import AFC_U1_RFID
 
 
+# ── Branch-coverage unit tests for extras/AFC_U1_rfid.py ──────────────────────
+#
+# was tests/test_AFC_U1_rfid_coverage.py
 # ── Shared fakes ──────────────────────────────────────────────────────────────
 
-class _Recorder:
+class _Recorder_rfid_coverage:
     def __init__(self, result=None, raises=None):
         self.calls = []
         self.result = result
@@ -81,7 +80,7 @@ class _Lane:
         self.tool_loaded = tool_loaded
         self.material = "orig-mat"
         self.color = "orig-col"
-        self.send_lane_data = _Recorder()
+        self.send_lane_data = _Recorder_rfid_coverage()
 
 
 class _LookupPrinter:
@@ -108,7 +107,7 @@ class _AdvancingReactor:
     def __init__(self, times):
         self._times = list(times)
         self._i = 0
-        self.register_callback = _Recorder()
+        self.register_callback = _Recorder_rfid_coverage()
 
     def monotonic(self):
         t = self._times[min(self._i, len(self._times) - 1)]
@@ -230,9 +229,9 @@ class TestAFCU1RFIDInit:
 
 class TestAFCU1RFIDHandleReady:
     def _prep(self, reader):
-        reader.start = _Recorder()
-        reader._patch_scanner_rfid_update = _Recorder()
-        reader.register_lane = _Recorder()
+        reader.start = _Recorder_rfid_coverage()
+        reader._patch_scanner_rfid_update = _Recorder_rfid_coverage()
+        reader.register_lane = _Recorder_rfid_coverage()
 
     def test_afc_not_loaded_disables_reader(self):
         reader = _build()
@@ -389,7 +388,7 @@ class TestAFCU1RFIDPatchScannerRfidUpdate:
         assert reader.logger.messages == []
 
     def test_noop_when_no_scanner_channels(self):
-        original = _Recorder()
+        original = _Recorder_rfid_coverage()
         ptc = _FakePTC(cb=original)
         fd = _FakeFD(cb_list=[original])
         reader = self._reader(ptc, fd, set())
@@ -398,7 +397,7 @@ class TestAFCU1RFIDPatchScannerRfidUpdate:
         assert fd._notify_data_update_cb == [original]
 
     def test_patches_callback_and_suppresses_scanner_channel(self):
-        original = _Recorder()
+        original = _Recorder_rfid_coverage()
         ptc = _FakePTC(cb=original)
         fd = _FakeFD(cb_list=[original])
         reader = self._reader(ptc, fd, {0})
@@ -415,8 +414,8 @@ class TestAFCU1RFIDPatchScannerRfidUpdate:
         assert original.last == ((3, {"y": 2}, True), {})
 
     def test_warns_when_callback_not_found(self):
-        original = _Recorder()
-        other = _Recorder()
+        original = _Recorder_rfid_coverage()
+        other = _Recorder_rfid_coverage()
         ptc = _FakePTC(cb=original)
         fd = _FakeFD(cb_list=[other])  # original not present
         reader = self._reader(ptc, fd, {0})
@@ -512,7 +511,7 @@ class TestAFCU1RFIDStart:
         reader = _build(afc=afc)
         reader.afc = afc
         reader.logger = MockLogger()
-        reader._try_attach_filament_detect = _Recorder(result=True)
+        reader._try_attach_filament_detect = _Recorder_rfid_coverage(result=True)
         return reader
 
     def test_early_return_when_nothing_configured(self):
@@ -569,7 +568,7 @@ class TestAFCU1RFIDTryAttach:
         reader = _build()
         reader.logger = MockLogger()
         reader._filament_detect = object()
-        reader._register_fd_callback = _Recorder()
+        reader._register_fd_callback = _Recorder_rfid_coverage()
         assert reader._try_attach_filament_detect() is True
         assert reader._register_fd_callback.called is False
         assert reader.logger.messages == []
@@ -586,7 +585,7 @@ class TestAFCU1RFIDTryAttach:
         reader = _build()
         reader.logger = MockLogger()
         reader._filament_detect = None
-        reader._register_fd_callback = _Recorder()
+        reader._register_fd_callback = _Recorder_rfid_coverage()
 
         class _FD:
             def get_a_filament_info(self, ch):
@@ -609,7 +608,7 @@ class TestAFCU1RFIDTryAttach:
         reader = _build()
         reader.logger = MockLogger()
         reader._filament_detect = None
-        reader._register_fd_callback = _Recorder()
+        reader._register_fd_callback = _Recorder_rfid_coverage()
         fd = object()
         reader.printer = _LookupPrinter({"filament_detect": fd})
         assert reader._try_attach_filament_detect() is True
@@ -704,7 +703,7 @@ class TestAFCU1RFIDOnFilamentInfoUpdate:
     def _reader(self, check=None):
         reader = _build()
         reader.logger = MockLogger()
-        reader._check_channel = check or _Recorder()
+        reader._check_channel = check or _Recorder_rfid_coverage()
         return reader
 
     def test_dispatches_registered_channel(self):
@@ -723,7 +722,7 @@ class TestAFCU1RFIDOnFilamentInfoUpdate:
         assert reader._check_channel.called is False
 
     def test_dispatch_error_logs_warning(self):
-        reader = self._reader(check=_Recorder(raises=RuntimeError("bad")))
+        reader = self._reader(check=_Recorder_rfid_coverage(raises=RuntimeError("bad")))
         reader._channel_to_lane = {2: "lane2"}
         reader._on_filament_info_update(2, {"CARD_UID": 5})
         assert reader.logger.messages == [(
@@ -748,7 +747,7 @@ class TestAFCU1RFIDOnFilamentInfoUpdate:
         assert reader._check_channel.last == (("lane1", 1), {})
 
     def test_lane_loop_error_logs_warning(self):
-        reader = self._reader(check=_Recorder(raises=RuntimeError("oops")))
+        reader = self._reader(check=_Recorder_rfid_coverage(raises=RuntimeError("oops")))
         reader._lane_channel_map = {"lane1": 1}
         reader._on_filament_info_update()  # no args -> loop
         assert reader.logger.messages == [(
@@ -853,9 +852,9 @@ class TestAFCU1RFIDPollCb:
     def _reader(self, idle=None):
         reader = _build()
         reader.logger = MockLogger()
-        reader._try_attach_filament_detect = _Recorder(result=True)
-        reader._trigger_channel_update = _Recorder(result=True)
-        reader._check_channel = _Recorder()
+        reader._try_attach_filament_detect = _Recorder_rfid_coverage(result=True)
+        reader._trigger_channel_update = _Recorder_rfid_coverage(result=True)
+        reader._check_channel = _Recorder_rfid_coverage()
         objs = {}
         if idle is not None:
             objs["idle_timeout"] = idle
@@ -867,7 +866,7 @@ class TestAFCU1RFIDPollCb:
 
     def test_backoff_when_fd_unavailable(self):
         reader = self._reader()
-        reader._try_attach_filament_detect = _Recorder(result=False)
+        reader._try_attach_filament_detect = _Recorder_rfid_coverage(result=False)
         assert reader._poll_cb(100.0) == 100.0 + _BACKOFF_INTERVAL
 
     def test_deferred_while_printing(self):
@@ -898,7 +897,7 @@ class TestAFCU1RFIDPollCb:
     def test_trigger_failure_reaches_backoff_threshold(self):
         reader = self._reader()
         reader._scanner_channels = {0}
-        reader._trigger_channel_update = _Recorder(result=False)
+        reader._trigger_channel_update = _Recorder_rfid_coverage(result=False)
         reader._consecutive_failures = {0: _MAX_CONSECUTIVE_FAILURES - 1}
         ret = reader._poll_cb(0.0)
         assert reader._consecutive_failures[0] == _MAX_CONSECUTIVE_FAILURES
@@ -910,7 +909,7 @@ class TestAFCU1RFIDPollCb:
     def test_trigger_failure_below_threshold_no_backoff(self):
         reader = self._reader()
         reader._scanner_channels = {0}
-        reader._trigger_channel_update = _Recorder(result=False)
+        reader._trigger_channel_update = _Recorder_rfid_coverage(result=False)
         reader._consecutive_failures = {0: 0}
         ret = reader._poll_cb(0.0)
         assert reader._consecutive_failures[0] == 1
@@ -922,14 +921,14 @@ class TestAFCU1RFIDPollCb:
         reader = self._reader()
         reader._scanner_channels = {0}
         reader._consecutive_failures = {0: 3}
-        reader._trigger_channel_update = _Recorder(result=True)
+        reader._trigger_channel_update = _Recorder_rfid_coverage(result=True)
         reader._poll_cb(0.0)
         assert reader._consecutive_failures[0] == 0
 
     def test_scanner_poll_error_logs_warning(self):
         reader = self._reader()
         reader._cfg_scanner_channels = {0}
-        reader._check_channel = _Recorder(raises=RuntimeError("boom"))
+        reader._check_channel = _Recorder_rfid_coverage(raises=RuntimeError("boom"))
         reader._poll_cb(0.0)
         assert reader.logger.messages == [(
             "warning", "U1 RFID: poll error on scanner ch0: boom")]
@@ -937,7 +936,7 @@ class TestAFCU1RFIDPollCb:
     def test_lane_poll_error_logs_warning(self):
         reader = self._reader()
         reader._lane_channel_map = {"lane1": 2}
-        reader._check_channel = _Recorder(raises=RuntimeError("bad"))
+        reader._check_channel = _Recorder_rfid_coverage(raises=RuntimeError("bad"))
         reader._poll_cb(0.0)
         assert reader.logger.messages == [(
             "warning", "U1 RFID: poll error on lane1 ch2: bad")]
@@ -972,7 +971,7 @@ class TestAFCU1RFIDPollCb:
         reader = self._reader()
         reader._scanner_channels = {0}
         reader._consecutive_failures = {0: _MAX_CONSECUTIVE_FAILURES}
-        reader._trigger_channel_update = _Recorder(result=True)
+        reader._trigger_channel_update = _Recorder_rfid_coverage(result=True)
         reader._backed_off = True
         reader._backoff_cycles = 2
         ret = reader._poll_cb(0.0)
@@ -1004,7 +1003,7 @@ class TestAFCU1RFIDSendLaneData:
         reader.logger = MockLogger()
         reader.afc = MockAFC()
         lane = _Lane(name="lane9")
-        lane.send_lane_data = _Recorder(raises=RuntimeError("nope"))
+        lane.send_lane_data = _Recorder_rfid_coverage(raises=RuntimeError("nope"))
         reader._send_lane_data(lane)
         assert reader.logger.messages == [(
             "debug", "U1 RFID: send_lane_data skipped for lane9: nope")]
@@ -1016,7 +1015,7 @@ class TestAFCU1RFIDHandleWebhookScan:
     def _reader(self):
         reader = _build()
         reader.logger = MockLogger()
-        reader._check_channel = _Recorder()
+        reader._check_channel = _Recorder_rfid_coverage()
         reader._channel_to_lane = {0: "lane1"}
         return reader
 
@@ -1091,7 +1090,7 @@ class TestAFCU1RFIDHandleWebhookScan:
 
     def test_check_channel_error_logs_warning(self):
         reader = self._reader()
-        reader._check_channel = _Recorder(raises=RuntimeError("x"))
+        reader._check_channel = _Recorder_rfid_coverage(raises=RuntimeError("x"))
         req = _WebReq(data={"channel": 0})
         reader._handle_webhook_scan(req)
         assert reader.logger.messages == [(
@@ -1125,7 +1124,7 @@ class TestAFCU1RFIDCheckChannelLane:
         reader._tag_reads = {}
         reader._lane_auto_create = False
         reader._map_to_slot_info = lambda info: dict(_SLOT)
-        reader._notify_scan = _Recorder()
+        reader._notify_scan = _Recorder_rfid_coverage()
         reader.printer = _LookupPrinter({})
         return reader
 
@@ -1206,7 +1205,7 @@ class TestAFCU1RFIDCheckChannelLane:
     def test_info_none_reads_live_and_returns_on_none(self):
         lane = _Lane(name="lane1")
         reader = self._reader(lane)
-        reader._get_channel_info = _Recorder(result=None)
+        reader._get_channel_info = _Recorder_rfid_coverage(result=None)
         reader._check_channel("lane1", 0, info=None)
         assert reader._get_channel_info.last == ((0,), {})
         assert reader._notify_scan.called is False
@@ -1216,7 +1215,7 @@ class TestAFCU1RFIDCheckChannelLane:
         reader = self._reader(lane)
         reader._last_uid = {0: 0x1234}
         reader._pending_confirm = {0: (0x1234, 1)}
-        reader._clear_lane = _Recorder()
+        reader._clear_lane = _Recorder_rfid_coverage()
         reader._check_channel("lane1", 0, info=self._tag(CARD_UID=0))
         assert reader._last_uid[0] == 0
         assert 0 not in reader._pending_confirm
@@ -1226,7 +1225,7 @@ class TestAFCU1RFIDCheckChannelLane:
         lane = _Lane(name="lane1", status="Loaded")
         reader = self._reader(lane)
         reader._last_uid = {0: 0x1234}
-        reader._clear_lane = _Recorder()
+        reader._clear_lane = _Recorder_rfid_coverage()
         reader._check_channel("lane1", 0, info=self._tag(CARD_UID=0))
         assert reader._last_uid[0] == 0
         assert reader._clear_lane.called is False
@@ -1315,7 +1314,7 @@ class TestAFCU1RFIDGraceExpired:
         reader.logger = MockLogger()
         reader._pending_defer = {}
         reader._webhook_channels_seen = set()
-        reader._check_channel = _Recorder()
+        reader._check_channel = _Recorder_rfid_coverage()
         return reader
 
     def test_superseded_uid_skips(self):
@@ -1343,7 +1342,7 @@ class TestAFCU1RFIDGraceExpired:
     def test_deferred_read_error_logs_warning(self):
         reader = self._reader()
         reader._pending_defer = {0: 0x1234}
-        reader._check_channel = _Recorder(raises=RuntimeError("bad"))
+        reader._check_channel = _Recorder_rfid_coverage(raises=RuntimeError("bad"))
         reader._grace_expired("lane1", 0, 0x1234)
         assert reader.logger.messages == [(
             "warning", "U1 RFID: deferred read error ch0: bad")]
@@ -1714,7 +1713,7 @@ class TestAFCU1RFIDNotifyScan:
         assert reader._responses == ["Spool loaded:"]
 
     def test_scanner_emits_prompt_and_exception(self):
-        em = _Recorder()
+        em = _Recorder_rfid_coverage()
 
         class _EM:
             def raise_exception_async(self, **kwargs):
@@ -1833,9 +1832,9 @@ class TestAFCU1RFIDForceRead:
         reader.reactor = _AdvancingReactor(times)
         reader._lane_channel_map = {"lane1": 0}
         reader._last_uid = {0: 0x1111}
-        reader._trigger_channel_update = _Recorder(result=True)
-        reader._get_channel_info = _Recorder(result=None)
-        reader._check_channel = _Recorder()
+        reader._trigger_channel_update = _Recorder_rfid_coverage(result=True)
+        reader._get_channel_info = _Recorder_rfid_coverage(result=None)
+        reader._check_channel = _Recorder_rfid_coverage()
         return reader
 
     def test_unknown_lane_returns(self):
@@ -1847,7 +1846,7 @@ class TestAFCU1RFIDForceRead:
 
     def test_trigger_failure_warns(self):
         reader = self._reader([100.0])
-        reader._trigger_channel_update = _Recorder(result=False)
+        reader._trigger_channel_update = _Recorder_rfid_coverage(result=False)
         reader.force_read("lane1")
         assert reader._last_uid[0] is None
         assert reader._check_channel.called is False
@@ -1857,7 +1856,7 @@ class TestAFCU1RFIDForceRead:
 
     def test_reads_within_deadline(self):
         reader = self._reader([100.0, 100.2])
-        reader._get_channel_info = _Recorder(result={"CARD_UID": 0x2222})
+        reader._get_channel_info = _Recorder_rfid_coverage(result={"CARD_UID": 0x2222})
         reader.force_read("lane1")
         args, kwargs = reader._check_channel.last
         assert args == ("lane1", 0)
@@ -1902,3 +1901,212 @@ class TestLoadConfig:
                    return_value=MockLogger()):
             reader = load_config(config)
         assert isinstance(reader, AFC_U1_RFID)
+
+
+# ── Unit tests for the U1 RFID spool-scanner stable-read gate in ──────────────
+#
+# was tests/test_AFC_U1_rfid_scanner.py
+TAG = {
+    "CARD_UID": 0x56A36AEA,
+    "MAIN_TYPE": "PLA",
+    "SUB_TYPE": "",
+}
+TAG_OTHER = dict(TAG, CARD_UID=0x26A36AEA)
+
+
+# ── Typed fakes ───────────────────────────────────────────────────────────────
+
+class _Recorder_rfid_scanner:
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = result
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.result
+
+    @property
+    def called(self):
+        return len(self.calls) > 0
+
+    @property
+    def call_count(self):
+        return len(self.calls)
+
+
+class _FakeLogger:
+    def __init__(self):
+        self.lines = {"info": [], "debug": [], "warning": [], "error": []}
+
+    def info(self, msg, *a, **k):
+        self.lines["info"].append(msg)
+
+    def debug(self, msg, *a, **k):
+        self.lines["debug"].append(msg)
+
+    def warning(self, msg, *a, **k):
+        self.lines["warning"].append(msg)
+
+    def error(self, msg, *a, **k):
+        self.lines["error"].append(msg)
+
+
+class _FakeReactor:
+    def __init__(self):
+        self.register_callback = _Recorder_rfid_scanner()
+
+    def monotonic(self):
+        return 100.0
+
+
+class _FakeAFC:
+    def __init__(self):
+        self.lanes = {}
+
+
+def _make_rfid(confirm_reads=3, webhook_grace=0.0):
+    rfid = AFC_U1_RFID.__new__(AFC_U1_RFID)
+    rfid.logger = _FakeLogger()
+    rfid.afc = _FakeAFC()
+    rfid.reactor = _FakeReactor()
+    rfid._filament_detect = object()
+    rfid._cfg_scanner_channels = {0}
+    rfid._lane_objects = {}
+    rfid._lane_channel_map = {}
+    rfid._scanner_confirm_reads = confirm_reads
+    rfid._pending_confirm = {}
+    rfid._pending_defer = {}
+    rfid._last_uid = {}
+    rfid._webhook_channels_seen = set()
+    rfid._webhook_grace = webhook_grace
+    rfid._scanner_auto_create = True
+    rfid._lane_auto_create = True
+    rfid._notify_scan = _Recorder_rfid_scanner()
+    rfid._map_to_slot_info = _Recorder_rfid_scanner(result={
+        "brand": "Test", "material": "PLA", "color_hex": "FF0000",
+        "multi_color": ["FF0000"]})
+    return rfid
+
+
+def _scan(rfid, info=TAG, source='poll'):
+    with patch("extras.AFC_U1_rfid.sync_rfid_to_spoolman") as sync:
+        rfid._check_channel("", 0, info=dict(info), source=source)
+    return sync
+
+
+# ── Stable-read gate ──────────────────────────────────────────────────────────
+
+def test_scan_waits_for_n_consecutive_reads():
+    rfid = _make_rfid(confirm_reads=3)
+
+    sync1 = _scan(rfid)
+    assert not sync1.called
+    assert rfid._pending_confirm[0] == (TAG["CARD_UID"], 1)
+    assert 0 not in rfid._last_uid            # not yet acted
+
+    sync2 = _scan(rfid)
+    assert not sync2.called
+    assert rfid._pending_confirm[0] == (TAG["CARD_UID"], 2)
+
+    sync3 = _scan(rfid)  # third consecutive identical read acts
+    sync3.assert_called_once()
+    assert rfid._notify_scan.call_count == 1
+    assert 0 not in rfid._pending_confirm     # gate consumed
+    assert rfid._last_uid[0] == TAG["CARD_UID"]
+
+
+def test_different_uid_mid_confirmation_resets_count():
+    """A corrupt/partial UID mid-stream must not accumulate — a stable clean
+    read wins over transient misreads."""
+    rfid = _make_rfid(confirm_reads=3)
+
+    _scan(rfid)                       # uid A: count 1
+    _scan(rfid, info=TAG_OTHER)       # uid B: count resets to 1
+    assert rfid._pending_confirm[0] == (TAG_OTHER["CARD_UID"], 1)
+
+    sync = _scan(rfid)                # uid A again: count 1, not 2
+    assert not sync.called
+    assert rfid._pending_confirm[0] == (TAG["CARD_UID"], 1)
+
+
+def test_confirm_reads_of_one_acts_immediately():
+    rfid = _make_rfid(confirm_reads=1)
+    sync = _scan(rfid)
+    sync.assert_called_once()
+    assert rfid._pending_confirm == {}        # gate never engaged
+    assert rfid._last_uid[0] == TAG["CARD_UID"]
+
+
+def test_webhook_bypasses_gate():
+    """A webhook is a full-data authoritative push — no confirmation needed."""
+    rfid = _make_rfid(confirm_reads=3)
+    sync = _scan(rfid, source='webhook')
+    sync.assert_called_once()
+    assert rfid._pending_confirm == {}
+    assert rfid._notify_scan.call_count == 1
+
+
+# ── Dedup / removal ───────────────────────────────────────────────────────────
+
+def test_same_uid_never_refires():
+    rfid = _make_rfid(confirm_reads=1)
+    _scan(rfid).assert_called_once()
+
+    sync = _scan(rfid)  # spool still presented
+    assert not sync.called
+    assert rfid._notify_scan.call_count == 1
+
+
+def test_new_spool_after_first_fires_again():
+    rfid = _make_rfid(confirm_reads=1)
+    _scan(rfid).assert_called_once()
+    _scan(rfid, info=TAG_OTHER).assert_called_once()
+    assert rfid._last_uid[0] == TAG_OTHER["CARD_UID"]
+    assert rfid._notify_scan.call_count == 2
+
+
+def test_tag_removal_clears_pending_confirmation():
+    rfid = _make_rfid(confirm_reads=3)
+    _scan(rfid)
+    assert 0 in rfid._pending_confirm
+
+    sync = _scan(rfid, info=dict(TAG, CARD_UID=0))  # tag removed
+
+    assert not sync.called
+    assert 0 not in rfid._pending_confirm
+    assert rfid._last_uid.get(0) in (None, 0)  # nothing was staged yet
+
+
+def test_scanner_keeps_last_uid_after_removal():
+    """Scanner channels intentionally keep _last_uid after a completed scan:
+    the same spool must not re-fire while/after being presented."""
+    rfid = _make_rfid(confirm_reads=1)
+    _scan(rfid).assert_called_once()
+    assert rfid._last_uid[0] == TAG["CARD_UID"]
+
+    _scan(rfid, info=dict(TAG, CARD_UID=0))         # removed
+    assert rfid._last_uid[0] == TAG["CARD_UID"]     # kept (scanner channel)
+
+    sync = _scan(rfid)                              # same spool re-presented
+    assert not sync.called                          # still deduped
+
+
+# ── Content gates ─────────────────────────────────────────────────────────────
+
+def test_main_type_none_records_uid_but_does_not_act():
+    rfid = _make_rfid(confirm_reads=1)
+    sync = _scan(rfid, info=dict(TAG, MAIN_TYPE="NONE"))
+    assert not sync.called
+    assert not rfid._notify_scan.called
+    assert rfid._last_uid[0] == TAG["CARD_UID"]  # recorded for dedup
+
+
+def test_scanner_sets_next_spool_staging():
+    """Scanner reads stage via next_spool_id (set_next=True) rather than
+    assigning to a lane."""
+    rfid = _make_rfid(confirm_reads=1)
+    sync = _scan(rfid)
+    assert sync.call_args.kwargs.get("set_next") is True
+    args = sync.call_args.args
+    assert args[1] is None  # scanner channel has no lane
+
