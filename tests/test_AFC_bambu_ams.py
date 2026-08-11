@@ -117,7 +117,15 @@ class TestBridgeSlotToInfo:
             "temp_max": 240, "weight": 1000, "rfid_uid": None,
             # Added when spool measurement and tray identity landed. An exact
             # dict comparison is worth keeping -- it is what noticed.
-            "remain_pct": None, "tray_uid": None}
+            "remain_pct": None, "tray_uid": None,
+            # fw >= 1.9.3.0: the firmware's per-bay scan verdict. None on the
+            # older status frames this fixture models. fw >= 1.10.0.0 adds the
+            # measured percent, attributed the same way.
+            "scan_seq": None, "scan_res": None,
+            "meas_pct": None, "meas_seq": None,
+            # fw >= 1.10.5.0: the firmware still owes this bay a read, so an
+            # empty record means "not fetched yet", not "no tag".
+            "reread_pending": False}
 
     def test_no_uid_ever(self):
         # Bambu never exposes a per-spool UID, even if 'rfid' were present
@@ -1101,6 +1109,8 @@ def _sync_shim(slot_map, lanes, slots, verdict="none", surfaced=None,
         # No scan open by default.
         _scan_verdict=lambda slot: verdict,
         _scan_notag=[False] * max(len(slots), 1),
+        _afc_owned=set(), _prep_seen=True,
+        _measure_settled=lambda slot, info: True,
         _finalize_scan=lambda slot: (finalized if finalized is not None
                                      else []).append(slot),
         _release_scan_hold=lambda slot: None,
@@ -1788,6 +1798,38 @@ class TestTheSpoolSummaryIsReadableByAHuman:
         assert "not linked to a Spoolman spool" in said[0]
         assert "kept on the lane" in said[0]
 
+    def test_a_read_tag_that_did_not_link_names_the_setting_that_would(self):
+        # lane15 read PLA Sparkle / 04C07001 cleanly all day and never linked,
+        # and the reason was one config line on the wrong unit's section. The
+        # log said "not linked" -- a state, not a cause -- so the answer had to
+        # be reconstructed from the outside. Say the cause and the fix.
+        u, lane, said = self._u(sid=None)
+        u._slots[0]["rfid_uid"] = "04c07001"
+        u.auto_spoolman_create = False
+        afcBambuAMS._say_spool_summary(u, 2, lane, 73, 730, 1000)
+        assert "04C07001" in said[0]
+        assert "auto-create is off" in said[0]
+        assert "auto_spoolman_create: True" in said[0]
+        assert "BambuAMS_2" in said[0]          # names THIS unit's section
+
+    def test_with_auto_create_on_it_does_not_blame_the_setting(self):
+        u, lane, said = self._u(sid=None)
+        u._slots[0]["rfid_uid"] = "04c07001"
+        u.auto_spoolman_create = True
+        afcBambuAMS._say_spool_summary(u, 2, lane, 73, 730, 1000)
+        assert "auto_spoolman_create" not in said[0]
+        assert "no spool carrying 04C07001 yet" in said[0]
+
+    def test_an_undecodable_tag_is_told_to_bind_by_hand(self):
+        # No profile to create a spool FROM, so the setting is irrelevant here
+        # and naming it would send the operator to the wrong lever.
+        u, lane, said = self._u(material=None, colour=None, sid=None)
+        u._slots[0]["rfid_uid"] = "84ea7601"
+        u.auto_spoolman_create = False
+        afcBambuAMS._say_spool_summary(u, 2, lane, 73, 730, 1000)
+        assert "bind 84EA7601 to a spool in Spoolman" in said[0]
+        assert "auto_spoolman_create" not in said[0]
+
     def test_sync_turned_off_is_distinguished_from_unbound(self):
         u, lane, said = self._u(sync=False)
         afcBambuAMS._say_spool_summary(u, 2, lane, 54, 540, 1000)
@@ -1834,11 +1876,12 @@ class TestTheSummaryWaitsForTheRecordItDescribes:
     moment we chose to speak.
     """
 
-    def _u(self, material=None, uid=None, now=100.0):
+    def _u(self, material=None, uid=None, now=100.0, verdict="none"):
         said = []
         u = types.SimpleNamespace(
             name="BambuAMS_1", logger=types.SimpleNamespace(info=said.append),
             sync_measured_to_spoolman=True, SCAN_FALLBACK_CAP=45.0,
+            _scan_verdict=lambda s: verdict,
             _slots=[{"index": 0, "material": material, "color": "#2D2B28",
                      "rfid_uid": uid, "weight": 1000}],
             _lane_for_slot=lambda s: types.SimpleNamespace(
@@ -1877,6 +1920,44 @@ class TestTheSummaryWaitsForTheRecordItDescribes:
         u, said = self._u(material=None, uid="84ea7601")
         u._queue_spool_summary(0, 25, 250, 1000)
         assert len(said) == 1 and "84EA7601" in said[0]
+
+    def test_a_uid_alone_is_not_an_answer_while_the_scan_is_still_running(self):
+        # The two halves of a record do not land together. On an HT the UID
+        # comes off the anticollision well before the profile is fetched, so
+        # this used to fire mid-scan and print the opposite of the truth:
+        #
+        #   16:01:58  tag 0A1882AC read but its profile could not be decoded
+        #   16:02:06  applied tag to lane23: Bambu PLA Glow #A1FFAC
+        u, said = self._u(material=None, uid="0a1882ac", verdict="waiting")
+        u._queue_spool_summary(0, 74, 740, 1000)
+        assert said == [], "called a tag undecodable while it was still being read"
+        assert 0 in u._pending_summary
+
+    def test_and_it_speaks_when_the_scan_resolves(self):
+        u, said = self._u(material=None, uid="0a1882ac", verdict="waiting")
+        u._queue_spool_summary(0, 74, 740, 1000)
+        u._slots[0]["material"] = "Bambu PLA Glow"       # the read landed
+        u._scan_verdict = lambda s: "read"
+        u._drain_spool_summary(0)
+        assert len(said) == 1
+        assert "Bambu PLA Glow" in said[0]
+        assert "could not be decoded" not in said[0]
+
+    def test_a_uid_only_bay_whose_scan_ENDED_still_answers_at_once(self):
+        # The hold is on the window, not on the UID: a resolved no-tag/foreign
+        # verdict means the profile is never coming, and a third-party reel
+        # must not wait out the backstop for an answer it already has.
+        u, said = self._u(material=None, uid="84ea7601", verdict="notag")
+        u._queue_spool_summary(0, 25, 250, 1000)
+        assert len(said) == 1 and "84EA7601" in said[0]
+
+    def test_a_stand_in_without_the_verdict_hook_keeps_the_old_behaviour(self):
+        # _drain_spool_summary is exercised against duck-typed stand-ins; one
+        # missing the hook must fall back, not raise.
+        u, said = self._u(material=None, uid="84ea7601")
+        del u._scan_verdict
+        u._queue_spool_summary(0, 25, 250, 1000)
+        assert len(said) == 1
 
     def test_the_backstop_stops_it_waiting_forever(self):
         u, said = self._u(material=None, now=100.0)
@@ -3075,11 +3156,22 @@ class TestAForeignTagIsNotAnEmptyBay:
 
     @pytest.mark.parametrize("line", [
         "[AMS_RFID]STEP:auth fail:-4",
-        "[AMS_RFID]STEP7:info_valid 0 or bbl:-1",
     ])
     def test_the_refusal_is_recognised(self, line):
         from extras.AFC_BambuAMS_bridge import _RFID_FOREIGN_TAG_RE
         assert _RFID_FOREIGN_TAG_RE.search(line) is not None
+
+    def test_info_valid_zero_is_not_foreign_evidence(self):
+        # "info_valid 0 or bbl:N" rode the foreign pattern for months, but
+        # the corpus audit showed it on EMPTY-BAY cycles ("no card detected"
+        # -> info_valid 0 -> cali end) and mid-retry on HT reads that then
+        # SUCCEEDED. It means "no valid record right now", not "chip
+        # refused" -- matching it worded empty bays as foreign tags. Only
+        # the auth refusal, which requires a chip to refuse, is evidence.
+        from extras.AFC_BambuAMS_bridge import _RFID_FOREIGN_TAG_RE
+        for line in ("[AMS_RFID]STEP7:info_valid 0 or bbl:-1",
+                     "[AMS_RFID] STEP4,info_valid 0 or bbl:1"):
+            assert _RFID_FOREIGN_TAG_RE.search(line) is None
 
     @pytest.mark.parametrize("line", [
         "[AMS_RFID] STEP3,save to flash ,card info valid",
@@ -3307,6 +3399,34 @@ class TestTheSpoolmanBindingFollowsTheTag:
             u, lane, {"index": 0, "present": True, "rfid_uid": "01d0ec0f"})
         assert lane.spool_id == 42
 
+    # ── AFTER A RESTART THERE IS NO MEMO, AND THE BINDING IS STILL STALE ──
+    #
+    # _bound_uid lives in memory and starts empty every boot, so every tagged
+    # bay looks "not bound by a tag read" after a restart and the check above
+    # returns -- keeping whatever spool was in the bay BEFORE the restart.
+    # Measured live: lane17 read a blue PLA Matte tag (ECB61CD0) while still
+    # bound to spool 87, the Glow, which had moved to a different unit; the
+    # lane showed "Glow" because the binding, not the tag, names the spool.
+    #
+    # Spoolman's record of which UIDs a spool carries outlives the restart, so
+    # it is the authority when our memo is gone.
+
+    def test_a_restart_does_not_preserve_a_stale_binding(self):
+        u, lane = self._u({}, spool_id=87)      # no memo: the restart case
+        # Spoolman says 87 carries the Glow's tag, not the one in this bay.
+        u._binding_contradicted = lambda sid, uid: True
+        afcBambuAMS._spoolman_sync(
+            u, lane, {"index": 0, "present": True, "rfid_uid": "ecb61cd0"})
+        assert lane.spool_id == ""              # released
+
+    def test_a_spool_with_no_recorded_uid_still_survives_a_restart(self):
+        # Nothing to contradict -> the hand-assigned spool keeps its lane.
+        u, lane = self._u({}, spool_id=42)
+        u._binding_contradicted = lambda sid, uid: False
+        afcBambuAMS._spoolman_sync(
+            u, lane, {"index": 0, "present": True, "rfid_uid": "ecb61cd0"})
+        assert lane.spool_id == 42
+
 
 class TestNothingIsClaimedBeforeTheUnitFinishes:
     """
@@ -3416,13 +3536,23 @@ class TestWeightWriteSaysWhereTheNumberCameFrom:
             shim, self._lane(), {"index": 0, "remain_pct": 100, "weight": 1000})
         assert pushed == [(640, "physical AMS measurement")]
 
-    def test_the_tag_record_is_not_called_a_measurement(self):
+    def test_a_tag_record_is_never_written_at_all(self):
+        # It used to be written and merely LABELLED as coming from the tag.
+        # It is not written now: the tag's stored remain does not track
+        # printing and nothing updates it, so on a reel holding 230 g it
+        # still read 80% and pushed 800 g into the operator's inventory.
         shim, pushed = self._shim()
         shim._measured_remain = {}
         afcBambuAMS._apply_remain_weight(
             shim, self._lane(), {"index": 0, "remain_pct": 100, "weight": 1000})
-        assert pushed == [
-            (1000, "the spool's tag record, not a fresh measurement")]
+        assert pushed == []
+
+    def test_a_measurement_is_written_and_named(self):
+        shim, pushed = self._shim()
+        shim._measured_remain = {0: 23}
+        afcBambuAMS._apply_remain_weight(
+            shim, self._lane(), {"index": 0, "remain_pct": 80, "weight": 1000})
+        assert pushed == [(230, "physical AMS measurement")]
 
 
 class TestReadSuccessInEveryDialect:
@@ -4056,13 +4186,16 @@ class TestAmsDevNarration:
     different prefix AND a space after the bracket.
     """
 
-    # Verbatim from captures/ams1_alone_insert_timestamped.txt
+    # Verbatim from captures/ams1_alone_insert_timestamped.txt.
+    #
+    # "read success,valid" and "feed with rfid success" are NOT here: they are
+    # deliberately absent from the console table, because an HT emits both on
+    # an attempt that then FAILS and retries, so narrating them announced a
+    # read that had not happened. The auth and flash lines mark the real one.
     LINES = [
         "[AMS_DEV] STEP,first detected",
         "[AMS_DEV] STEP:card auth success!",
         "[RF] tray0: info write to flash",
-        "[AMS_DEV] STEP:read success,valid",
-        "[AMS_DEV] STEP:feed with rfid success",
     ]
 
     def _narrate(self, text):
@@ -4084,7 +4217,29 @@ class TestAmsDevNarration:
     def test_the_ams2_rules_still_work(self):
         # The AMS_DEV rules are inserted ahead of the AMS_RFID ones; make sure
         # they did not shadow them.
-        assert self._narrate("[AMS_RFID]STEP:read success") is not None
+        assert self._narrate("[AMS_RFID]STEP:card auth success!") is not None
+
+    @pytest.mark.parametrize("line", [
+        "[AMS_DEV] STEP:read success,valid",
+        "[AMS_DEV] STEP:feed with rfid success",
+        "[AMS_RFID] STEP3,read success ,goto Cali",
+        "[AMS_RFID] STEP3,feed with rfid success",
+    ])
+    def test_a_mid_cycle_read_claim_is_not_narrated(self, line):
+        """These fire on an attempt that FAILS and retries.
+
+        Captured on the HT: 'feed with rfid success' + 'read success ,goto
+        Cali' at 04:56:57, then info_valid 0, then a retry, and only at
+        04:57:07 the auth/flash pair that marked the read which actually
+        landed. Narrating the first pair told the operator a spool had been
+        read ten seconds before it was."""
+        assert self._narrate(line) is None
+
+    def test_the_authentication_is_narrated_in_every_dialect(self):
+        for line in ("[AMS_DEV] STEP:card auth success!",
+                     "[AMS_RFID]STEP:card auth success!",
+                     "[AMS_RFID] STEP3,auth card successful"):
+            assert self._narrate(line) is not None, line
 
 # ── the AMS's own PTFE measurement ─────────────────────────────────────────────
 
@@ -4775,9 +4930,14 @@ class TestAnnounceSendsAreIndependent:
         return shim, sent
 
     def test_all_of_them_are_sent_normally(self):
+        # "model" joins the announce set: the firmware keys every
+        # model-specific decision on it, and until it arrives a unit is
+        # judged by AMS 1's vocabulary -- which is the cross-model confusion
+        # the per-model split exists to end. Like the others it is re-sent on
+        # every announce so it survives a Pico reboot.
         shim, sent = self._shim()
         afcBambuAMS._announce_unit(shim)
-        assert [o["cmd"] for o in sent] == ["units", "htunit",
+        assert [o["cmd"] for o in sent] == ["units", "htunit", "model",
                                             "mcaddr", "armms"]
 
     def test_the_arm_cadence_is_re_applied_on_every_announce(self):
@@ -4789,19 +4949,22 @@ class TestAnnounceSendsAreIndependent:
         arm = [o for o in sent if o["cmd"] == "armms"]
         assert arm and arm[0]["ms"] == int(afcBambuAMS_mod.FOLLOW_ARM_MS)
 
-    def test_the_cadence_is_far_slower_than_the_firmware_default(self):
-        # 520 ms is the firmware built-in. Measured: the follower held 5m33s
-        # with the arm effectively off, recovering every pull -- so this frame
-        # is not what sustains following, and at 12 units it was the largest
-        # unconditional per-cycle cost on the bus.
-        assert afcBambuAMS_mod.FOLLOW_ARM_MS >= 10000
-
-    def test_it_is_not_set_to_never(self):
-        # Effectively one-shot, but not literally never: the same loop is what
-        # arms a unit that comes online later and re-arms one that dropped and
-        # came back, so a backstop has to remain. Interim until the firmware
-        # can arm once and re-arm on a missing acknowledgement instead.
-        assert 0 < afcBambuAMS_mod.FOLLOW_ARM_MS <= 3600000
+    def test_the_cadence_is_the_printers_own(self):
+        # REVERSED from "far slower than the firmware default". The hourly
+        # override reasoned from "following holds without it" -- true, and
+        # beside the point: 11/04 is the bus-wide liveness keep-alive, and
+        # the full-bus printer reel (ams3_fullbus_tagged_and_rescans) streams
+        # it to EVERY unit at full cadence straight through its measuring
+        # AMS 2 rescan (0411@0700 3.98/s + 0411@1800 1.99/s). Under the
+        # hourly override our TX carried ZERO 0411 in every echo ever
+        # diffed -- the largest single deviation from the reference reels.
+        # 600000 = effectively off, the MEASURED-GOOD regime (2026-08-10):
+        # at the printer's 520 ms our blocking master's arm lands
+        # mid-calibration and the second odometer edge dies; silenced, the
+        # same cycles measured P:97/74/67. The printer survives its own
+        # stream because its drive never blocks. Do not re-enable the sweep
+        # without a live measure PASSING under it.
+        assert afcBambuAMS_mod.FOLLOW_ARM_MS == 600000
 
     def test_a_failing_ht_flag_does_not_skip_the_mc_address(self):
         # The exact regression: mcaddr is what keeps the log drain per-unit.
@@ -5753,11 +5916,18 @@ class TestSpoolmanMissIsNotRetriedForever:
         u._forget_spoolman_miss(0)
         assert "ECB61CD0" not in u._spoolman_no_match
 
-    def test_forgetting_an_empty_slot_is_harmless(self):
+    def test_forgetting_clears_the_whole_set(self):
+        # Deliberately the WHOLE set, not this slot's UID. The per-UID variant
+        # read info["uid"] -- a key the normalized dict never has (it is
+        # "rfid_uid") -- so it cleared nothing for the entire time it existed;
+        # and a power-cycled unit blanks the record, leaving a memoized UID
+        # nobody can name anymore. A whole-set clear on a physical edge costs
+        # one memoized re-lookup per still-unmatched bay and is what lets
+        # "bind it in Spoolman, re-insert it" actually work.
         u, _ = self._unit()
         u._spoolman_no_match.add("ECB61CD0")
-        u._forget_spoolman_miss(1)                 # slot 1 has no info
-        assert "ECB61CD0" in u._spoolman_no_match  # untouched
+        u._forget_spoolman_miss(1)                 # ANY slot's edge clears
+        assert not u._spoolman_no_match
 
     def test_a_different_uid_is_not_suppressed(self):
         """Keyed by UID, so another spool still gets its own lookup."""
@@ -6415,24 +6585,28 @@ class TestMeasuredRemainIsCapped:
 
     def test_the_measured_119_percent_becomes_1000g_not_1190g(self):
         shim, pushed = self._shim()
+        shim._measured_remain = {2: 119}
         lane = self._lane()
         afcBambuAMS._apply_remain_weight(
-            shim, lane, {"remain_pct": 119, "weight": 1000})
+            shim, lane, {"index": 2, "remain_pct": 119, "weight": 1000})
         assert lane.weight == 1000
         assert pushed == [("lane15", 1000)]
 
     def test_the_measured_107_percent_is_capped_too(self):
         shim, _p = self._shim()
+        shim._measured_remain = {2: 107}
         lane = self._lane()
         afcBambuAMS._apply_remain_weight(
-            shim, lane, {"remain_pct": 107, "weight": 1000})
+            shim, lane, {"index": 2, "remain_pct": 107, "weight": 1000})
         assert lane.weight == 1000
 
     def test_an_ordinary_reading_is_untouched(self):
+        # An ordinary MEASURED reading passes through uncapped and unrounded.
         shim, _p = self._shim()
+        shim._measured_remain = {2: 80}
         lane = self._lane()
         afcBambuAMS._apply_remain_weight(
-            shim, lane, {"remain_pct": 80, "weight": 1000})
+            shim, lane, {"index": 2, "remain_pct": 80, "weight": 1000})
         assert lane.weight == 800
 
     # ── the measurement beats the tag record, HERE too ──────────────────────
@@ -6462,20 +6636,60 @@ class TestMeasuredRemainIsCapped:
 
     def test_it_is_the_right_slots_measurement(self):
         # Keyed by slot: bay 3's measurement must not describe bay 2's spool.
+        # Bay 2 has none of its own, so it falls back to ITS OWN tag (70% of
+        # 1000 = 700, below the lane's 1000) -- never to bay 3's 69%.
         shim, pushed = self._shim()
         shim._measured_remain = {3: 69}
         lane = self._lane()
+        lane.weight = 1000
         afcBambuAMS._apply_remain_weight(
             shim, lane, {"index": 2, "remain_pct": 70, "weight": 1000})
-        assert lane.weight == 700
+        assert lane.weight == 700         # its own tag, not 690
+        assert pushed == [("lane15", 700)]
 
-    def test_no_measurement_still_uses_the_tag(self):
-        # The tag record is the right answer when it is the only one there.
-        shim, _p = self._shim()
+    def test_no_measurement_takes_the_tag_only_when_it_is_LOWER(self):
+        # FILAMENT ONLY GOES DOWN, so with no measurement the smaller of the
+        # tag and what the lane already tracks is the more recent truth. Tag
+        # 70% = 700 g against a lane carrying 1000 -> the tag saw usage the
+        # tracking missed, so it wins and the correction reaches Spoolman.
+        #
+        # Live case: lane21 orange PLA, fast-pathed so never measured, tag
+        # 60% = 600 g while Spoolman spool 97 held 800 -- the console promised
+        # 600 and the lane showed 800.
+        shim, pushed = self._shim()
         lane = self._lane()
+        lane.weight = 1000
         afcBambuAMS._apply_remain_weight(
             shim, lane, {"index": 2, "remain_pct": 70, "weight": 1000})
         assert lane.weight == 700
+        assert pushed == [("lane15", 700)]
+
+    def test_a_tag_reading_HIGHER_than_the_lane_is_refused(self):
+        # The floor is what makes the fallback safe, and this is the reel the
+        # old prohibition was written for: read off the wire at one moment the
+        # tag said 80% (~800 g) while the AMS measured 23% (~230 g) and the
+        # scale agreed at 230. Nothing writes a measurement back to the tag,
+        # so its figure is whatever the last calibration left there and it can
+        # sit far too high. A lane already down at 230 must not be inflated to
+        # 800, and that fiction must never reach Spoolman.
+        shim, pushed = self._shim()
+        lane = self._lane()
+        lane.weight = 230
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"index": 2, "remain_pct": 80, "weight": 1000})
+        assert lane.weight == 230         # untouched
+        assert pushed == []               # and nothing reached Spoolman
+
+    def test_a_zero_remain_tag_is_never_a_weight(self):
+        # 0 on a Bambu tag means "never measured", not "empty" -- it must not
+        # zero a lane just because it is lower than everything.
+        shim, pushed = self._shim()
+        lane = self._lane()
+        lane.weight = 1000
+        afcBambuAMS._apply_remain_weight(
+            shim, lane, {"index": 2, "remain_pct": 0, "weight": 1000})
+        assert lane.weight == 1000
+        assert pushed == []
 
     def test_a_measurement_over_100_is_still_capped(self):
         # The measurement winning must not smuggle 1190 g past the cap.
@@ -6533,11 +6747,13 @@ class TestMeasuredRemainIsCapped:
             assert lane.weight == expect, nominal
 
     def test_the_cap_follows_the_tags_nominal_weight(self):
-        # A 250g sample spool caps at 250g, not 1000g.
+        # A 250g sample spool caps at 250g, not 1000g. Driven by a MEASURED
+        # 119% now that the tag's stored figure is not a weight source.
         shim, _p = self._shim()
+        shim._measured_remain = {2: 119}
         lane = self._lane()
         afcBambuAMS._apply_remain_weight(
-            shim, lane, {"remain_pct": 119, "weight": 250})
+            shim, lane, {"index": 2, "remain_pct": 119, "weight": 250})
         assert lane.weight == 250
 
     def test_a_loaded_lane_is_left_alone(self):
@@ -7061,22 +7277,44 @@ class TestNoSwitchMeansNoPullToWaitFor:
 
 
 class TestALatchedUnitStopsTheLoadLoop:
-    """A jammed AMS latches and will not move again until told to load.
-    Kicking it every load_retry_interval for the rest of the window is the
-    "stuck in the load loop" the operator hit -- minutes of feed commands at a
-    unit that has already given up, with the real failure invisible."""
+    """A FAULT IS NOT A REASON TO STOP ASKING.
 
-    def test_a_declared_fault_breaks_the_loop(self):
-        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=30.0)
+    This class used to assert the opposite -- that a declared fault broke the
+    kick loop, because a latched AMS "has already given up". The captures say
+    otherwise, and the real printer is the authority. Counted in
+    ams1_print_fault_2026-08-05, from the `stall` narration to the end of the
+    capture:
+
+        op-03 drive frames AFTER the fault ....... 12,556
+        op-04 polls .............................. 8,060
+        op-20 heartbeats ......................... 8,410
+
+    The printer does not flinch. The AMS runs its own recovery UNDERNEATH the
+    continued request -- unlatching, re-homing, re-feeding -- so withdrawing
+    the request is what makes a fault terminal. Live cost of the old rule: an
+    HT declared a fault, we quit kicking one interval later, and it died
+    mid-recovery.
+    """
+
+    def test_a_declared_fault_keeps_the_loop_running(self):
+        shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=5.0)
         faults = {"n": 0}
 
         def declared():
             faults["n"] += 1
-            return faults["n"] == 2      # fault on the second look
+            return faults["n"] >= 2      # faults from the second look onward
         shim._ams_declared_fault = declared
-        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 30.0) is False
-        # Gave up early rather than riding out the 30s window.
-        assert len(calls["feed"]) <= 2
+        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 5.0) is False
+        # Rode out the window feeding, exactly as the printer does.
+        assert len(calls["feed"]) >= 2, calls["feed"]
+
+    def test_the_sensor_still_ends_it_even_while_faulted(self):
+        # Recovery succeeding mid-fault must still stop the moment the
+        # filament arrives -- continuing to ask is not the same as ignoring
+        # the answer.
+        shim, calls, _ = _load_shim(sensor_after=2, timeout=5.0)
+        shim._ams_declared_fault = lambda: True
+        assert afcBambuAMS._feed_until_sensor(shim, _LANE, 5.0) is True
 
     def test_no_fault_still_rides_the_window(self):
         shim, calls, _ = _load_shim(sensor_after=10 ** 9, timeout=0.4)
@@ -7172,3 +7410,1403 @@ class TestAms1FaultReachesEveryErrorPath:
                 assert word not in src, (
                     f"{name} matches fault text itself; the AMS 1 says none of "
                     f"those words -- keep detection in the bridge")
+
+
+class TestTheFirmwareVerdictOutranksNarration:
+    """
+    fw >= 1.9.3.0 publishes a per-bay scan verdict in the status frame:
+    scan_seq advances when the firmware's scan window resolves for THAT bay,
+    scan_res says how (1 read / 2 foreign / 3 no tag).
+
+    Why it exists, measured live with two boxed units: the narration stamps
+    are bridge-wide (per address class at best) and both boxed units narrate
+    as 0x0700 -- so a sibling's "read success" answered for this bay, and ANY
+    cycle-end (including this unit's OWN insert-preload, which runs before
+    the commanded scan) finalised this bay as no-tag. Back-to-back inserts on
+    two units finalised the second as "no readable tag profile" with the
+    tag's UID sitting in the same log line.
+    """
+
+    def _u(self, seq=None, res=None, base=None, read_ok=False, ended=False,
+           t0=100.0, now=101.0):
+        b = MagicMock()
+        b.rfid_read_succeeded_since = lambda since, addr=None: read_ok
+        b.rfid_cycle_ended_since = lambda since, addr=None: ended
+        info = {"index": 0, "present": True}
+        if seq is not None:
+            info["scan_seq"] = seq
+            info["scan_res"] = res
+        u = types.SimpleNamespace(
+            _bridge=b, _scan_t0=[t0], dry_dev_addr=0x0700,
+            SCAN_FALLBACK_CAP=afcBambuAMS.SCAN_FALLBACK_CAP,
+            SCAN_VERDICT_CAP=afcBambuAMS.SCAN_VERDICT_CAP,
+            _slots=[info],
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: now)))
+        if base is not None:
+            u._scan_seq0 = {0: base}
+        return u
+
+    def test_a_resolved_read_is_read(self):
+        u = self._u(seq=2, res=1, base=1)
+        assert afcBambuAMS._scan_verdict(u, 0) == "read"
+
+    def test_a_resolved_no_tag_is_notag(self):
+        u = self._u(seq=2, res=3, base=1)
+        assert afcBambuAMS._scan_verdict(u, 0) == "notag"
+
+    def test_a_foreign_tag_finalizes_to_defaults(self):
+        # res 2 = a chip answered anticollision but auth failed. The verdict
+        # is "notag" -- _finalize_scan's operator message is what tells a
+        # third-party spool from an empty reader, not the verdict.
+        u = self._u(seq=2, res=2, base=1)
+        assert afcBambuAMS._scan_verdict(u, 0) == "notag"
+
+    def test_a_siblings_read_success_cannot_answer_for_this_bay(self):
+        # THE cross-credit pin. The narration says a read succeeded (it was
+        # the OTHER unit's), but this bay's firmware verdict has not resolved:
+        # the answer is still "waiting", never "read".
+        u = self._u(seq=1, res=1, base=1, read_ok=True)
+        assert afcBambuAMS._scan_verdict(u, 0) == "waiting"
+
+    def test_a_siblings_cycle_end_cannot_finalize_this_bay(self):
+        # The mirror image: any unit's cycle-end used to finalize this bay as
+        # no-tag -- the live "no readable tag profile" failure on back-to-back
+        # inserts. With an unresolved firmware verdict it stays "waiting".
+        u = self._u(seq=1, res=None, base=1, ended=True)
+        assert afcBambuAMS._scan_verdict(u, 0) == "waiting"
+
+    def test_reinserting_the_same_spool_still_reads(self):
+        # Same spool back in the bay: the record bytes are identical, but the
+        # firmware still bumps the seq when its window resolves -- the case
+        # that sank every record-content comparison scheme.
+        u = self._u(seq=2, res=1, base=1)
+        assert afcBambuAMS._scan_verdict(u, 0) == "read"
+
+    def test_first_resolution_after_boot_counts(self):
+        # No baseline recorded (scan opened before any verdict existed):
+        # seq 1 vs baseline None is an advance.
+        u = self._u(seq=1, res=1)
+        assert afcBambuAMS._scan_verdict(u, 0) == "read"
+
+    def test_the_silence_backstop_survives_the_seq_path(self):
+        # Firmware frames stopped mid-scan: the seq can never advance, and the
+        # verdict must still fall back to no-tag rather than waiting forever.
+        u = self._u(seq=1, res=None, base=1,
+                    now=100.0 + afcBambuAMS.SCAN_VERDICT_CAP + 1.0)
+        assert afcBambuAMS._scan_verdict(u, 0) == "notag"
+
+    def test_the_short_cap_does_not_preempt_the_firmware(self):
+        # The 45 s narration-mode cap must NOT fire on the seq path: measured
+        # live, a presence flap opened the hold early and the short cap
+        # finalized defaults mid-preload -- a timer answering instead of the
+        # unit. Past 45 s but inside SCAN_VERDICT_CAP the answer is still
+        # "waiting".
+        u = self._u(seq=1, res=None, base=1,
+                    now=100.0 + afcBambuAMS.SCAN_FALLBACK_CAP + 5.0)
+        u.SCAN_VERDICT_CAP = afcBambuAMS.SCAN_VERDICT_CAP
+        assert afcBambuAMS._scan_verdict(u, 0) == "waiting"
+
+    def test_old_firmware_falls_back_to_narration(self):
+        # No scan_seq in the record (fw < 1.9.3.0): the narration stamps
+        # decide, exactly as before.
+        u = self._u(read_ok=True)
+        assert afcBambuAMS._scan_verdict(u, 0) == "read"
+
+    def test_open_scan_baselines_the_seq(self):
+        u = self._u(seq=7, res=1)
+        u._scan_notag = [False]
+        u._scan_seq0 = {}
+        afcBambuAMS._open_scan(u, 0)
+        assert u._scan_seq0[0] == 7
+        # A verdict resolved BEFORE this scan opened must not answer it.
+        assert afcBambuAMS._scan_verdict(u, 0) == "waiting"
+
+
+class TestMemoLifecycleOnPhysicalEdges:
+    """
+    The Spoolman memos are per-OCCUPANCY, not per-session: a spool physically
+    moving is the only event that can change their answers, so the edges clear
+    them. Live failure this pins: UID 0A1882AC stayed memoized as "no
+    Spoolman match" while spool 87 verifiably carried it -- the operator's
+    bind-then-reinsert workflow could never recover without a restart.
+    """
+
+    def test_forget_spares_the_binding_check(self):
+        # The miss memo clears on physical edges; the binding-check memo does
+        # NOT. Clearing it per edge re-probed Spoolman for every bound lane on
+        # the next pass, and scan motion flaps edges in bursts -- blocking
+        # HTTP on the reactor, the "Timer too close" class. It resets only
+        # with the connection.
+        u = types.SimpleNamespace(
+            _spoolman_no_match={"AABBCCDD"},
+            _binding_check={("87", "AABBCCDD"): False},
+            _slots=[{}], SLOTS_PER_UNIT=4)
+        afcBambuAMS._forget_spoolman_miss(u, 0)
+        assert not u._spoolman_no_match
+        assert u._binding_check == {("87", "AABBCCDD"): False}
+
+    def test_a_binding_lookup_failure_is_not_memoized(self):
+        # get_spool raising must not settle the (spool, uid) verdict: the next
+        # status pass retries once Spoolman is back. Only real answers are
+        # memoized.
+        client = MagicMock()
+        client.get_spool.side_effect = RuntimeError("down")
+        import extras.AFC_BambuAMS as mod
+        u = types.SimpleNamespace(afc=object())
+        orig = mod._bambu_spoolman_client
+        mod._bambu_spoolman_client = lambda afc: client
+        try:
+            assert afcBambuAMS._binding_contradicted(u, 87, "AABBCCDD") is False
+            assert not getattr(u, "_binding_check", {})
+            # Spoolman comes back with a real contradiction: the verdict now
+            # lands (and memoizes) instead of being masked by the failed try.
+            client.get_spool.side_effect = None
+            client.get_spool.return_value = {
+                "extra": {"card_uids": "\"11223344\""}}
+            assert afcBambuAMS._binding_contradicted(u, 87, "AABBCCDD") is True
+            assert u._binding_check[("87", "AABBCCDD")] is True
+        finally:
+            mod._bambu_spoolman_client = orig
+
+
+class TestALateTagBeatsANoTagVerdict:
+    """The bay's record can improve AFTER the unit has answered.
+
+    "Two outcomes, never three" assumed it could not. Measured live on AMS 2
+    bay 1: the scan resolved no-tag (its narration never reached the window),
+    the background fill then re-read the bay and the record filled in with
+    PLA Matte / A3D8E1 / uid ecb61cd0 / remain 100 -- while lane19 sat on
+    PLA/1000 g defaults, because the no-tag latch blocks a bay from surfacing
+    until the spool is physically pulled. The lane and the record disagreed,
+    and the record was right.
+    """
+
+    def _u(self, info):
+        lane = types.SimpleNamespace(name="lane19", status=None, spool_id=None)
+        u = types.SimpleNamespace(
+            name="BambuAMS_2", _slots=[info], _slot_map={"lane19": 0},
+            lanes={"lane19": lane}, _scan_notag=[False], _afc_owned=set(), _prep_seen=True,
+            _measure_settled=lambda slot, info: True,
+            _scan_t0=[100.0], _prev_present=[True], SLOTS_PER_UNIT=4,
+            unit_slots=4, logger=_Logger(), surfaced=[], finalized=[],
+            _ACTIVE_STATES=afcBambuAMS._ACTIVE_STATES,
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: 200.0)))
+        u._scan_verdict = lambda s: "notag"
+        u._maybe_auto_scan = lambda s, p, i: None
+        u._is_virtual_hub = lambda l: False
+        u.lane_loaded = lambda l: None
+        u.lane_not_ready = lambda l: None
+        u.lane_illuminate_spool = lambda l: None
+        u._drain_spool_summary = lambda s: None
+        u._release_scan_hold = lambda s: u._scan_t0.__setitem__(s, None)
+        u._finalize_scan = lambda s: u.finalized.append(s)
+        u._surface_slot_info = lambda l, i: u.surfaced.append(i)
+        return u, lane
+
+    def test_a_record_with_a_tag_is_surfaced_despite_the_notag_verdict(self):
+        u, lane = self._u({"index": 0, "present": True, "material": "PLA Matte",
+                           "rfid_uid": "ecb61cd0", "color": "A3D8E1"})
+        afcBambuAMS._sync_lanes(u)
+        assert u.surfaced, "a real tag must reach the lane"
+        assert not u.finalized, "defaults must not be applied over a real tag"
+        assert u._scan_notag[0] is False   # latch cleared, not stuck
+
+    def test_a_genuinely_empty_record_still_gets_defaults(self):
+        u, lane = self._u({"index": 0, "present": True,
+                           "material": "", "rfid_uid": None})
+        afcBambuAMS._sync_lanes(u)
+        assert u.finalized == [0]
+        assert not u.surfaced
+
+    def test_a_uid_without_a_profile_is_not_enough(self):
+        # A chip that anticollided but never decoded is not a tag read; the
+        # no-tag path owns that case and its message names it.
+        u, lane = self._u({"index": 0, "present": True,
+                           "material": "", "rfid_uid": "d34e4e39"})
+        afcBambuAMS._sync_lanes(u)
+        assert u.finalized == [0]
+        assert not u.surfaced
+
+
+class TestTheMeasurementIsAttributedByTheWindow:
+    """AMS 1's measurement must never land on AMS 2's spool.
+
+    Measured live: "[AMS_DEV] odom C:0.360,R:0.057,P:23%" from AMS 1 was
+    adopted by AMS 2 -- which had a capacity window pending -- and written to
+    Spoolman spool 109 as 230 g, recording a ~900 g reel as nearly empty. The
+    narration arrives on device 0x0700 and BOTH boxed units answer there, so
+    the address cannot attribute it; the firmware's capacity window can,
+    because it was opened for a specific bay.
+    """
+
+    def _u(self, info):
+        lane = types.SimpleNamespace(name="lane19", status=None, spool_id=109)
+        u = types.SimpleNamespace(
+            name="BambuAMS_2", _slots=[info], _slot_map={"lane19": 0},
+            lanes={"lane19": lane}, _scan_notag=[False], _scan_t0=[None],
+            _afc_owned=set(), _prep_seen=True,
+            _measure_settled=lambda slot, info: True,
+            _prev_present=[True], SLOTS_PER_UNIT=4, unit_slots=4,
+            logger=_Logger(), adopted=[],
+            _ACTIVE_STATES=afcBambuAMS._ACTIVE_STATES,
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: 200.0)))
+        u._scan_verdict = lambda s: "none"
+        u._maybe_auto_scan = lambda s, p, i: None
+        u._is_virtual_hub = lambda l: False
+        u.lane_loaded = lambda l: None
+        u.lane_not_ready = lambda l: None
+        u.lane_illuminate_spool = lambda l: None
+        u._drain_spool_summary = lambda s: None
+        u._surface_slot_info = lambda l, i: None
+        u._adopt_measured_remain = lambda s, p, src="": u.adopted.append((s, p, src))
+        return u
+
+    def _info(self, **kw):
+        base = {"index": 0, "present": True, "material": "PLA Matte",
+                "rfid_uid": "ecb61cd0"}
+        base.update(kw)
+        return base
+
+    def test_a_measurement_on_this_bay_is_adopted_once(self):
+        u = self._u(self._info(meas_pct=23, meas_seq=1))
+        afcBambuAMS._sync_lanes(u)
+        afcBambuAMS._sync_lanes(u)          # same seq: already counted
+        assert u.adopted == [(0, 23, "physical AMS measurement")]
+
+    def test_a_fresh_measurement_of_the_same_value_is_new_news(self):
+        info = self._info(meas_pct=23, meas_seq=1)
+        u = self._u(info)
+        afcBambuAMS._sync_lanes(u)
+        info["meas_seq"] = 2                # measured again, same percent
+        afcBambuAMS._sync_lanes(u)
+        assert len(u.adopted) == 2
+
+    def test_no_measurement_means_nothing_is_adopted(self):
+        u = self._u(self._info(meas_pct=None, meas_seq=0))
+        afcBambuAMS._sync_lanes(u)
+        assert u.adopted == []
+
+    def test_older_firmware_does_not_adopt_from_this_path(self):
+        # No mpct/mseq in the frame at all: the narration path stays in charge.
+        u = self._u(self._info())
+        afcBambuAMS._sync_lanes(u)
+        assert u.adopted == []
+
+
+class TestEachModelOwnsItsBehaviour:
+    """AMS 1, AMS 2 and the HT are three machines, not one with an if.
+
+    Every assertion here is a regression that actually shipped tonight
+    because a shared branch decided something model-specific.
+    """
+
+    def _u(self, model):
+        u = afcBambuAMS.__new__(afcBambuAMS)
+        u.ams_model = model
+        return u
+
+    def test_every_model_has_a_profile(self):
+        for m in ("ams1", "ams2", "ht"):
+            assert self._u(m).profile["fw_model"] in (0, 1, 2)
+
+    def test_the_three_models_are_distinct_to_the_firmware(self):
+        seen = {self._u(m).profile["fw_model"] for m in ("ams1", "ams2", "ht")}
+        assert seen == {0, 1, 2}, "AMS 1 and AMS 2 must not share a row"
+
+    def test_only_the_ht_is_ht(self):
+        assert self._u("ht")._is_ht() is True
+        assert self._u("ams1")._is_ht() is False
+        assert self._u("ams2")._is_ht() is False
+
+    def test_the_ht_is_never_pre_read(self):
+        # A plain 0x211 to an HT answers instantly from its FLASH CACHE --
+        # the previous spool on a swap. The boxed units answer for the bay
+        # they were asked about.
+        assert self._u("ht").profile["pre_read_safe"] is False
+        assert self._u("ams1").profile["pre_read_safe"] is True
+        assert self._u("ams2").profile["pre_read_safe"] is True
+
+    def test_the_ht_scan_is_firmware_armed(self):
+        # The module must NOT command an HT scan: its window is armed on the
+        # insert edge in firmware, and a commanded read would collect the
+        # flash cache before the unit has touched the new tag.
+        assert self._u("ht").profile["commands_scan"] is False
+        assert self._u("ams1").profile["commands_scan"] is True
+        assert self._u("ams2").profile["commands_scan"] is True
+
+    def test_slot_counts_are_per_model(self):
+        assert self._u("ht").profile["slots"] == 1
+        assert self._u("ams1").profile["slots"] == 4
+        assert self._u("ams2").profile["slots"] == 4
+
+    def test_an_unknown_model_falls_back_without_raising(self):
+        # A typo in the config must not take a unit's identity with it.
+        assert self._u("nonsense").profile["fw_model"] in (0, 1, 2)
+
+
+class TestPrepKeepsWhatAFCRestored:
+    """PREP reads sensors. AFC owns the filament data.
+
+    Surfacing the bay's record at PREP is how one unit's tag reached
+    another's lane at startup -- uid 01d0ec0f applied to BOTH units' slot 2,
+    overwriting what AFC had correctly restored from vars. Every other unit
+    type refuses that job: OpenAMS's prep sets prep_state from its sensors
+    and touches no filament field.
+    """
+
+    def _lane(self, **kw):
+        lane = types.SimpleNamespace(
+            name="lane21", material="", color="", weight=0, spool_id=None,
+            prep_state=False, loaded_to_hub=False, status=None,
+            tool_loaded=False, index=3, map="T1")
+        for k, v in kw.items():
+            setattr(lane, k, v)
+        return lane
+
+    def _unit(self, lane, info):
+        u = types.SimpleNamespace(
+            name="BambuAMS_2", _slots=[info], surfaced=[],
+            lanes={lane.name: lane}, logger=_Logger(),
+            _bridge=MagicMock(), SLOTS_PER_UNIT=4, _afc_owned=set())
+        u._slot_of = lambda l: 0
+        u._unit_online = lambda latest: True
+        u._is_virtual_hub = lambda l: False
+        u.lane_loaded = lambda l: None
+        u.lane_not_ready = lambda l: None
+        u.lane_illuminate_spool = lambda l: None
+        u._surface_slot_info = lambda l, i: u.surfaced.append(i)
+        u._restore_sub_type = lambda l: None
+        u.afc = types.SimpleNamespace(
+            function=types.SimpleNamespace(TcmdAssign=lambda l: None))
+        return u
+
+    INFO = {"index": 0, "present": True, "material": "PLA Basic",
+            "rfid_uid": "01d0ec0f", "color": "9CDBD9"}
+
+    def test_a_lane_afc_restored_is_left_alone(self):
+        lane = self._lane(material="PLA", spool_id=109, color="#A3D8E1")
+        u = self._unit(lane, self.INFO)
+        afcBambuAMS.system_Test(u, lane, 0.0, False, False)
+        assert u.surfaced == [], "PREP must not overwrite restored lane data"
+        assert lane.spool_id == 109 and lane.color == "#A3D8E1"
+
+    def test_a_spoolman_linked_lane_with_no_material_is_still_left_alone(self):
+        # The binding is AFC's, re-hydrated from Spoolman at boot.
+        lane = self._lane(spool_id=137)
+        u = self._unit(lane, self.INFO)
+        afcBambuAMS.system_Test(u, lane, 0.0, False, False)
+        assert u.surfaced == []
+        assert lane.spool_id == 137
+
+    def test_an_empty_lane_still_gets_filled(self):
+        # Nothing to preserve, so a fresh install is not left blank.
+        lane = self._lane()
+        u = self._unit(lane, self.INFO)
+        afcBambuAMS.system_Test(u, lane, 0.0, False, False)
+        assert u.surfaced == [self.INFO]
+
+    def test_prep_still_sets_the_sensor_state(self):
+        lane = self._lane(material="PLA", spool_id=109)
+        u = self._unit(lane, self.INFO)
+        afcBambuAMS.system_Test(u, lane, 0.0, False, False)
+        assert lane.prep_state is True      # the sensor half still runs
+
+    def test_prep_marks_the_bay_so_the_status_path_defers_too(self):
+        # Gating PREP alone moves the overwrite by one poll, no further.
+        lane = self._lane(material="PLA", spool_id=109)
+        u = self._unit(lane, self.INFO)
+        afcBambuAMS.system_Test(u, lane, 0.0, False, False)
+        assert u._afc_owned == {0}
+
+    def test_prep_marks_nothing_for_a_lane_it_filled_itself(self):
+        lane = self._lane()
+        u = self._unit(lane, self.INFO)
+        afcBambuAMS.system_Test(u, lane, 0.0, False, False)
+        assert u._afc_owned == set()
+
+
+class TestTheStatusPathDefersToAFCUntilTheUnitAnswers:
+    """The other half of the boot rule.
+
+    PREP declining to surface only helps if the poll a second later declines
+    too: with no scan open the verdict is "none" and the bay just reports its
+    cached record, which is exactly the value PREP refused.
+    """
+
+    def _shim(self, verdict, owned, info=None, lane=None):
+        lane = lane or types.SimpleNamespace(
+            hub_obj=None, tool_loaded=False, prep_state=None,
+            _load_state=None, loaded_to_hub=None, status=None,
+            material="PLA", spool_id=109)
+        info = info if info is not None else {
+            "present": True, "material": "PLA Basic", "rfid_uid": "01d0ec0f"}
+        s = _sync_shim({"l": 0}, {"l": lane}, [info], verdict=verdict)
+        s.surfaced = []
+        s._surface_slot_info = lambda ln, i: s.surfaced.append(i)
+        s._afc_owned = set(owned)
+        s._fill_missing_variant = lambda ln, i: None
+        s._measure_settled = lambda slot, info: True
+        s.logger = _Logger()
+        s.name = "BambuAMS_2"
+        s.lane = lane
+        return s
+
+    def test_a_marked_bay_is_not_surfaced_with_no_scan_open(self):
+        s = self._shim("none", {0})
+        afcBambuAMS._sync_lanes(s)
+        assert s.surfaced == []
+
+    def test_an_unmarked_bay_is_surfaced_as_before(self):
+        s = self._shim("none", set())
+        afcBambuAMS._sync_lanes(s)
+        assert len(s.surfaced) == 1
+
+    def test_a_read_outranks_the_mark_and_clears_it(self):
+        # The unit answering for this bay beats anything restored from vars.
+        s = self._shim("read", {0})
+        s._log_tag_readout = lambda ln, i, force=False: None
+        afcBambuAMS._sync_lanes(s)
+        assert len(s.surfaced) == 1
+        assert s._afc_owned == set()
+
+    def test_pulling_the_spool_clears_the_mark(self):
+        # AFC's data described a spool that is no longer there.
+        s = self._shim("none", {0}, info={"present": False})
+        afcBambuAMS._sync_lanes(s)
+        assert s._afc_owned == set()
+
+    def test_a_notag_verdict_also_clears_the_mark(self):
+        s = self._shim("notag", {0},
+                       info={"present": True, "material": "", "rfid_uid": ""})
+        afcBambuAMS._sync_lanes(s)
+        assert s._afc_owned == set()
+
+    def test_nothing_is_written_before_prep_has_run(self):
+        # Measured on the printer: "applied tag to lane21" landed five
+        # seconds BEFORE "BambuAMS_2 Prepping lanes". AFC_prep restores the
+        # var file and then calls system_Test, so these early polls read a
+        # blank lane and would leave prep nothing to protect.
+        s = self._shim("none", set())
+        s._prep_seen = False
+        afcBambuAMS._sync_lanes(s)
+        assert s.surfaced == []
+
+    def test_the_sensor_half_still_runs_before_prep(self):
+        s = self._shim("none", set())
+        s._prep_seen = False
+        afcBambuAMS._sync_lanes(s)
+        assert s.lane.prep_state is True
+
+
+class TestTheVariantComesBackFromTheBay:
+    """The card renders material + sub_type itself.
+
+    Joining them in the lane's status produced "PLA Glow Glow" on the actual
+    panel -- four Bambu lanes reading a bare "PLA" is a MISSING sub_type.
+    Nothing outside this module can supply it: AFC's prep restores material,
+    colour, weight and the Spoolman link and not the variant, and Spoolman
+    has no sub_type field. The bay still has the whole string.
+    """
+
+    def _lane(self, **kw):
+        lane = types.SimpleNamespace(
+            name="lane15", material="PLA", sub_type="", spool_vendor="",
+            filament_name="", send_lane_data=lambda: None)
+        for k, v in kw.items():
+            setattr(lane, k, v)
+        return lane
+
+    def _u(self):
+        u = types.SimpleNamespace(name="BambuAMS_1", logger=_Logger(),
+                                  saved=[])
+        u._save_lane_vars = lambda: u.saved.append(True)
+        u._uid_claimed_elsewhere = lambda uid: False
+        return u
+
+    def _fill(self, lane, material="PLA Sparkle"):
+        afcBambuAMS._fill_missing_variant(self._u(), lane, {"material": material})
+        return lane
+
+    def test_the_variant_is_taken_from_the_record(self):
+        assert self._fill(self._lane()).sub_type == "Sparkle"
+
+    def test_the_material_is_not_touched(self):
+        # The card joins the two; writing "PLA Sparkle" here doubles it.
+        assert self._fill(self._lane()).material == "PLA"
+
+    def test_a_variant_already_on_the_lane_wins(self):
+        lane = self._fill(self._lane(sub_type="Matte"))
+        assert lane.sub_type == "Matte"
+
+    def test_a_different_material_cannot_decorate_the_lane(self):
+        # A bay reporting PETG has nothing to say about a PLA lane.
+        lane = self._fill(self._lane(), material="PETG HF")
+        assert lane.sub_type == ""
+
+    def test_a_record_with_no_variant_changes_nothing(self):
+        assert self._fill(self._lane(), material="PLA").sub_type == ""
+
+    def test_an_unknown_record_changes_nothing(self):
+        assert self._fill(self._lane(), material="unknown").sub_type == ""
+
+    def test_a_blank_record_changes_nothing(self):
+        assert self._fill(self._lane(), material="").sub_type == ""
+
+    def test_the_vendor_and_display_name_are_filled_in_too(self):
+        lane = self._fill(self._lane())
+        assert lane.spool_vendor == "Bambu"
+        assert lane.filament_name == "Bambu PLA Sparkle"
+
+    def test_an_existing_display_name_is_left_alone(self):
+        lane = self._fill(self._lane(filament_name="My Custom Name"))
+        assert lane.filament_name == "My Custom Name"
+
+    def test_the_change_is_persisted_once(self):
+        u = self._u()
+        lane = self._lane()
+        info = {"material": "PLA Sparkle"}
+        afcBambuAMS._fill_missing_variant(u, lane, info)
+        afcBambuAMS._fill_missing_variant(u, lane, info)   # sub_type is set
+        assert u.saved == [True]
+
+
+class TestABootDeferredBayStillGetsItsVariant:
+    """The fill has to reach the lanes the boot rule is protecting -- those
+    are exactly the ones AFC restored without a variant."""
+
+    def test_a_marked_bay_is_filled_without_being_surfaced(self):
+        lane = types.SimpleNamespace(
+            name="lane15", hub_obj=None, tool_loaded=False, prep_state=None,
+            _load_state=None, loaded_to_hub=None, status=None, material="PLA",
+            spool_id=109, sub_type="", spool_vendor="", filament_name="",
+            send_lane_data=lambda: None)
+        info = {"present": True, "material": "PLA Sparkle",
+                "rfid_uid": "04c07001"}
+        s = _sync_shim({"l": 0}, {"l": lane}, [info], verdict="none")
+        s.surfaced = []
+        s._surface_slot_info = lambda ln, i: s.surfaced.append(i)
+        s._afc_owned = {0}
+        s._prep_seen = True
+        s.logger = _Logger()
+        s.name = "BambuAMS_1"
+        s._save_lane_vars = lambda: None
+        s._uid_claimed_elsewhere = lambda uid: False
+        s._fill_missing_variant = afcBambuAMS._fill_missing_variant.__get__(s)
+        afcBambuAMS._sync_lanes(s)
+        assert s.surfaced == []          # the boot rule still holds
+        assert lane.sub_type == "Sparkle"
+        assert lane.material == "PLA"    # and only the variant moved
+
+
+class TestAMS2WaitsForItsMeasurement:
+    """AMS 2 announces the read BEFORE it calibrates, and applying the tag
+    right then stops the calibration.
+
+    Two cycles, same unit, same spool, read line by line:
+
+      07:00 SUCCEEDED -- the card was already in range so the read was silent
+      ("cali read tray 1", no read phrase), the module never fired an apply,
+      and nothing but our capacity enables sat between "first detected"
+      (07:00:33) and "second detected ... P:87%" (07:00:40).
+
+      12:03 STALLED -- "read success,valid" at 12:03:15, apply and Spoolman
+      round-trip at 12:03:15.141, calibration started 12:03:18, and mid-window
+      at 12:03:35 "STEP:rfid pull 0" (which in the good cycle came AFTER
+      "odom calib success"). Five seconds later "cali end", no percentage.
+    """
+
+    def _u(self, model, mseq0=None, mseq=None, ended=False):
+        u = types.SimpleNamespace(
+            name="BambuAMS_2", ams_model=model, logger=_Logger(),
+            _slot_map={"lane19": 0}, _scan_t0=[100.0], dry_dev_addr=0x0700,
+            _meas_seq0={0: mseq0}, _measure_wait_said=set(),
+            _bridge=types.SimpleNamespace(
+                rfid_cycle_ended_since=lambda since, addr=None: ended))
+        u.profile = afcBambuAMS._PROFILES[model]
+        return u
+
+    def _settled(self, u, mseq=None):
+        return afcBambuAMS._measure_settled(u, 0, {"meas_seq": mseq})
+
+    def test_ams2_holds_the_lane_after_a_read(self):
+        assert self._settled(self._u("ams2")) is False
+
+    def test_ams2_applies_once_the_measurement_lands(self):
+        # meas_seq moved past what _open_scan baselined.
+        assert self._settled(self._u("ams2", mseq0=4), mseq=5) is True
+
+    def test_a_measurement_that_has_not_moved_is_not_this_scans(self):
+        assert self._settled(self._u("ams2", mseq0=4), mseq=4) is False
+
+    def test_ams2_applies_when_the_unit_ends_the_cycle_without_one(self):
+        # "cali end" with no percentage: finished, nothing coming.
+        assert self._settled(self._u("ams2", ended=True)) is True
+
+    def test_ams1_never_waits(self):
+        # Nine clean measurements in the same log with the apply going out
+        # mid-cycle. It does not need the wait, so it does not take it.
+        assert self._settled(self._u("ams1")) is True
+
+    def test_the_ht_never_waits(self):
+        assert self._settled(self._u("ht")) is True
+
+    def test_the_wait_is_announced_once_not_per_status_frame(self):
+        u = self._u("ams2")
+        for _ in range(5):
+            self._settled(u)
+        said = [m for k, m in u.logger.messages
+                if k == "info" and "holding the lane" in m]
+        assert len(said) == 1
+
+    def test_the_wait_names_the_lane(self):
+        u = self._u("ams2")
+        self._settled(u)
+        assert any("lane19" in m for _, m in u.logger.messages)
+
+    def test_a_broken_bridge_helper_never_blocks_the_lane(self):
+        u = self._u("ams2")
+        u._bridge.rfid_cycle_ended_since = MagicMock(side_effect=RuntimeError)
+        assert self._settled(u) is True
+
+    def test_a_new_scan_gets_a_fresh_announcement(self):
+        u = self._u("ams2")
+        self._settled(u)
+        u._scan_t0 = [None]
+        u._slots = [{}]
+        u._scan_notag = [True]
+        u._bridge = None
+        u.afc = types.SimpleNamespace(
+            reactor=types.SimpleNamespace(monotonic=lambda: 200.0,
+                                          register_timer=lambda *a, **k: None,
+                                          NEVER=9e99, update_timer=lambda *a: None))
+        try:
+            afcBambuAMS._open_scan(u, 0)
+        except Exception:
+            pass
+        assert 0 not in u._measure_wait_said
+
+
+class TestADuplicatedUIDIsNotEvidence:
+    """A tag is one chip in one bay. Two units cannot both be reading it.
+
+    Measured after a reflash: the bridge's chain map came back "index 0:
+    A9CD... <- slot0=PLA Matte, slot2=PLA Matte" and "index 1: 68273B... <-
+    slot0=PLA Matte, slot2=PLA Matte" -- identical records for two units,
+    while AMS 1 physically held Sparkle and Basic. The UID pin was right and
+    the records behind it were not, and the variant fill wrote "Matte" over
+    lane15's Sparkle on the strength of it.
+    """
+
+    def _pair(self, other_slots):
+        a = afcBambuAMS.__new__(afcBambuAMS)
+        b = afcBambuAMS.__new__(afcBambuAMS)
+        b._slots = other_slots
+        a.afc = types.SimpleNamespace(units={"BambuAMS_1": a, "BambuAMS_2": b})
+        return a
+
+    def test_a_uid_another_unit_also_claims_is_refused(self):
+        a = self._pair([{"present": True, "rfid_uid": "13f56d32"}])
+        assert a._uid_claimed_elsewhere("13f56d32") is True
+
+    def test_case_and_padding_do_not_hide_the_duplicate(self):
+        a = self._pair([{"present": True, "rfid_uid": " 13F56D32 "}])
+        assert a._uid_claimed_elsewhere("13f56d32") is True
+
+    def test_a_uid_only_this_unit_claims_is_fine(self):
+        a = self._pair([{"present": True, "rfid_uid": "ecb61cd0"}])
+        assert a._uid_claimed_elsewhere("04c07001") is False
+
+    def test_an_empty_bay_elsewhere_does_not_count(self):
+        # A stale record on a bay with nothing in it claims nothing.
+        a = self._pair([{"present": False, "rfid_uid": "04c07001"}])
+        assert a._uid_claimed_elsewhere("04c07001") is False
+
+    def test_no_uid_is_never_a_duplicate(self):
+        a = self._pair([{"present": True, "rfid_uid": "04c07001"}])
+        assert a._uid_claimed_elsewhere("") is False
+        assert a._uid_claimed_elsewhere(None) is False
+
+    def test_non_bambu_units_are_ignored(self):
+        a = afcBambuAMS.__new__(afcBambuAMS)
+        ace = types.SimpleNamespace(_slots=[{"present": True,
+                                             "rfid_uid": "04c07001"}])
+        a.afc = types.SimpleNamespace(units={"a": a, "Ace2_1": ace})
+        assert a._uid_claimed_elsewhere("04c07001") is False
+
+    def test_the_fill_refuses_a_duplicated_record(self):
+        u = afcBambuAMS.__new__(afcBambuAMS)
+        other = afcBambuAMS.__new__(afcBambuAMS)
+        other._slots = [{"present": True, "rfid_uid": "13f56d32"}]
+        u.afc = types.SimpleNamespace(units={"a": u, "b": other})
+        u.name = "BambuAMS_1"
+        u.logger = _Logger()
+        u._save_lane_vars = lambda: None
+        lane = types.SimpleNamespace(name="lane15", material="PLA",
+                                     sub_type="", spool_vendor="",
+                                     filament_name="",
+                                     send_lane_data=lambda: None)
+        u._fill_missing_variant(lane, {"material": "PLA Matte",
+                                       "rfid_uid": "13f56d32"})
+        assert lane.sub_type == ""      # Sparkle is not overwritten by Matte
+
+
+class TestAConfirmationIsNotANoOpTheFirstTime:
+    """The chain order is not stable across reboots.
+
+    Both boxed units answer on 0x0700, so enrollment order is whoever
+    replies first, and the log has it flipping: A9CD=1/68273B=0 at 07:22,
+    flipped at 07:37, back for ten boots from 11:09, flipped again at 12:13.
+
+    Before resolution every unit sits on its config ams_index (default 0),
+    so both boxed units consume index 0's frames. The one that pins
+    elsewhere clears its cache; the one that CONFIRMS the index it was
+    already assuming used to keep it -- and on a flip boot that cache is the
+    other unit's. That is the 12:13 boot, where both units reported
+    slot0=PLA Matte / slot2=PLA Matte while AMS 1 held Sparkle and Basic.
+    """
+
+    def _shim(self, resolved):
+        sent = []
+        u = types.SimpleNamespace(
+            name="BambuAMS_1", ams_index=0, unit_uid="A9CD", SLOTS_PER_UNIT=4,
+            _dry_id_follows_index=False, _id_resolved=resolved,
+            _announce_deferred=False, _announce_defer_warned=False,
+            _announce_unit=lambda: None, ams_model="ams1",
+            logger=types.SimpleNamespace(info=lambda m: None,
+                                         debug=lambda m: None,
+                                         warning=lambda m: None),
+            _bridge=types.SimpleNamespace(send=lambda o: sent.append(o)))
+        u._slots = [{"present": True, "rfid_uid": "ecb61cd0",
+                     "material": "PLA Matte"}, {}, {}, {}]
+        u._send_ht_flag = lambda b: None
+        u._send_mc_addr = lambda b: None
+        u._is_ht = lambda: False
+        return u, sent
+
+    def test_the_first_confirmation_drops_the_unverified_cache(self):
+        u, sent = self._shim(resolved=False)
+        afcBambuAMS._adopt_index(u, 0)          # same index it was assuming
+        assert u._slots == [{}, {}, {}, {}]
+
+    def test_the_first_confirmation_re_seeds_from_the_verified_index(self):
+        u, sent = self._shim(resolved=False)
+        afcBambuAMS._adopt_index(u, 0)
+        assert {"cmd": "status"} in sent
+
+    def test_a_later_confirmation_keeps_the_cache(self):
+        # Re-confirmations happen at every reconnect; the index was already
+        # verified, so the records under it are this unit's.
+        u, sent = self._shim(resolved=True)
+        afcBambuAMS._adopt_index(u, 0)
+        assert u._slots[0]["rfid_uid"] == "ecb61cd0"
+
+    def test_the_index_is_marked_resolved_either_way(self):
+        u, _ = self._shim(resolved=False)
+        afcBambuAMS._adopt_index(u, 0)
+        assert u._id_resolved is True
+
+    def test_a_changed_pin_still_clears_as_before(self):
+        u, sent = self._shim(resolved=True)
+        afcBambuAMS._adopt_index(u, 1)
+        assert u._slots == [{}, {}, {}, {}]
+        assert u.ams_index == 1
+
+
+class TestTheIdentityTableIsPushedAndPersisted:
+    """Class, order and MODEL all arrive when Klipper connects, and the Pico
+    enumerates the chain at power-up -- so the first enrollment knows none of
+    them. Keyed by UID they are knowable before a unit has an index, which is
+    what lets the firmware keep them in flash and be right first time.
+    """
+
+    def _unit(self, name, uid, model, is_ht=False):
+        u = types.SimpleNamespace(unit_uid=uid, ams_model=model)
+        u._is_ht = lambda: is_ht
+        u.profile = afcBambuAMS._PROFILES[model]
+        return (name, u)
+
+    def _send(self, units):
+        sent = []
+        shim = types.SimpleNamespace(
+            printer=types.SimpleNamespace(lookup_objects=lambda k: units))
+        bridge = types.SimpleNamespace(send=lambda o: sent.append(o))
+        afcBambuAMS._send_bindings(shim, bridge)
+        return sent
+
+    ALL = None
+
+    def _all(self):
+        return [self._unit("BambuAMS_1", "A" * 24, "ams1"),
+                self._unit("BambuAMS_2", "B" * 24, "ams2"),
+                self._unit("BambuAMS_HT", "C" * 24, "ht", is_ht=True)]
+
+    def test_every_unit_is_bound_with_its_model(self):
+        binds = [o for o in self._send(self._all()) if o.get("cmd") == "bind"]
+        assert [(b["idx"], b["m"]) for b in binds] == [(0, 0), (1, 1), (2, 2)]
+
+    def test_boxed_units_come_before_hts(self):
+        binds = [o for o in self._send(self._all()) if o.get("cmd") == "bind"]
+        assert binds[-1]["uid"] == "C" * 24      # the HT is last
+
+    def test_the_save_is_requested_once_after_the_binds(self):
+        sent = self._send(self._all())
+        assert [o.get("cmd") for o in sent].count("idsave") == 1
+        assert sent[-1] == {"cmd": "idsave"}     # after every bind
+
+    def test_an_unknown_model_still_binds_without_raising(self):
+        # A typo in ams_model must not cost the unit its place in the chain.
+        name, u = self._unit("BambuAMS_1", "A" * 24, "ams1")
+        u.profile = {}                            # no fw_model key
+        binds = [o for o in self._send([(name, u)]) if o.get("cmd") == "bind"]
+        assert binds[0]["m"] in (0, 1, 2)
+
+    def test_a_unit_without_a_uid_is_skipped(self):
+        units = [self._unit("BambuAMS_1", "", "ams1")] + self._all()[1:]
+        binds = [o for o in self._send(units) if o.get("cmd") == "bind"]
+        assert all(b["uid"] for b in binds)
+        assert len(binds) == 2
+
+    def test_nothing_is_sent_when_no_unit_has_a_uid(self):
+        units = [self._unit("BambuAMS_1", "", "ams1")]
+        assert self._send(units) == []
+
+
+class TestTheVariantComesBackFromTheVarFile:
+    """get_status writes sub_type on every save and AFC_prep never reads it
+    back, so every restart returns a lane with its variant blank -- lane23
+    came back "PLA" instead of "PLA Glow".
+
+    _fill_missing_variant covers this from the bay's record, but only when
+    there IS one: the HT stopped re-scanning on boot (a reboot is not an
+    insert), so nothing refreshed its record and the variant stayed lost. The
+    value was in the var file the whole time.
+    """
+
+    def _u(self, tmp_path, saved):
+        import json as _json
+        var = str(tmp_path / "AFC")
+        with open(var + ".unit", "w") as fh:
+            _json.dump({"BambuAMS_HT": {"lane23": saved}}, fh)
+        u = types.SimpleNamespace(
+            name="BambuAMS_HT",
+            afc=types.SimpleNamespace(VarFile=var))
+        return u
+
+    def _lane(self, sub=""):
+        return types.SimpleNamespace(name="lane23", sub_type=sub)
+
+    def test_the_variant_is_restored(self, tmp_path):
+        u = self._u(tmp_path, {"material": "PLA", "sub_type": "Glow"})
+        lane = self._lane()
+        afcBambuAMS._restore_sub_type(u, lane)
+        assert lane.sub_type == "Glow"
+
+    def test_a_variant_already_on_the_lane_wins(self, tmp_path):
+        # It came from a tag this session; a stored string is not closer.
+        u = self._u(tmp_path, {"sub_type": "Glow"})
+        lane = self._lane(sub="Matte")
+        afcBambuAMS._restore_sub_type(u, lane)
+        assert lane.sub_type == "Matte"
+
+    def test_a_blank_stored_value_changes_nothing(self, tmp_path):
+        u = self._u(tmp_path, {"material": "PLA", "sub_type": ""})
+        lane = self._lane()
+        afcBambuAMS._restore_sub_type(u, lane)
+        assert lane.sub_type == ""
+
+    def test_a_missing_lane_entry_changes_nothing(self, tmp_path):
+        u = self._u(tmp_path, {"sub_type": "Glow"})
+        lane = types.SimpleNamespace(name="lane99", sub_type="")
+        afcBambuAMS._restore_sub_type(u, lane)
+        assert lane.sub_type == ""
+
+    def test_a_missing_var_file_never_raises(self):
+        u = types.SimpleNamespace(
+            name="BambuAMS_HT",
+            afc=types.SimpleNamespace(VarFile="/nonexistent/AFC"))
+        lane = self._lane()
+        afcBambuAMS._restore_sub_type(u, lane)      # no raise
+        assert lane.sub_type == ""
+
+    def test_bad_json_never_raises(self, tmp_path):
+        var = str(tmp_path / "AFC")
+        open(var + ".unit", "w").write("{not json")
+        u = types.SimpleNamespace(
+            name="BambuAMS_HT", afc=types.SimpleNamespace(VarFile=var))
+        lane = self._lane()
+        afcBambuAMS._restore_sub_type(u, lane)      # no raise
+        assert lane.sub_type == ""
+
+
+class TestAMeasurementOutlivesTheSession:
+    """lane.weight was set and never persisted. A Spoolman-bound lane survived
+    a restart through re-hydration -- lane19's 900 g came back -- so this was
+    invisible there, and not on lane15, whose measured 250 g reverted to the
+    stored 220 the moment Klipper restarted.
+    """
+
+    def _u(self, lane):
+        u = types.SimpleNamespace(
+            name="BambuAMS_1", logger=_Logger(), saves=[],
+            SLOTS_PER_UNIT=4, _slot_map={"lane15": 0},
+            lanes={"lane15": lane}, _meas_pct={}, _spoolman_push=True)
+        u._save_lane_vars = lambda: u.saves.append(True)
+        u._queue_spool_summary = lambda *a: None
+        u._push_measured_to_spoolman = lambda l, g: None
+        u._lane_for_slot = lambda s: lane
+        return u
+
+    def test_a_measured_weight_is_persisted(self):
+        lane = types.SimpleNamespace(name="lane15", weight=220.0,
+                                     spool_id=None)
+        u = self._u(lane)
+        u._slots = [{"weight": 1000}]
+        ok = afcBambuAMS._adopt_measured_remain(u, 0, 25, "test")
+        if ok:                                  # the path that sets weight
+            assert lane.weight == 250
+            assert u.saves == [True], "a measurement must outlive the session"
+
+
+class TestTheTagsStoredRemainNeverSetsTheWeight:
+    """A MEASUREMENT OUTRANKS THE TAG. The tag still beats nothing at all.
+
+    _surface_slot_info scaled the nominal by info["remain_pct"] -- the
+    percentage written on the tag by whatever last wrote it, not this spool's
+    current contents. It overwrote lane15's MEASURED 250 g with the tag's 80%
+    of 1000 = 800 g, and once measurements began persisting properly that
+    wrong number reached the var file instead of evaporating at restart.
+    That case is still asserted below and must never come back.
+
+    The fix over-corrected, though: it barred the tag from the weight
+    ENTIRELY. An AMS 2 fast-paths any card it recognises -- "odom calib
+    success exit 0", its stored per-tray calibration confirmed on one edge,
+    no percent published, which is the unit's design and what a real printer
+    does too. On that path no measurement ever arrives, so a 60%-remaining
+    PETG reel sat on its lane as a full 1000 g indefinitely while the console
+    printed the honest 60% two lines earlier.
+
+    So the rule is precedence, not prohibition: a measurement wins whenever
+    there is one (_measured_remain), and the tag seeds the weight only when
+    there is not. A measurement landing later still overwrites.
+    """
+
+    def _apply(self, lane_weight, remain_pct, nominal=1000):
+        lane = types.SimpleNamespace(
+            name="lane15", material="", sub_type="", color="", spool_vendor="",
+            filament_name="", weight=lane_weight, spool_id=None,
+            extruder_temp=None, multi_color=[], bambu_sku="")
+        u = types.SimpleNamespace(name="BambuAMS_1", logger=_Logger())
+        u._save_lane_vars = lambda: None
+        u._spoolman_sync = lambda *a, **k: None
+        u._log_tag_readout = lambda *a, **k: None
+        u._apply_remain_weight = lambda l, i: None
+        afcBambuAMS._surface_slot_info(u, lane, {
+            "material": "PLA Sparkle", "color": "2D2B28", "weight": nominal,
+            "remain_pct": remain_pct, "rfid_uid": "04c07001"})
+        return lane
+
+    def test_a_measured_weight_is_not_overwritten_by_the_tag(self):
+        # The exact lane15 case: 250 g measured, tag says 80%.
+        assert self._apply(250, 80).weight == 250
+
+    def test_a_lane_on_the_nominal_takes_the_tag_percent_when_unmeasured(self):
+        # A lane sitting at exactly the nominal is a lane carrying a DEFAULT,
+        # not a claim. With no measurement for this bay the tag's 80% is the
+        # best thing known about the spool, and reporting a part-used reel as
+        # full is its own wrong answer.
+        assert self._apply(1000, 80).weight == 800
+
+    def test_an_empty_lane_takes_the_tag_percent_when_unmeasured(self):
+        assert self._apply(0, 80).weight == 800
+
+    def test_a_measurement_still_outranks_the_tag_on_a_nominal_lane(self):
+        # The precedence that matters: same nominal lane, same 80% tag, but
+        # this bay HAS an adopted measurement -- the tag must not touch it.
+        lane = types.SimpleNamespace(
+            name="lane15", material="", sub_type="", color="", spool_vendor="",
+            filament_name="", weight=1000, spool_id=None,
+            extruder_temp=None, multi_color=[], bambu_sku="")
+        u = types.SimpleNamespace(name="BambuAMS_1", logger=_Logger())
+        u._save_lane_vars = lambda: None
+        u._spoolman_sync = lambda *a, **k: None
+        u._log_tag_readout = lambda *a, **k: None
+        u._apply_remain_weight = lambda l, i: None
+        u._measured_remain = {2: 25}          # 25% measured for this slot
+        afcBambuAMS._surface_slot_info(u, lane, {
+            "material": "PLA Sparkle", "color": "2D2B28", "weight": 1000,
+            "remain_pct": 80, "rfid_uid": "04c07001", "index": 2})
+        assert lane.weight == 1000            # untouched by the tag
+
+    def test_a_zero_remain_tag_still_seeds_the_nominal(self):
+        assert self._apply(0, 0).weight == 1000
+
+    def test_the_profile_is_still_applied_to_an_unlinked_lane(self):
+        # No Spoolman match is not a reason to leave the lane blank -- the tag
+        # is what we know about the spool, so all of it goes on.
+        lane = self._apply(0, 80)
+        assert lane.material == "PLA"
+        assert lane.sub_type == "Sparkle"
+        assert lane.color == "#2D2B28"
+        assert lane.spool_vendor == "Bambu"
+        assert lane.filament_name == "Bambu PLA Sparkle"
+
+
+class TestTheTareBelongsToTheSpoolNotTheLane:
+    """
+    ``empty_spool_weight`` is written from Spoolman's ``spool_weight`` when a
+    lane binds (AFC_spool), so dropping the link has to put the CONFIGURED
+    value back -- otherwise the lane keeps a departed spool's tare, and since
+    the var file persists it, "keeps" means across every future restart.
+
+    Measured on this printer: several Spoolman entries carry
+    ``spool_weight: 1000`` -- the net filament weight typed into the empty-spool
+    field -- so lane15, bound to nothing, measured 220 g and reported a total
+    of 220 + 1000 g. It had held one of those spools once.
+    """
+
+    def _lane(self, tare=1000.0, configured=190):
+        cfg = types.SimpleNamespace(
+            getfloat=lambda k, d=None, **kw: configured)
+        return types.SimpleNamespace(
+            name="lane15", spool_id=87, empty_spool_weight=tare, _config=cfg)
+
+    def _u(self):
+        u = types.SimpleNamespace(
+            name="BambuAMS_1",
+            logger=types.SimpleNamespace(debug=lambda *a, **k: None))
+        u._restore_config_tare = afcBambuAMS._restore_config_tare.__get__(u)
+        u._unbind_spool = afcBambuAMS._unbind_spool.__get__(u)
+        u._clear_lane_filament = afcBambuAMS._clear_lane_filament.__get__(u)
+        return u
+
+    def test_unbinding_gives_the_configured_tare_back(self):
+        u, lane = self._u(), self._lane()
+        u._unbind_spool(lane, "the bay is empty")
+        assert lane.spool_id == ''
+        assert lane.empty_spool_weight == 190
+
+    def test_clearing_a_lane_does_it_too(self):
+        # The no-tag path blanks the profile without going through _unbind.
+        u, lane = self._u(), self._lane()
+        u._clear_lane_filament(lane)
+        assert lane.empty_spool_weight == 190
+
+    def test_a_lane_already_bound_to_nothing_is_left_alone(self):
+        # _unbind_spool returns early, so nothing is rewritten -- a lane the
+        # operator set by hand keeps what they set.
+        u, lane = self._u(), self._lane()
+        lane.spool_id = None
+        lane.empty_spool_weight = 250.0
+        u._unbind_spool(lane)
+        assert lane.empty_spool_weight == 250.0
+
+    def test_a_lane_config_that_sets_its_own_tare_wins(self):
+        u = self._u()
+        lane = self._lane(configured=420)
+        u._unbind_spool(lane)
+        assert lane.empty_spool_weight == 420
+
+    def test_a_lane_with_no_config_is_survived(self):
+        # Duck-typed stand-ins have no _config; leaving the value alone is the
+        # old behaviour and must not raise.
+        u = self._u()
+        lane = types.SimpleNamespace(name="lane15", spool_id=87,
+                                     empty_spool_weight=1000.0)
+        u._unbind_spool(lane)
+        assert lane.spool_id == ''
+        assert lane.empty_spool_weight == 1000.0
+
+
+class TestAnUnlinkedLaneKeepsItsNameAcrossARestart:
+    """
+    _fill_missing_variant used to return the moment ``sub_type`` was set, and
+    _restore_sub_type -- added later, at prep -- sets it from the var file. So
+    on an UNLINKED lane the second fix switched the first one off:
+
+        lane15  material 'PLA'  sub_type 'Sparkle'  filament_name ''
+        lane23  material 'PLA'  sub_type 'Glow'     filament_name 'Bambu Glow'
+
+    lane23 looked fine only because it is BOUND: set_spoolID re-hydrates it
+    from Spoolman, which has no sub_type column, so its sub_type came back
+    blank after prep and the fill still ran. lane15 has no spool to re-hydrate
+    from, so nothing wiped its sub_type and the early return took the other two
+    fields with it. filament_name is what the card displays.
+    """
+
+    def _u(self):
+        u = types.SimpleNamespace(
+            name="BambuAMS_1",
+            logger=types.SimpleNamespace(info=lambda *a, **k: None,
+                                         debug=lambda *a, **k: None),
+            _uid_claimed_elsewhere=lambda uid: False,
+            _save_lane_vars=lambda *a, **k: None)
+        u._fill_missing_variant = afcBambuAMS._fill_missing_variant.__get__(u)
+        return u
+
+    def _info(self, material="PLA Sparkle", uid="04c07001"):
+        return {"material": material, "rfid_uid": uid, "index": 0}
+
+    def test_a_restored_sub_type_no_longer_blocks_the_name(self):
+        u = self._u()
+        lane = types.SimpleNamespace(name="lane15", material="PLA",
+                                     sub_type="Sparkle", spool_vendor="",
+                                     filament_name="")
+        u._fill_missing_variant(lane, self._info())
+        assert lane.filament_name, "the card's field was left blank"
+        assert "Sparkle" in lane.filament_name
+        assert lane.spool_vendor
+
+    def test_a_lane_with_everything_is_left_alone(self):
+        u = self._u()
+        lane = types.SimpleNamespace(name="lane15", material="PLA",
+                                     sub_type="Sparkle",
+                                     spool_vendor="Somebody Else",
+                                     filament_name="A Name I Chose")
+        u._fill_missing_variant(lane, self._info())
+        assert lane.filament_name == "A Name I Chose"
+        assert lane.spool_vendor == "Somebody Else"
+
+    def test_a_blank_lane_still_gets_the_variant(self):
+        u = self._u()
+        lane = types.SimpleNamespace(name="lane23", material="PLA",
+                                     sub_type="", spool_vendor="",
+                                     filament_name="")
+        u._fill_missing_variant(lane, self._info("PLA Glow", "0a1882ac"))
+        assert lane.sub_type == "Glow"
+        assert lane.filament_name
+
+    def test_a_bay_holding_another_material_decorates_nothing(self):
+        # The guard that was already there, and must survive the wider gate.
+        u = self._u()
+        lane = types.SimpleNamespace(name="lane15", material="PLA",
+                                     sub_type="Sparkle", spool_vendor="",
+                                     filament_name="")
+        u._fill_missing_variant(lane, self._info("PETG Basic"))
+        assert lane.filament_name == ""
+
+    def test_a_uid_two_units_both_claim_decorates_nothing(self):
+        u = self._u()
+        u._uid_claimed_elsewhere = lambda uid: True
+        lane = types.SimpleNamespace(name="lane15", material="PLA",
+                                     sub_type="Sparkle", spool_vendor="",
+                                     filament_name="")
+        u._fill_missing_variant(lane, self._info())
+        assert lane.filament_name == ""
+
+
+class TestTheSummaryWaitsForTheSpoolmanAnswer:
+    """
+    The measured-spool summary names the Spoolman binding, and _bind_by_uid_bg
+    does that lookup off-reactor. So the bay's record can be complete while the
+    fact the sentence depends on is still a round-trip away -- and 170 ms was
+    enough to print the opposite of the truth:
+
+        17:20:11.781  ... not linked to a Spoolman spool, so this is kept on
+                      the lane only -- Spoolman has no spool carrying ECB61CD0
+        17:20:11.950  matched lane19 to Spoolman spool 109 by UID ecb61cd0
+
+    _spoolman_inflight holds exactly the UIDs whose lookup is running.
+    """
+
+    def _u(self, inflight=(), deadline=200.0, verdict="read"):
+        # deadline in the FUTURE by default (reactor clock is 100.0), so these
+        # exercise the hold rather than the backstop.
+        said = []
+        u = types.SimpleNamespace(
+            name="BambuAMS_2",
+            _slots=[{"index": 0, "material": "PLA Matte", "rfid_uid": "ecb61cd0"}],
+            _pending_summary={0: (91, 910, 1000, deadline)},
+            _spoolman_inflight=set(inflight),
+            _scan_verdict=lambda s: verdict,
+            _lane_for_slot=lambda s: types.SimpleNamespace(name="lane19"),
+            afc=types.SimpleNamespace(
+                reactor=types.SimpleNamespace(monotonic=lambda: 100.0)),
+        )
+        u._say_spool_summary = lambda *a, **k: said.append(a)
+        u._drain_spool_summary = \
+            afcBambuAMS._drain_spool_summary.__get__(u)
+        return u, said
+
+    def test_it_holds_while_the_lookup_is_running(self):
+        u, said = self._u(inflight=["ecb61cd0"])
+        u._drain_spool_summary(0)
+        assert said == [], "spoke while the Spoolman answer was in flight"
+        assert 0 in u._pending_summary, "dropped the summary instead of holding"
+
+    def test_it_speaks_once_the_lookup_finishes(self):
+        u, said = self._u(inflight=["ecb61cd0"])
+        u._drain_spool_summary(0)
+        u._spoolman_inflight.clear()          # the lookup came back
+        u._drain_spool_summary(0)
+        assert len(said) == 1
+        assert 0 not in u._pending_summary
+
+    def test_case_does_not_defeat_the_check(self):
+        # The record carries lower case; the in-flight set is seeded from the
+        # tag, which is upper. Matching literally would have missed every time.
+        u, said = self._u(inflight=["ECB61CD0"])
+        u._drain_spool_summary(0)
+        assert said == []
+
+    def test_an_unrelated_lookup_does_not_hold_this_bay(self):
+        u, said = self._u(inflight=["0a1882ac"])
+        u._drain_spool_summary(0)
+        assert len(said) == 1
+
+    def test_the_backstop_still_wins(self):
+        # A Spoolman that never answers must not silence the line for ever.
+        u, said = self._u(inflight=["ecb61cd0"], deadline=50.0)  # already past
+        u._drain_spool_summary(0)
+        assert len(said) == 1, "the backstop stopped working"
+
+    def test_no_uid_on_the_record_is_not_held(self):
+        u, said = self._u(inflight=["ecb61cd0"])
+        u._slots = [{"index": 0, "material": "PLA Matte", "rfid_uid": ""}]
+        u._drain_spool_summary(0)
+        assert len(said) == 1
+
+
+class TestNoScanWhileAnythingIsMovingFilament:
+    """A scan started beside a load shut the toolhead mcu down.
+
+        23:38:09  Loading lane21                     (AMS 2, slot 2)
+        23:38:28  spool INSERTED in slot 0 (BambuAMS_1)
+        23:38:28  new spool detected in slot 0, scanning tag
+        23:38:44  MCU 'EBBT0' shutdown: Timer too close
+
+    A tag scan holds the bus for tens of seconds; run beside a load it
+    starves Klipper's reactor until the toolhead misses its timers. The two
+    guards in place both had a hole: in_print() (a bare TOOL_LOAD is not a
+    print) and _unit_tool_loaded (asks about THIS unit -- the load was on the
+    other one). The hazard is any filament moving anywhere.
+    """
+
+    def _unit(self, lane_states=(), in_toolchange=False):
+        lanes = {f"lane{i}": types.SimpleNamespace(status=s)
+                 for i, s in enumerate(lane_states)}
+        afc = types.SimpleNamespace(in_toolchange=in_toolchange, lanes=lanes)
+        return types.SimpleNamespace(afc=afc,
+                                     _AFC_BUSY_STATES=afcBambuAMS._AFC_BUSY_STATES)
+
+    def test_idle_lanes_are_not_busy(self):
+        u = self._unit(("None", "Loaded", "Tool Loaded"))
+        assert afcBambuAMS._afc_motion_busy(u) is False
+
+    def test_a_load_on_ANOTHER_unit_is_busy(self):
+        # The crash: BambuAMS_1's insert while BambuAMS_2's lane21 loaded.
+        u = self._unit(("None", "Tool Loading"))
+        assert afcBambuAMS._afc_motion_busy(u) is True
+
+    def test_an_unload_is_busy(self):
+        assert afcBambuAMS._afc_motion_busy(self._unit(("Tool Unloading",))) is True
+
+    def test_a_toolchange_is_busy_even_with_quiet_lanes(self):
+        u = self._unit(("None",), in_toolchange=True)
+        assert afcBambuAMS._afc_motion_busy(u) is True
+
+    def test_an_unanswerable_afc_is_treated_as_busy(self):
+        # A false busy costs a few seconds; a false idle costs the print.
+        class Boom:
+            @property
+            def in_toolchange(self):
+                raise RuntimeError("AFC not answering")
+        u = types.SimpleNamespace(afc=Boom(),
+                                  _AFC_BUSY_STATES=afcBambuAMS._AFC_BUSY_STATES)
+        assert afcBambuAMS._afc_motion_busy(u) is True
+
+    def test_no_afc_at_all_is_not_busy(self):
+        u = types.SimpleNamespace(afc=None,
+                                  _AFC_BUSY_STATES=afcBambuAMS._AFC_BUSY_STATES)
+        assert afcBambuAMS._afc_motion_busy(u) is False
+
+
+from extras import AFC_BambuAMS_bridge as _brgmod  # noqa: E402
+
+
+class TestTheConsoleReadsLikeEnglish:
+    """The operator's console during a print was register dumps.
+
+    Pasted verbatim off a live print -- these were essentially every line
+    shown for minutes at a time, none of it actionable:
+
+        [AMS_PMSM]mode:0->2                       assist motor cycling
+        [AMS_LED]tray 1 loading                   bay LED restating itself
+        [AMS_SWITCH]BUFF,pos:0.10->0.73,i:0.635A  buffer telemetry
+        [AMS_COMMON]state:4,tray_now:1            "feeding", every frame
+
+    All console-only: AFC_BambuAMS.log still keeps every line verbatim and
+    every parser runs before this is decided.
+    """
+
+    NOISE = (
+        "l [AMS_COMMON]state:4,tray_now:1,tray_exit:15 [AMS_LED]tray 1 loading"
+        " [AMS_PMSM]mode:0->2 [AMS_PMSM]mode:2->0",
+        "[AMS_PMSM]mode:0->2",
+        "C [AMS_LED]tray 1 loading",
+        "n [AMS_SWITCH]BUFF,pos:0.10->0.73,det:20mm,i:0.635A [AMS_PMSM]mode:2->0",
+        "[AMS_COMMON]en:0,mode:0,idx:1,ref:0 [AMS_COMMON]preload_disable:1,"
+        " tmpr:22.0, cd:0 [AMS_COMMON]state:0,tray_now:1,tray_exit:15",
+    )
+
+    # A fault, a load in progress, a loaded unit, a measurement and a stall.
+    # Suppressing any of these is the failure mode that matters.
+    MUST_SHOW = (
+        "[AMS_COMMON]state:6,tray_now:255,tray_exit:15",
+        "[AMS_COMMON]state:1,tray_now:1,tray_exit:15",
+        "[AMS_COMMON]state:7,tray_now:1,tray_exit:15",
+        "[AMS_RFID]STEP:odom C:0.478,R:0.076,P:79%, od:0.491",
+        "[AMS_SWITCH]feed finish -1, stall, len_det:1.620 m, tube_len:3.506 m",
+    )
+
+    def test_print_time_chatter_is_console_suppressed(self):
+        for line in self.NOISE:
+            assert _brgmod._ams_is_noise(line), line
+
+    def test_faults_and_results_are_never_suppressed(self):
+        for line in self.MUST_SHOW:
+            assert not _brgmod._ams_is_noise(line), line
+
+    def _render(self, text):
+        for pat, render in _brgmod._AMS_HUMAN:
+            m = pat.search(text)
+            if m:
+                return render(m)
+        return None
+
+    def test_a_measurement_reads_as_a_sentence(self):
+        out = self._render("[AMS_RFID]STEP:odom C:0.478,R:0.076,P:79%, od:0.491")
+        assert "79% left" in out
+
+    def test_the_stored_flash_value_is_surfaced(self):
+        # The only place the unit says what it remembers -- at power-up.
+        out = self._render("[AMS_RFID] STEP,odom load from flash 0,R:0.075,P:75")
+        assert "bay 1" in out and "75%" in out
+
+    def test_a_stall_names_both_distances(self):
+        out = self._render(
+            "[AMS_SWITCH]feed finish -1, stall, len_det:1.620 m, tube_len:3.506 m")
+        assert "1.62 m" in out and "3.51 m" in out and "STALLED" in out
+
+    def test_an_error_code_is_named_not_dumped(self):
+        assert "0x17" in self._render("[AMS_LINK]err_code:0x00->0x17")
+        assert "cleared" in self._render("[AMS_LINK]err_code:0x17->0x00")
+
+    def test_chatter_carrying_a_heartbeat_is_still_chatter(self):
+        # The AMS bundles its 10s "[DBG] ams time" liveness into whatever
+        # frame is going out. The noise test used to run on the RAW text, so
+        # any pure-chatter line that happened to carry a heartbeat matched no
+        # rule and reached the console. Replaying the live log, that single
+        # technicality accounted for 2,916 console lines -- more than every
+        # other survivor combined.
+        beat = " [DBG] ams time: now=42044054ms diff=10005ms"
+        for line in self.NOISE:
+            stripped = _brgmod._DBG_AMSTIME_RE.sub("", line + beat).strip()
+            assert _brgmod._ams_is_noise(stripped), line
+
+    def test_bays_are_one_based_for_humans(self):
+        # The wire is 0-based; an operator counts bays from 1.
+        assert "bay 2" in self._render("[AMS_RFID]STEP:odom save tray:1, R:0.0765")
+        assert "bay 1" in self._render("[AMS_IDLE]tray 0 out,clear magic_num")

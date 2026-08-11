@@ -220,6 +220,13 @@
 #   _finalize_scan   the no-tag outcome: clear the lane, drop the Spoolman
 #                    link, apply AFC defaults.
 #
+# AT BOOT, AFC OUTRANKS THE BAY. No scan has been asked yet, so the bay is
+# reporting a cached record nothing has confirmed, while the lane carries what
+# the operator last saw and what AFC deliberately restored from vars. PREP
+# marks such a bay in _afc_owned and neither PREP nor _sync_lanes surfaces
+# over it -- until the spool comes out or the unit answers a scan for that
+# bay, which are the only two things that can know better.
+#
 # TWO OUTCOMES, NEVER THREE. Either the unit read a tag and its record is this
 # spool's, or it did not and the lane gets defaults. There is no third ending
 # in which the previous spool's profile is left on the lane.
@@ -366,6 +373,16 @@ except Exception:                        # older AFC_RFID without these helpers
     get_auto_spoolman_create = None      # type: ignore
     find_spool_by_uid = None             # type: ignore
     SpoolmanClient = None                # type: ignore
+try:
+    # The UIDs a Spoolman spool carries, normalized the same way the matcher
+    # normalizes them -- so "is this bay's tag on that spool" is asked in
+    # exactly the terms find_spool_by_uid answers it. Separate import: these
+    # are older than the helpers above in some AFC_RFID revisions, and a
+    # missing one must not take the whole block down.
+    from extras.AFC_RFID import _spool_uids, _norm_uid
+except Exception:
+    _spool_uids = None                   # type: ignore
+    _norm_uid = None                     # type: ignore
 
 
 def _bambu_spoolman_client(afc: Any):
@@ -384,7 +401,13 @@ def _bambu_spoolman_client(afc: Any):
             or getattr(afc, "moonraker", None) is None):
         return None
     try:
-        return SpoolmanClient(afc.moonraker)
+        # The shared per-afc cache (AFC_RFID._cached_spoolman_client), so the
+        # client's ensure-fields memos survive between calls here too.
+        try:
+            from extras.AFC_RFID import _cached_spoolman_client
+            return _cached_spoolman_client(afc)
+        except Exception:
+            return SpoolmanClient(afc.moonraker)
     except Exception:
         return None
 
@@ -635,6 +658,31 @@ def bridge_slot_to_info(slot: dict) -> dict:
         # printer); "tray_uid" is Bambu's 16-byte tray id. Empty until a read.
         "rfid_uid": (slot.get("uid") or None),
         "tray_uid": (slot.get("tray_uid") or None),
+        # The firmware's scan-window verdict (fw >= 1.9.3.0): scan_seq
+        # advances each time a scan window RESOLVES for this bay, scan_res
+        # says how (1 read / 2 foreign / 3 no tag). Attributed at the source:
+        # the firmware runs one window at a time for a known (unit, slot), so
+        # unlike the narration stamps this cannot credit a sibling's read or
+        # cycle-end to this bay. None on older firmware, and the verdict
+        # logic falls back to the narration stamps.
+        "scan_seq": (slot.get("sseq")
+                     if isinstance(slot.get("sseq"), int) else None),
+        "scan_res": (slot.get("sres")
+                     if isinstance(slot.get("sres"), int) else None),
+        # The MEASURED percent, attributed by the firmware to the bay whose
+        # capacity window produced it (fw >= 1.10.0.0). The narration it comes
+        # from arrives on device 0x0700, which both boxed units share, so the
+        # host could only guess whose spool it described -- and guessed wrong,
+        # writing AMS 1's 23% onto AMS 2's Spoolman spool. meas_seq advances
+        # per measurement so a repeat of the same value is still fresh news.
+        "meas_pct": (slot.get("mpct")
+                     if isinstance(slot.get("mpct"), int)
+                     and slot.get("mpct") >= 0 else None),
+        "meas_seq": (slot.get("mseq")
+                     if isinstance(slot.get("mseq"), int) else None),
+        # The firmware still owes this bay a re-read (fw >= 1.10.5.0). While
+        # it does, an empty record means "not fetched yet", never "no tag".
+        "reread_pending": bool(slot.get("rrq")),
     }
 
 
@@ -1004,32 +1052,23 @@ DEFAULT_BOWDEN_MM = 3000.0
 PATH_ADOPT_TOLERANCE_MM = 25.0
 
 
-#: How often the firmware re-sends the 11/04 follower arm, in ms. Applied at
-#: announce, so it survives a Pico reboot without a reflash.
+#: How often the firmware re-sends the 11/04 keep-alive, in ms. Applied at
+#: announce, so it survives a Pico reboot without a reflash. 0 = the
+#: firmware's built-in 520 ms, matched to the printer's own cadence
+#: (~507 ms HT / ~539 ms boxed).
 #:
-#: The firmware's built-in default is 520 ms, matched to the printer's own
-#: observed cadence. It does not need to be anywhere near that. Measured with
-#: the arm effectively disabled and everything else at stock: the follower held
-#: for 5 min 33 s, and every filament pull was recovered in about a second with
-#: no degradation and no "assist finish". The arm is not what sustains
-#: following -- the AP2 sync is, which muting it demonstrated twice by
-#: producing the drop/re-engage pulsing.
-#:
-#: Not set to "once and never again", tempting as that is. The same loop is
-#: what arms a unit that comes online LATER, and it skips any unit that has not
-#: answered within ONLINE_TIMEOUT_MS -- so it doubles as the re-arm for a unit
-#: that dropped and came back, so it is not turned off entirely -- an hourly
-#: backstop keeps that path alive while making the frame effectively one-shot.
-#:
-#: INTERIM. The right design is an acknowledged arm rather than a timer: the
-#: firmware already latches the unit's own follower state out of narration
-#: ("[AMS_COMMON]state:4," = following, state:0 = dropped), so it can arm once
-#: and re-arm only when the unit has NOT confirmed. Two things block that
-#: today -- s_ams_state is global rather than per-unit, so on a chain it holds
-#: whichever unit narrated last; and the latch has a missing-braces bug where
-#: s_ams_state_n++ runs unguarded. Both are firmware, so this constant is the
-#: stand-in until that is built and flashed.
-FOLLOW_ARM_MS = 3600000.0
+#: THE HOURLY OVERRIDE THAT LIVED HERE SILENCED A SIGNAL THE PRINTER NEVER
+#: STOPS SENDING. From 2026-08-03 this was 3600000.0 -- reasoned from "the
+#: follower holds without it, so make it a backstop". Following does hold;
+#: but the frame is not a follower command, it is the bus-wide liveness
+#: keep-alive, and the full-bus printer reel (ams3_fullbus_tagged_and_rescans)
+#: streams it to EVERY unit at full cadence straight through its measuring
+#: AMS 2 rescan: 0411@0700 3.98/s + 0411@1800 1.99/s. Under the hourly
+#: override our TX carried ZERO 0411 in every echo window ever diffed --
+#: the largest single deviation from the reference reels, found only when
+#: the operator forced the ours-vs-printer diff. Match the printer; do not
+#: re-quiet this without a reel that shows the printer quieting it.
+FOLLOW_ARM_MS = 600000.0
 
 #: How long to let a freshly-connected Pico settle before announcing to it.
 #:
@@ -1318,6 +1357,16 @@ class afcBambuAMS(afcUnit):
     # channel -- cannot leave a bay waiting forever.
     SCAN_FALLBACK_CAP = 45.0
 
+    # The backstop for the FIRMWARE-verdict path (fw >= 1.9.3.0). Longer than
+    # SCAN_FALLBACK_CAP on purpose: the firmware ALWAYS publishes an answer --
+    # its window close, a hijack, a removal all resolve the seq -- so a module
+    # clock firing first is a timer answering instead of the unit. Measured:
+    # a presence flap on a slow pull opened the hold 16 s before the spool
+    # seated, and the 45 s cap finalized defaults mid-preload while the unit
+    # was still working. 90 s clears the 61 s firmware window with margin and
+    # fires only when the bridge is genuinely dead.
+    SCAN_VERDICT_CAP = 90.0
+
     #: Alias of the module constant, for discoverability on the class.
     DRY_STOP_GRACE = DRY_STOP_GRACE
 
@@ -1465,6 +1514,13 @@ class afcBambuAMS(afcUnit):
         # [AFC_BambuAMS] units on the same serial_port share one bridge.
         self.ams_index = config.getint("ams_index", 0, minval=0,
                                        maxval=MAX_AMS - 1)
+        # The CONFIG value, frozen before UID resolution mutates ams_index.
+        # This is the operator's stated enrollment ORDER for the uid-binding
+        # table (class_rank_of ranks by bound idx): it decides which boxed
+        # unit takes wire id 0 on the next fresh enrollment. The bind builder
+        # used to sort by unit NAME, which silently pinned BambuAMS_1 to id 0
+        # -- the reverse of the reference bus, where the AMS 2 Pro sits at 0.
+        self._bind_rank = self.ams_index
         # Optional: pin this unit to its physical AMS by UID (12-byte hex from the
         # bridge `chain` command). The firmware assigns chain indices by ANNOUNCE
         # order, which reshuffles across power-cycles -- so a fixed ams_index can
@@ -1777,6 +1833,33 @@ class afcBambuAMS(afcUnit):
         # removal or a new scan -- the only two things that can change the
         # answer.
         self._scan_notag: List[bool] = [False] * self.SLOTS_PER_UNIT
+        # BAYS WHOSE LANE AFC ALREADY OWNS, RECORDED AT PREP.
+        #
+        # PREP puts a slot in here when the bay is occupied AND the lane came
+        # back from the var file with a profile or a Spoolman link. While a
+        # slot is in this set the status path leaves the lane's filament data
+        # alone: it is what the operator last saw, it survived the restart on
+        # purpose, and no tag has been read since boot to contradict it.
+        #
+        # A slot leaves the set the moment there is something better: the
+        # spool comes out, or the unit answers a scan for that bay. So this
+        # is a boot-scoped deferral, not a permanent freeze.
+        self._afc_owned: set = set()
+        # Has PREP walked this unit's lanes yet?
+        #
+        # ORDERING, AND IT IS NOT THE ORDER YOU WOULD GUESS. The bridge is
+        # polling and _sync_lanes is running WELL BEFORE prep: measured on
+        # the printer, "applied tag to lane21" landed five seconds ahead of
+        # "BambuAMS_2 Prepping lanes". AFC_prep restores the var file onto
+        # the lanes and THEN calls system_Test, so every one of those early
+        # polls sees a blank lane, surfaces the bay's cached record onto it,
+        # and leaves prep nothing to preserve -- the deferral below would
+        # have been a no-op.
+        #
+        # So the status path holds its filament half until prep has run.
+        # Presence and lane status still mirror through; only the part that
+        # writes a profile waits, and it waits on a fact, not a timer.
+        self._prep_seen: bool = False
         # THE TAG UID EACH LANE'S SPOOLMAN BINDING WAS MADE FROM.
         #
         # Without it, "this lane is bound" and "this lane is bound to the spool
@@ -1848,6 +1931,19 @@ class afcBambuAMS(afcUnit):
             desc="Force an AMS relink / error-recovery reset (deregister + "
                  "re-register) to clear a TIMEOUT/error state without a power "
                  "cycle. AFC_BAMBU_RELINK UNIT=<unit>")
+        self.gcode.register_mux_command(
+            "AFC_BAMBU_SAVEIDS", "UNIT", self.name,
+            self.cmd_AFC_BAMBU_SAVEIDS,
+            desc="Commit the configured unit_uids to the bridge and restart "
+                 "onto them, so a config change takes effect NOW instead of "
+                 "at the next power-up. AFC_BAMBU_SAVEIDS UNIT=<unit> "
+                 "[RESET=0] [RESTART=0]. Never during a print.")
+        self.gcode.register_mux_command(
+            "AFC_BAMBU_REMEASURE", "UNIT", self.name,
+            self.cmd_AFC_BAMBU_REMEASURE,
+            desc="Forget the bay's card and re-scan so the unit runs a FULL "
+                 "measure instead of its known-card fast path. "
+                 "AFC_BAMBU_REMEASURE UNIT=<unit> LANE=<lane>")
         self.gcode.register_mux_command(
             "AFC_BAMBU_SCAN", "UNIT", self.name, self.cmd_AFC_BAMBU_SCAN,
             desc="Trigger an RFID/tag scan on demand -- the same read the "
@@ -1965,6 +2061,13 @@ class afcBambuAMS(afcUnit):
             desc="Enroll and address by CLASS the way a real printer does: "
                  "boxed 0x00-0x03, HT 0x80-0x87. Verify with AFC_BAMBU_RC. "
                  "AFC_BAMBU_CLASSADDR UNIT=<unit> ON=<0|1>")
+        self.gcode.register_mux_command(
+            "AFC_BAMBU_MMFIX", "UNIT", self.name, self.cmd_AFC_BAMBU_MMFIX,
+            desc="Address-mismatch remedy: bus silence so the units re-take "
+                 "the addresses we already hold, WITHOUT a relink. Off by "
+                 "default. Reports the counters that say whether it works -- "
+                 "a climbing 'remedies applied' means it does not. "
+                 "AFC_BAMBU_MMFIX UNIT=<unit> [ON=<0|1>]")
         self.gcode.register_mux_command(
             "AFC_BAMBU_ROLLCALL", "UNIT", self.name, self.cmd_AFC_BAMBU_ROLLCALL,
             desc="Run the printer's address register: probe all 12 bus ids "
@@ -2307,6 +2410,117 @@ class afcBambuAMS(afcUnit):
             f"AFC_BAMBU_RECOVER: {lane_name} reset. If a load still stalls the "
             f"feeder, the bay filament tip is jammed -- open the AMS, trim the "
             f"tip, and reinsert.")
+
+    def cmd_AFC_BAMBU_SAVEIDS(self, gcmd: Any) -> None:
+        """
+        Commit the configured unit_uids to the bridge and restart onto them.
+
+        Usage
+        -----
+        `AFC_BAMBU_SAVEIDS UNIT=<unit> [RESET=0] [RESTART=0]`
+
+        WHAT THIS IS FOR. The identity table (uid -> chain index + model) is
+        what lets the Pico enrol correctly the moment it powers up, instead of
+        letting announce order decide -- which is measured flipping between
+        reboots with every unit_uid pinned in printer.cfg. Prep writes it
+        automatically, but only the NEXT power-up reads it, so a config change
+        takes a boot to bite. This does the whole thing at once: push, store,
+        reboot the Pico onto the stored table, restart Klipper onto the result.
+
+        Run it after putting the UIDs from AFC_BAMBU_UIDS into printer.cfg, or
+        after changing one. Never during a print -- it drops the bus.
+
+        THE ONLY WAIT HERE IS FOR A REAL ANSWER. The firmware replies to every
+        idsave, so the Pico is not rebooted until the record is confirmed
+        down; there is no sleep guessing at how long a flash write takes. The
+        reboot itself is not waited on at all -- Klipper's own restart takes
+        longer than the Pico's, and re-resolves the chain on reconnect.
+
+        RESET=0 stores and stops (no reboot, effective next power-up).
+        RESTART=0 reboots the Pico but leaves Klipper alone -- expect the
+        bridge to be offline until you restart it yourself.
+
+        :param gcmd: Klipper gcode command object
+        """
+        do_reset = gcmd.get_int("RESET", 1) != 0
+        do_restart = gcmd.get_int("RESTART", 1) != 0
+        do_wipe = gcmd.get_int("WIPE", 0) != 0
+        # NOT WHILE PRINTING. This drops the bus and restarts the host; there
+        # is no version of that which is survivable mid-print.
+        state = None
+        try:
+            ps = self.printer.lookup_object("print_stats", None)
+            if ps is not None:
+                state = ps.get_status(self.afc.reactor.monotonic()).get("state")
+        except Exception:
+            state = None                 # no print_stats: nothing to protect
+        if state in ("printing", "paused"):
+            raise gcmd.error(
+                "AFC_BAMBU_SAVEIDS: not while a print is active "
+                f"(print_stats state={state})")
+        bridge = self._bridge
+        if bridge is None:
+            raise gcmd.error("AFC_BAMBU_SAVEIDS: bridge not connected")
+        try:
+            with bridge._lock:
+                bridge._last_idsave = None
+        except Exception:
+            pass
+        if do_wipe:
+            # ERASE instead of store. The next power-up then enrols exactly as
+            # it did before any of this existed, and the prep after that has to
+            # write a record from scratch -- which is the only way to exercise
+            # the write path on real flash, and the support answer for a chain
+            # whose units have been swapped.
+            bridge.send({"cmd": "idwipe"})
+        else:
+            self._send_bindings(bridge)      # binds + the idsave that follows
+        # Wait for the firmware's answer. reactor.pause yields, so this does
+        # not hold the reactor -- the same way the UID resolve at ready waits.
+        reactor = self.afc.reactor
+        end = reactor.monotonic() + 5.0
+        got = None
+        while reactor.monotonic() < end:
+            try:
+                with bridge._lock:
+                    got = bridge._last_idsave
+            except Exception:
+                got = None
+            if got is not None:
+                break
+            reactor.pause(reactor.monotonic() + 0.05)
+        if got is None:
+            raise gcmd.error(
+                "AFC_BAMBU_SAVEIDS: the bridge never answered; nothing was "
+                "changed and the Pico was NOT rebooted")
+        state, n = got[0], got[1]
+        if state == "failed":
+            raise gcmd.error(
+                "AFC_BAMBU_SAVEIDS: the bridge could not store the "
+                "identities; the Pico was NOT rebooted. The chain will keep "
+                "enrolling from announce order.")
+        self.gcode.respond_info(
+            f"AFC_BAMBU_SAVEIDS: {n} unit identities "
+            + {"written": "stored", "wiped": "ERASED"}.get(state,
+                                                           "already stored"))
+        if not do_reset:
+            self.gcode.respond_info(
+                "AFC_BAMBU_SAVEIDS: RESET=0 -- they take effect at the next "
+                "power-up.")
+            return
+        try:
+            bridge.send({"cmd": "reset"})    # reboot into the same firmware
+        except Exception as e:
+            raise gcmd.error(f"AFC_BAMBU_SAVEIDS: reset failed: {e}")
+        if not do_restart:
+            self.gcode.respond_info(
+                "AFC_BAMBU_SAVEIDS: Pico rebooting; RESTART=0, so the bridge "
+                "stays offline until you restart Klipper.")
+            return
+        self.gcode.respond_info(
+            "AFC_BAMBU_SAVEIDS: Pico rebooting onto the stored identities; "
+            "restarting Klipper onto the result.")
+        self.gcode.run_script_from_command("FIRMWARE_RESTART")
 
     def cmd_AFC_BAMBU_RELINK(self, gcmd: Any) -> None:
         """
@@ -3325,6 +3539,89 @@ class afcBambuAMS(afcUnit):
             f"{'ON' if on else 'OFF'} -- re-enrollment follows on the next "
             f"discovery round; check it with AFC_BAMBU_RC and AFC_BAMBU_UIDS")
 
+    def cmd_AFC_BAMBU_MMFIX(self, gcmd: Any) -> None:
+        """
+        The address-mismatch remedy: switch it on/off, and read its counters.
+
+        AFC_BAMBU_MMFIX UNIT=<unit> [ON=<0|1>]
+
+        An op-05 phase-1 reply carries the sender's UID (536 of 536 across the
+        captures); an op-04 status reply carries none. So "this frame is AMS 1's
+        slots" is always an inference from our address map, and this is the one
+        check of that inference against the wire. When it disagrees, every slot
+        record published from that address belongs to a different unit.
+
+        The REMEDY is bus silence: a unit keeps the address it was last given
+        and re-registers only after its master goes quiet for ~2 s. It is not
+        a relink -- the unit table survives, and the ordinary announce path
+        re-asserts the addresses we already hold. Acting with a relink is what
+        emptied the chain map on fw 1.18.0.0.
+
+        OFF by default, because this feature has destabilised the chain twice.
+        With no ON= it reports without changing anything.
+
+        WHAT TO WATCH. `remedy` stopping means it worked. `remedy` climbing at
+        roughly one per minute means it did not and the map is still
+        contradicted -- turn it back off. `defer` counts firings held back
+        because the bus was feeding, which is correct behaviour, not a fault.
+
+        :param gcmd: The Klipper GCodeCommand
+
+        Usage
+        -------
+        `AFC_BAMBU_MMFIX UNIT=<unit> [ON=<0 or 1>]`
+
+        Example
+        -------
+        ```
+        AFC_BAMBU_MMFIX UNIT=BambuAMS_1 ON=1
+        ```
+        """
+        if self._bridge is None:
+            raise gcmd.error("AFC_BAMBU_MMFIX: bridge not connected")
+        on = gcmd.get_int("ON", None, minval=0, maxval=1)
+        cmd = {"cmd": "mmfix"}
+        if on is not None:
+            cmd["on"] = on
+        self._bridge._last_mmfix = None       # so the wait cannot read a stale one
+        self._bridge.send(cmd)
+        # Wait for the firmware's own answer rather than reporting what we just
+        # asked for -- the counters are the point, and echoing the request back
+        # would be a check that cannot fail.
+        d = self._wait_for_mmfix()
+        if d is None:
+            gcmd.respond_info(
+                "AFC_BAMBU_MMFIX: sent, but the bridge did not answer -- "
+                "firmware older than 1.20.0.0 does not have this")
+            return
+        gcmd.respond_info(
+            f"AFC_BAMBU_MMFIX {self.name}: remedy is "
+            f"{'ON' if d.get('on') else 'OFF'} -- {d.get('detect')} "
+            f"disagreement(s) seen, {d.get('remedy')} remed(ies) applied, "
+            f"{d.get('defer')} held back for a busy bus; last disagreeing "
+            f"address {d.get('addr')}, current streak {d.get('streak')}"
+            f"{', bus quiet right now' if d.get('quiet') else ''}. "
+            f"A climbing 'remedies applied' means it is NOT fixing the map.")
+
+    def _wait_for_mmfix(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        Block briefly for the bridge's {"evt":"mmfix"} reply.
+
+        :param timeout: seconds to wait
+        :return: the reply payload, or None if the firmware never answered
+        """
+        try:
+            reactor = self.afc.reactor
+            end = reactor.monotonic() + timeout
+            while reactor.monotonic() < end:
+                d = getattr(self._bridge, "_last_mmfix", None)
+                if d is not None:
+                    return d
+                reactor.pause(reactor.monotonic() + 0.05)
+        except Exception:
+            pass
+        return getattr(self._bridge, "_last_mmfix", None)
+
     def cmd_AFC_BAMBU_RC(self, gcmd: Any) -> None:
         """
         Print the roll-call counters and which bus ids answered.
@@ -3796,6 +4093,50 @@ class afcBambuAMS(afcUnit):
             return "?"
         return "none" if ack is None else f"0x{int(ack):04X}"
 
+    def cmd_AFC_BAMBU_REMEASURE(self, gcmd: Any) -> None:
+        """
+        Force a FULL spool measurement: forget the bay's card, then scan.
+
+        The unit keeps per-tray records in its own flash and serves a
+        known card a one-edge confirmation that KEEPS the stored value --
+        on any master, the real printer included (captured 2026-08-10:
+        'odom calib success exit 0', no odom save). Clearing the card
+        cache first makes the next scan take the fresh-card path: the
+        full two-edge measure, odom save, and a genuinely new percent.
+        Use when reality changed without a measure -- filament used off
+        the printer, a respool, a doubtful number.
+
+        Usage
+        -------
+        `AFC_BAMBU_REMEASURE UNIT=<unit> LANE=<lane>`
+        """
+        if self._bridge is None:
+            raise gcmd.error(
+                f"AFC_BAMBU_REMEASURE: bridge not connected for {self.name}")
+        lane_name = gcmd.get("LANE")
+        lane = self.lanes.get(lane_name)
+        if lane is None:
+            raise gcmd.error(
+                f"AFC_BAMBU_REMEASURE: lane '{lane_name}' not on unit "
+                f"{self.name} (lanes: {', '.join(self.lanes) or 'none'})")
+        slot = self._slot_of(lane)
+        if slot is None:
+            raise gcmd.error(
+                f"AFC_BAMBU_REMEASURE: {lane_name} is not mapped to an AMS slot")
+        self._bridge.send({"cmd": "cardclear", "unit": self.ams_index,
+                           "slot": slot})
+        if 0 <= slot < len(self._auto_scanned):
+            self._auto_scanned[slot] = False
+        if afcBambuAMS._start_capscan(self, slot):
+            gcmd.respond_info(
+                f"AFC_BAMBU_REMEASURE: {lane_name} -- card cache cleared; "
+                f"the unit will treat the spool as new and run the full "
+                f"measurement (tag + both odometer edges, ~40s).")
+        else:
+            gcmd.respond_info(
+                f"AFC_BAMBU_REMEASURE: {lane_name} -- card cache cleared, but "
+                f"another spool operation holds the bus; re-run in a moment.")
+
     def cmd_AFC_BAMBU_SCAN(self, gcmd: Any) -> None:
         """
         Trigger an RFID/tag scan on demand -- the exact read the auto-scan runs
@@ -3843,14 +4184,19 @@ class afcBambuAMS(afcUnit):
             # answer, and a re-scan after a failed one stayed latched no-tag.
             if 0 <= slot < len(self._auto_scanned):
                 self._auto_scanned[slot] = False
-            self._open_scan(slot)
             # A manual scan measures as well -- one tag read then the spool
             # measurement, so a scan always answers how much filament is on
             # the spool (measured percent -> slot remain + lane grams).
+            #
+            # The hold opens AFTER the capscan is accepted. Opened first, a
+            # refused bus claim raised out of this command with the hold still
+            # armed and nothing scanning -- 45 s later the backstop finalized
+            # "no tag" and wiped a lane that was never scanned.
             if not afcBambuAMS._start_capscan(self, slot):
                 msg = (f"AFC_BAMBU_SCAN: scan command not issued for {lane_name} "
                        f"on {self.name}")
                 raise gcmd.error(msg)
+            self._open_scan(slot)
             gcmd.respond_info(
                 f"AFC_BAMBU_SCAN: scanning {lane_name} (slot {slot}) on {self.name} "
                 f"at 0x{getattr(self, 'dry_dev_addr', 0):04X}; material lands "
@@ -4477,7 +4823,34 @@ class afcBambuAMS(afcUnit):
         self._dry_refusal_logged = False
         self._scan_t0 = [None] * self.SLOTS_PER_UNIT
         self._scan_motion_t0 = [None] * self.SLOTS_PER_UNIT
+        # ONE SPOOLMAN LOOKUP PER INSERT, exactly like OpenAMS's
+        # _rfid_scanned latch. _surface_slot_info runs on every status frame,
+        # so hanging the Spoolman work off it meant the reactor could be
+        # asked to make blocking HTTP calls at 1 Hz forever, guarded only by
+        # memo sets -- and every memo gap became the "Timer too close"
+        # shutdown. The physical events are what change the answer, so they
+        # are what re-arm this: the removal edge (and a reconnect) discard
+        # the slot, nothing else does.
+        self._spoolman_latched = set()
         self._scan_primed = False           # re-prime the baseline after reconnect
+        # The identity memos reset with the connection. A spool swapped while
+        # the bridge was down produces NO removal edge (the baseline re-primes
+        # around it), so anything keyed to a slot -- the bound-tag memo, a
+        # measured remain% -- would attribute the OLD spool's facts to the NEW
+        # one. The lookup memos reset with them: one memoized re-query per bay
+        # is the whole cost, and a fresh connection deserves fresh answers.
+        latch = getattr(self, "_spoolman_latched", None)
+        if isinstance(latch, set):
+            latch.clear()
+        for name in ("_bound_uid", "_binding_check", "_measured_remain",
+                     "_meas_seen",
+                     "_pending_summary", "_scan_seq0", "_scan_claim_tries"):
+            memo = getattr(self, name, None)
+            if isinstance(memo, dict):
+                memo.clear()
+        miss = getattr(self, "_spoolman_no_match", None)
+        if isinstance(miss, set):
+            miss.clear()
 
     def _handle_ready(self) -> None:
         """Build the slot map and connect to the bridge once the reactor is up."""
@@ -4699,7 +5072,32 @@ class afcBambuAMS(afcUnit):
         :param idx: The chain index carrying this unit's unit_uid
         """
         old = self.ams_index
+        was_resolved = self._id_resolved
         self._id_resolved = True          # a real chain index, not the default
+        # ANYTHING CACHED UNDER AN UNVERIFIED INDEX IS ANOTHER UNIT'S.
+        #
+        # THE CHAIN ORDER IS NOT STABLE ACROSS REBOOTS. Both boxed units
+        # answer on 0x0700, so enrollment order is whoever replies first, and
+        # the log has it flipping: A9CD=1/68273B=0 at 07:22, flipped at
+        # 07:37, back for ten boots from 11:09, flipped again at 12:13. (The
+        # HT is always index 2 -- it is on 0x1800 and cannot be confused.)
+        #
+        # Before resolution EVERY unit sits on its config ams_index, which
+        # defaults to 0, so both boxed units consume index 0's status frames.
+        # The one that pins elsewhere clears below; the one that "confirms"
+        # the index it was already assuming took the quiet path and KEPT that
+        # cache -- and on a flip boot that cache is the other unit's. That is
+        # exactly the 12:13 boot: both units reported slot0=PLA Matte,
+        # slot2=PLA Matte while AMS 1 physically held Sparkle and Basic.
+        #
+        # A confirmation is not a no-op the first time. It is the moment the
+        # index stops being a guess, and the cache from before it has to go.
+        if idx == old and not was_resolved:
+            self._slots = [{} for _ in range(self.SLOTS_PER_UNIT)]
+            try:
+                self._bridge.send({"cmd": "status"})   # re-seed, verified now
+            except Exception:
+                pass
         if idx == old:
             # Quiet: re-confirmations happen at every resolve/reconnect and say
             # nothing new. Only a CHANGED pin (below) is console-worthy.
@@ -4710,6 +5108,7 @@ class afcBambuAMS(afcUnit):
             except Exception:
                 pass
             self._send_ht_flag(self._bridge)     # re-assert (Pico may have rebooted)
+            afcBambuAMS._send_unit_model(self, self._bridge)  # which machine
             self._send_mc_addr(self._bridge)
             if self._announce_deferred:      # held at connect -- send it now
                 self._announce_deferred = False
@@ -4728,6 +5127,7 @@ class afcBambuAMS(afcUnit):
             if self._is_ht():
                 self._bridge.send({"cmd": "htunit", "unit": old, "on": 0})
             self._send_ht_flag(self._bridge)
+            afcBambuAMS._send_unit_model(self, self._bridge)
             self._send_mc_addr(self._bridge)
             self._bridge.send({"cmd": "status"})    # re-seed from the right unit
         except Exception:
@@ -4845,6 +5245,7 @@ class afcBambuAMS(afcUnit):
                 ("units", lambda: self._bridge.send(
                     {"cmd": "units", "n": self.ams_index + 1})),
                 ("ht flag", lambda: self._send_ht_flag(self._bridge)),
+                ("model", lambda: afcBambuAMS._send_unit_model(self, self._bridge)),
                 ("mc address", lambda: self._send_mc_addr(self._bridge)),
                 ("arm cadence", lambda: self._bridge.send(
                     {"cmd": "armms", "ms": int(FOLLOW_ARM_MS)}))):
@@ -5043,12 +5444,18 @@ class afcBambuAMS(afcUnit):
     def system_Test(self, cur_lane: Any, delay: float, assignTcmd: bool,
                     enable_movement: bool) -> bool:
         """
-        PREP-time lane test: mirror bridge slot state onto the lane.
+        PREP-time lane test: read the bay's sensors, keep what AFC restored.
 
         Seeds prep/hub state from the bridge's cached slot info (present spool ->
         prep_state + staged-at-hub), keeps the virtual hub's live occupancy
         derived from tool_loaded, and assigns the lane's T-command. The bridge
         being offline (protocol bring-up) is reported but does not fail the lane.
+
+        It does NOT put the bay's tag record onto a lane AFC already
+        populated -- that is what OpenAMS and ACE do at prep, and it is what
+        this now does. An occupied bay whose lane came back with a profile or
+        a Spoolman link is marked in ``_afc_owned`` instead, which also holds
+        the status path off until the unit answers a scan for that bay.
 
         :param cur_lane: The lane to test
         :param delay: Prep delay between lanes (unused; no motion here)
@@ -5085,8 +5492,47 @@ class afcBambuAMS(afcUnit):
                 self.lane_loaded(cur_lane)
                 cur_lane.status = AFCLaneState.LOADED
                 self.lane_illuminate_spool(cur_lane)
-                # Surface the AMS tag PROFILE (material/color/temps) onto the lane.
-                self._surface_slot_info(cur_lane, info)
+                # ── PREP READS SENSORS. AFC OWNS THE FILAMENT DATA. ──
+                #
+                # This used to surface the bay's record onto the lane here,
+                # and that is how one unit's tag reached another unit's lane
+                # at startup: uid 01d0ec0f applied to BOTH units' slot 2,
+                # because PREP trusted a record that was wrong and overwrote
+                # what AFC had correctly restored from vars.
+                #
+                # Every other unit type refuses that job. OpenAMS's prep sets
+                # prep_state from its sensors and touches no filament field;
+                # ACE the same. AFC restores material/colour/weight/spool_id
+                # from the var file (AFC_prep re-hydrates a Spoolman-linked
+                # lane from Spoolman), and that is the authority at boot --
+                # it is what the operator last saw and what survived the
+                # restart on purpose.
+                #
+                # So a tag changes a lane only where a tag can be trusted: a
+                # real insert edge, whose scan the unit answers for that bay.
+                # A bay whose lane AFC left empty still fills in, from the
+                # status path once the record is its own -- not from PREP
+                # guessing at boot.
+                # THE VARIANT, WHICH AFC'S PREP DOES NOT RESTORE.
+                #
+                # get_status writes sub_type to the var file on every save and
+                # AFC_prep never reads it back, so every restart returns a
+                # lane with its variant blank -- lane23 came back "PLA"
+                # instead of "PLA Glow". _fill_missing_variant covers this
+                # from the bay's record, but only when there IS one: the HT
+                # no longer re-scans on boot (a reboot is not an insert), so
+                # nothing refreshes its record and the variant stayed lost.
+                #
+                # The value is sitting in the var file the whole time. Read it
+                # back here, in our own prep, rather than reaching into core
+                # AFC's.
+                self._restore_sub_type(cur_lane)
+                if (getattr(cur_lane, "material", "")
+                        or getattr(cur_lane, "spool_id", None)):
+                    self._afc_owned.add(slot)
+                else:
+                    self._surface_slot_info(cur_lane, info)
+        self._prep_seen = True               # the status path may write now
         if assignTcmd:
             try:
                 self.afc.function.TcmdAssign(cur_lane)
@@ -5165,6 +5611,34 @@ class afcBambuAMS(afcUnit):
                 self._track_odom(obj)
             except Exception:
                 pass
+            # ── IDENTITY VERIFIED ON EVERY FRAME, NOT ONCE AT BOOT. ──
+            #
+            # ams_index is resolved from unit_uid at ready, but the firmware
+            # re-enrolls the chain whenever the bus hiccups -- and the chain
+            # ORDER is discovery order, which is not stable across re-enrolls.
+            # Measured tonight: BambuAMS_1 held chain 0 all day, a reflash
+            # re-enrolled it at chain 1, and after a mid-session re-enroll a
+            # scan on AMS 2 slot 2 applied its tag to AMS 1's lane, then
+            # healed a minute later when the background retry re-adopted. The
+            # heal proves the machinery; this makes it immediate, and drops
+            # the frame that would have written the wrong unit's lanes.
+            #
+            # chain_uids() is the bridge's cached copy -- an in-memory list
+            # compare per frame, no bus traffic, no HTTP.
+            if getattr(self, "unit_uid", ""):
+                try:
+                    uids = self._bridge.chain_uids()
+                    if uids and self.unit_uid in uids:
+                        live = uids.index(self.unit_uid)
+                        if live != self.ams_index:
+                            self.logger.warning(
+                                f"AFC bambu {self.name}: chain re-enrolled -- "
+                                f"UID {self.unit_uid} moved from index "
+                                f"{self.ams_index} to {live}; re-adopting")
+                            self._adopt_index(live)
+                            return      # this frame was keyed to the old index
+                except Exception:
+                    pass
             for entry in obj.get("slots") or []:
                 if entry.get("unit", 0) != self.ams_index:
                     continue
@@ -5436,6 +5910,9 @@ class afcBambuAMS(afcUnit):
                 # Empty bay can't be staged; clear the latch so a re-inserted
                 # spool re-runs the full load path.
                 lane.loaded_to_hub = False
+                # The spool AFC's data described is gone, so there is nothing
+                # left to defer to.
+                self._afc_owned.discard(slot)
                 if not active and status != AFCLaneState.NONE:
                     try:
                         self.lane_not_ready(lane)
@@ -5444,6 +5921,15 @@ class afcBambuAMS(afcUnit):
                     lane.status = AFCLaneState.NONE
             if self._is_virtual_hub(lane):
                 lane._load_state = bool(getattr(lane, 'tool_loaded', False))
+            # PREP HAS NOT RUN YET, SO THE LANE IS NOT AFC'S ANSWER YET.
+            #
+            # These polls start before AFC_prep restores the var file, so a
+            # lane read here is blank for reasons that have nothing to do
+            # with what is in the bay. Writing a profile onto it now is how
+            # the boot rule got bypassed: by the time prep looked, the lane
+            # already carried the record prep was meant to protect it from.
+            if not getattr(self, "_prep_seen", False):
+                continue
             # A scan is a question we asked the unit. Until it answers, its bay
             # record is still the PREVIOUS spool's -- a bay the AMS already has
             # a record for reports that record from the instant a new spool goes
@@ -5452,6 +5938,32 @@ class afcBambuAMS(afcUnit):
             # So there are exactly three things a scan can be, and the unit
             # decides which: still working, read a tag, or finished with none.
             verdict = self._scan_verdict(slot)
+            # Pipeline trace: one line per verdict CHANGE per slot, carrying
+            # the firmware's seq/res and the record's headline fields. It is
+            # what made the read path legible when every stage was suspect --
+            # kept, at DEBUG, because it belongs in AFC.log next to the
+            # narration it explains, not on the operator's console. The lines
+            # an operator wants (applied tag / no readable tag / matched) are
+            # INFO already.
+            try:
+                tr = getattr(self, "_trace_verdict", None)
+                if tr is None:
+                    tr = self._trace_verdict = {}
+                if tr.get(slot) != verdict:
+                    tr[slot] = verdict
+                    self.logger.debug(
+                        f"AFC bambu {self.name}: slot {slot} scan verdict -> "
+                        f"{verdict} (fw seq={info.get('scan_seq')} "
+                        f"res={info.get('scan_res')} | record: "
+                        f"mat={info.get('material') or '-'} "
+                        f"uid={info.get('rfid_uid') or '-'} "
+                        f"present={info.get('present')})")
+            except Exception:
+                pass
+            if verdict in ("read", "notag"):
+                # The unit has answered for this bay. That outranks whatever
+                # AFC restored at boot, so stop deferring to it.
+                self._afc_owned.discard(slot)
             if verdict == "waiting":
                 continue                         # it has not answered yet
             if verdict == "notag":
@@ -5468,19 +5980,430 @@ class afcBambuAMS(afcUnit):
                 # declines. So anything the bay still reports for remain% or
                 # nominal weight came off the PREVIOUS spool's tag, exactly
                 # like the rest of the profile.
+                # A LATE TAG BEATS A NO-TAG VERDICT.
+                #
+                # "Two outcomes, never three" assumed the bay's record cannot
+                # improve after the unit has answered. It can: the background
+                # fill re-reads any bay whose record is unknown, and on a
+                # scan whose narration never reached the window the tag lands
+                # SECONDS AFTER the verdict resolved. Measured live on AMS 2
+                # bay 1 -- the record held PLA Matte / A3D8E1 / uid ecb61cd0
+                # / remain 100 while lane19 sat on PLA/1000 g defaults,
+                # because the latch below blocks this bay from surfacing
+                # until the spool is pulled.
+                #
+                # The gate is the RECORD's own evidence, not a clock and not
+                # narration: a material AND a uid mean the unit produced a
+                # tag for this bay, whatever the window concluded earlier.
+                # That is the same standard _surface_slot_info applies, so
+                # accepting it here cannot show anything it would not.
+                if info.get("material") and info.get("rfid_uid"):
+                    # SAY WHY NOTHING CHANGED, or it reads as a silent failure.
+                    #
+                    # A boxed unit does not always re-read on a re-insert: it
+                    # says "odom card in RF, delay check", runs the motions --
+                    # which the operator WATCHES -- and ends the cycle without
+                    # claiming a read. The bay's record is still this spool's,
+                    # so nothing is wrong and nothing needs to change; but a
+                    # scan that visibly ran and produced no console line looks
+                    # exactly like a fault.
+                    # ── A FRESH PHYSICAL INSERT NEVER SETTLES ON SAME-TAG. ──
+                    #
+                    # Repro (2026-08-10 02:37, lane22): removal edge, fresh
+                    # reinsert, fresh read -- and this branch settled it as
+                    # "no NEW read", released the hold, surfaced, and let the
+                    # Spoolman bind write MID-CYCLE, which this model's own
+                    # profile says aborts its calibration. The 640 g the lane
+                    # showed was Spoolman re-hydration, not a measurement.
+                    # The removal edge is the discriminator: same-tag settles
+                    # a SEATED re-scan, never a reinsert. One bypass per
+                    # insert -- the flag pops here, so if the measurement
+                    # genuinely never lands the next pass settles normally
+                    # and the existing backstops still close the window.
+                    fi = getattr(self, "_fresh_insert", None) or {}
+                    if True:  # ── THE REEL'S RULE, UNIVERSAL. ──
+                        # ams3_fullbus_tagged_and_rescans, 03:00: the printer
+                        # commands a re-scan of a SEATED spool, the unit
+                        # narrates "info same as last read" -- and measures
+                        # anyway (P:90%, saved). Same-info is narration, not
+                        # a veto: a scan's cycle ends in a measurement or the
+                        # unit's own conclusion, never in a driver-side
+                        # shortcut. So the hold below applies to EVERY scan,
+                        # commanded or insert, not only fresh inserts.
+                        # End on the UNIT'S ANSWER, never on a pass counter --
+                        # the operator's rule. Two answers end the hold: a
+                        # measurement adopted (_adopt pops the flag, so this
+                        # branch stops matching), or the unit narrating the
+                        # END of its cycle with nothing more coming -- then we
+                        # settle as a genuine no-new-read, right now, not
+                        # after a timeout. Passes arrive every second; the
+                        # cycle takes ~25s; only the unit knows which pass is
+                        # the last.
+                        ended = True
+                        try:
+                            started = (getattr(self, "_scan_t0", None)
+                                       or [None] * 8)[slot]
+                            bridge = getattr(self, "_bridge", None)
+                            if bridge is not None and started is not None:
+                                ended = bridge.rfid_cycle_ended_since(
+                                    started,
+                                    addr=getattr(self, "dry_dev_addr", None))
+                        except Exception:
+                            ended = True
+                        if not ended:
+                            if fi.get(slot) == 1:
+                                fi[slot] = 2
+                                self.logger.info(
+                                    f"AFC bambu {self.name}: {lane.name} -- "
+                                    f"fresh insert re-read its own tag; the "
+                                    f"measurement is still coming, holding "
+                                    f"the lane for the unit's answer")
+                            continue
+                        fi.pop(slot, None)   # the unit answered: settle now
+                        held = (getattr(self, "_measured_remain", None)
+                                or {}).get(slot)
+                        if held:
+                            # Ledger 3b: this settle path said "not measured"
+                            # even when a measurement from THIS session sits
+                            # on the record. Same fix as the readout line.
+                            self.logger.info(
+                                f"AFC bambu {self.name}: {lane.name} -- "
+                                f"cycle ended with no new read; already "
+                                f"measured this session ({held}% held), "
+                                f"spool unchanged")
+                            self._release_scan_hold(slot)
+                            self._scan_notag[slot] = False
+                            self._surface_slot_info(lane, info)
+                            continue
+                    same = (info.get("rfid_uid") ==
+                            (getattr(self, "_bound_uid", None) or {}).get(slot))
+                    self.logger.info(
+                        f"AFC bambu {self.name}: {lane.name} -- the unit ran "
+                        f"its scan and measure and reported no NEW read"
+                        f"{' (same spool as last time)' if same else ''}; "
+                        f"keeping the tag already on this bay "
+                        f"({info.get('material')}"
+                        f"{' ' + str(info.get('rfid_uid')).upper()}), "
+                        f"so nothing on the lane changes")
+                    self._release_scan_hold(slot)
+                    self._scan_notag[slot] = False
+                    self._surface_slot_info(lane, info)
+                    continue
+                # DO NOT CALL A BAY EMPTY WHILE ITS RECORD IS STILL COMING.
+                #
+                # A boxed unit reads the tag through its calibration --
+                # "STEP7:cali read tray N" with the card already in range --
+                # and says none of the phrases a full authentication emits.
+                # Read line by line, that cycle read the tag AND measured it:
+                #
+                #   07:00:24  STEP7:cali read tray 1
+                #   07:00:26  odom card in RF, delay check
+                #   07:00:40  second detected  odom C:0.497,P:87%
+                #
+                # ...and we defaulted the lane anyway, because no phrase we
+                # match appeared. The record was blank only because the
+                # removal edge cleared it and the re-read had not landed.
+                # The firmware says when it owes a bay a read; wait for it.
+                if info.get("reread_pending"):
+                    continue
                 if not self._scan_notag[slot]:
                     self._scan_notag[slot] = True
                     self._finalize_scan(slot)
                 continue
             if verdict == "read":
+                # THE MEASUREMENT COMES SECOND, AND ON SOME MODELS IT DOES
+                # NOT SURVIVE US TALKING OVER IT. Hold everything -- the
+                # readout, the apply, the Spoolman round-trip -- until the
+                # unit has finished, and say so once so the wait is visible.
+                if not self._measure_settled(slot, info):
+                    continue
                 self._release_scan_hold(slot)    # the record is this spool's
                 self._scan_notag[slot] = False
+                afcBambuAMS._log_tag_readout(self, lane, info, force=True)
+            # PREP DEFERRED TO AFC FOR THIS BAY, AND SO DOES THE STATUS PATH.
+            #
+            # Gating PREP alone would have moved the problem by a second: the
+            # first poll after boot reaches here with verdict "none" -- no
+            # scan has been asked, so the bay is just reporting its cached
+            # record -- and surfaces exactly what PREP declined to. That is
+            # how AMS 1 slot 2's tag still landed on AMS 2 slot 2.
+            #
+            # A verdict of "read" is the unit answering for this bay, which
+            # outranks anything restored, and it clears the deferral above.
+            if verdict == "none" and slot in self._afc_owned:
+                self._fill_missing_variant(lane, info)
+                continue
             self._surface_slot_info(lane, info)
+            # THE MEASUREMENT, FROM THE RECORD THAT OWNS IT.
+            #
+            # The firmware stamps the measured percent onto the bay whose
+            # capacity window produced it, so this needs no attribution of
+            # its own -- it is already this slot's. The narration path below
+            # (get_status/_cap_pending_slot) keys off a device address both
+            # boxed units answer on, which is how a 23% measurement from
+            # AMS 1 came to be written onto AMS 2's spool as 230 g.
+            try:
+                mseq = info.get("meas_seq")
+                mpct = info.get("meas_pct")
+                if mseq and mpct is not None:
+                    seen = getattr(self, "_meas_seen", None)
+                    if seen is None:
+                        seen = self._meas_seen = {}
+                    if seen.get(slot) != mseq:
+                        seen[slot] = mseq
+                        self._adopt_measured_remain(slot, int(mpct),
+                                                    "physical AMS measurement")
+            except Exception:
+                pass
             # A measurement finishes before the record it describes catches up
             # (see _queue_spool_summary). Now that the record has surfaced, the
             # summary can say what is actually in the bay.
             if getattr(self, "_pending_summary", None):
                 self._drain_spool_summary(slot)
+
+    def _measuring_slot(self, slot: int, info: dict) -> bool:
+        """
+        Whether a measurement for this slot is still plausibly coming.
+
+        Not the same question as _measure_settled, which asks whether we may
+        WRITE the lane yet and answers True immediately for any model that
+        measures while we talk -- the HT among them. This asks whether the
+        result is in, which for the HT it is not for several seconds after the
+        read resolves. That gap is what let the readout line call a spool "not
+        measured" while the unit was still weighing it, and be contradicted by
+        the truth moments later.
+
+        Answers False on any doubt: the caller's fallback is the old wording,
+        and claiming a measurement is coming when none is would be the worse
+        error of the two.
+
+        :param slot: 0-based AMS slot index on this unit
+        :param info: normalized slot info from bridge_slot_to_info
+        :return: True while a measurement is still outstanding
+        """
+        try:
+            if not getattr(self, "measure_on_insert", True):
+                return False
+            base = getattr(self, "_meas_seq0", None) or {}
+            if slot not in base:
+                return False              # no window open, nothing pending
+            mseq = info.get("meas_seq")
+            if mseq and mseq != base.get(slot):
+                return False              # already landed
+            started = (getattr(self, "_scan_t0", None) or [None] * 8)[slot] \
+                if 0 <= slot < len(getattr(self, "_scan_t0", None) or []) \
+                else None
+            bridge = getattr(self, "_bridge", None)
+            if bridge is not None and started is not None:
+                if bridge.rfid_cycle_ended_since(
+                        started, addr=getattr(self, "dry_dev_addr", None)):
+                    return False          # cycle over, nothing more coming
+            return True
+        except Exception:
+            return False
+
+    def _measure_settled(self, slot: int, info: dict) -> bool:
+        """
+        Whether this model's post-read measurement is done being disturbed.
+
+        True immediately for every model that measures with us talking (AMS 1
+        has nine clean measurements in the same log the HT is fine in). For a
+        model with ``quiet_while_measuring``, True only once the unit has
+        given one of its two possible answers:
+
+        * ``meas_seq`` advanced past the value baselined at ``_open_scan`` --
+          the measurement landed, and its percent is already on the record.
+        * the unit narrated the END of its cycle -- it is finished and no
+          measurement is coming.
+
+        NEITHER IS A TIMER. The scan's own backstop still covers a bridge
+        that stops talking, so nothing can wait here forever.
+
+        :param slot: 0-based AMS slot index on this unit
+        :param info: Normalized slot info from bridge_slot_to_info
+        :return bool: True when the lane may be written
+        """
+        try:
+            if not self.profile.get("quiet_while_measuring"):
+                return True
+        except Exception:
+            return True
+        mseq = info.get("meas_seq")
+        base = (getattr(self, "_meas_seq0", None) or {}).get(slot)
+        if mseq and mseq != base:
+            return True                      # it measured
+        started = (getattr(self, "_scan_t0", None) or [None] * 8)[slot] \
+            if 0 <= slot < len(getattr(self, "_scan_t0", None) or []) else None
+        bridge = getattr(self, "_bridge", None)
+        if bridge is not None and started is not None:
+            try:
+                if bridge.rfid_cycle_ended_since(
+                        started, addr=getattr(self, "dry_dev_addr", None)):
+                    return True              # finished, with nothing to show
+            except Exception:
+                return True                  # never block on a broken helper
+        # SAY IT ONCE. A read the operator watched happen, followed by a lane
+        # that does not change for twenty seconds, reads as a fault.
+        held = getattr(self, "_measure_wait_said", None)
+        if held is None:
+            held = self._measure_wait_said = set()
+        if slot not in held:
+            held.add(slot)
+            name = next((n for n, s in (getattr(self, "_slot_map", None)
+                                        or {}).items() if s == slot), None)
+            self.logger.info(
+                f"AFC bambu {self.name}: {name or f'slot {slot}'} read its "
+                f"tag; holding the lane until the unit finishes measuring "
+                f"the spool -- this model stops calibrating if we write "
+                f"mid-cycle")
+        return False
+
+    def _uid_claimed_elsewhere(self, uid: Optional[str]) -> bool:
+        """
+        Whether another Bambu unit reports a present bay with this same UID.
+
+        A tag is one physical chip in one physical bay, so two units cannot
+        both be reading it. When they say they are, the bridge has copied one
+        unit's records onto the other's -- the cross-unit leak -- and NOTHING
+        derived from that record may reach a lane.
+
+        :param uid: The bay record's tag UID (may be None/"")
+        :return bool: True when some other unit claims the same UID
+        """
+        uid = (uid or "").strip().lower()
+        if not uid:
+            return False
+        try:
+            units = (getattr(self.afc, "units", None) or {}).values()
+        except Exception:
+            return False
+        for unit in units:
+            if unit is self or not isinstance(unit, afcBambuAMS):
+                continue
+            for other in (getattr(unit, "_slots", None) or []):
+                if not other or not other.get("present"):
+                    continue
+                if (other.get("rfid_uid") or "").strip().lower() == uid:
+                    return True
+        return False
+
+    def _fill_missing_variant(self, lane: Any, info: dict) -> None:
+        """
+        Give a boot-restored lane back the variant nothing else can supply.
+
+        THE CARD RENDERS material + sub_type ITSELF. Four Bambu lanes all
+        reading a bare "PLA" is a MISSING sub_type, not a material that needs
+        decorating -- joining the two in the lane's status produced "PLA Glow
+        Glow" on the actual panel, which is how that was established.
+
+        sub_type does not survive a restart. AFC's prep restores material,
+        colour, weight and the Spoolman link from the var file and not the
+        variant, and Spoolman has no sub_type field at all -- vendor and
+        material are its own columns and "Basic"/"Matte"/"Sparkle" lives
+        inside the filament's name. Both of those are core AFC's to change,
+        not ours. The bay, however, still has the whole string: its record
+        says "PLA Sparkle" whether or not anything else remembers.
+
+        This is not the boot rule leaking. It writes ONE field, only when the
+        lane has nothing in it, and only when the record's base material is
+        already the lane's own -- a bay reporting PETG cannot decorate a PLA
+        lane. Nothing AFC restored is overwritten, because AFC restored
+        nothing here.
+
+        :param lane: The AFC lane object
+        :param info: Normalized slot info from bridge_slot_to_info
+        """
+        # ── ASK WHETHER ANYTHING IS MISSING, NOT WHETHER sub_type IS. ──
+        #
+        # This used to return the moment sub_type was set, and _restore_sub_type
+        # -- added later, in system_Test -- sets it at prep from the var file.
+        # So on an UNLINKED lane the second fix switched the first one off, and
+        # filament_name and spool_vendor never got filled:
+        #
+        #   lane15  material 'PLA'  sub_type 'Sparkle'  filament_name ''
+        #   lane23  material 'PLA'  sub_type 'Glow'     filament_name 'Bambu Glow'
+        #
+        # lane23 looked fine only because it is BOUND: set_spoolID re-hydrates
+        # it from Spoolman, Spoolman has no sub_type column, so its sub_type
+        # came back blank after prep and this function still ran. lane15 has no
+        # spool to re-hydrate from, nothing wiped its sub_type, and the early
+        # return took the other two fields down with it. filament_name is the
+        # field the card actually displays.
+        if (getattr(lane, "sub_type", "")
+                and getattr(lane, "spool_vendor", "")
+                and getattr(lane, "filament_name", "")):
+            return
+        tag_material = info.get("material")
+        if not tag_material or tag_material.lower() == "unknown":
+            return
+        # A UID TWO UNITS BOTH CLAIM IS NOT EVIDENCE OF ANYTHING.
+        #
+        # Measured after a reflash: the bridge's own chain map came back
+        # "index 0: A9CD... <- slot0=PLA Matte, slot2=PLA Matte" and "index
+        # 1: 68273B... <- slot0=PLA Matte, slot2=PLA Matte" -- identical
+        # records for two units, while AMS 1 physically held Sparkle and
+        # Basic. The UID pin was right and the records behind it were not.
+        # This wrote "Matte" over lane15's Sparkle and lane17's Basic on the
+        # strength of it.
+        #
+        # One unit's bay cannot hold another unit's spool, so a duplicated
+        # UID means the record is a copy, not a reading. Refuse it.
+        if self._uid_claimed_elsewhere(info.get("rfid_uid")):
+            return
+        material, sub_type = _split_bambu_material(tag_material)
+        if not sub_type:
+            return
+        if (getattr(lane, "material", "") or "").strip().lower() != \
+                material.strip().lower():
+            return
+        if not getattr(lane, "sub_type", ""):
+            lane.sub_type = sub_type
+        if not getattr(lane, "spool_vendor", ""):
+            lane.spool_vendor = BAMBU_BRAND
+        if not getattr(lane, "filament_name", "") \
+                and build_filament_name is not None:
+            lane.filament_name = build_filament_name(
+                BAMBU_BRAND, material, sub_type)
+        # SAY WHY, ACCURATELY. The var file HAS the variant -- get_status
+        # writes it -- AFC's prep restores material, colour, weight and the
+        # Spoolman link and simply never reads sub_type back. That is core
+        # AFC's to change, not ours, so the unit fills it from its own record.
+        self.logger.info(
+            f"AFC bambu {self.name}: {lane.name} -- filling in the variant "
+            f"from the bay's record ({material} {sub_type}); AFC's prep does "
+            f"not restore sub_type, so it comes back blank every restart")
+        try:
+            lane.send_lane_data()
+        except Exception:
+            pass
+        self._save_lane_vars()
+
+    def _restore_sub_type(self, lane: Any) -> None:
+        """
+        Give a lane back the variant the var file already holds.
+
+        AFC's prep restores material, colour, weight and the Spoolman link and
+        never reads sub_type, though get_status writes it on every save. That
+        file is core AFC's to change, not ours -- so the unit reads its own
+        lanes' variants back out of it.
+
+        Only fills a blank: anything already on the lane came from a tag or a
+        scan this session and is closer to the spool than a stored string.
+
+        :param lane: The AFC lane object
+        """
+        if getattr(lane, "sub_type", ""):
+            return
+        try:
+            path = "{}.unit".format(self.afc.VarFile)
+            with open(path) as fh:
+                units = json.load(fh)
+            saved = (units.get(self.name) or {}).get(lane.name) or {}
+            sub = (saved.get("sub_type") or "").strip()
+        except Exception:
+            return                      # no file, bad JSON: nothing to restore
+        if sub:
+            lane.sub_type = sub
 
     def _save_lane_vars(self) -> None:
         """
@@ -5563,6 +6486,11 @@ class afcBambuAMS(afcUnit):
         :param slot: 0-based AMS slot index on this unit
         """
         self._scan_notag[slot] = False   # asking again -- the old answer is void
+        # A new scan gets a new "holding for the measurement" line if it waits.
+        try:
+            (getattr(self, "_measure_wait_said", None) or set()).discard(slot)
+        except Exception:
+            pass
         t0 = getattr(self, "_scan_t0", None)
         if t0 is None or not (0 <= slot < len(t0)):
             return
@@ -5571,20 +6499,43 @@ class afcBambuAMS(afcUnit):
         except Exception:
             t0[slot] = None
             return
-        # BACKSTOP ONLY. The scan normally resolves in _sync_lanes, which runs
-        # on every status frame and asks _scan_verdict what the unit said -- so
-        # a read reaches the lane within a frame of the unit announcing it, and
-        # a cycle that ends with no tag falls back just as promptly.
-        #
-        # This callback exists for the one case that loop cannot cover: status
-        # frames stopping (a wedged bridge, a unit that went quiet mid-cycle).
-        # It is not a scan window and must not be tuned like one. Tightened to
-        # a per-model read time it would expire on tags still in flight and
-        # announce them as "no readable tag".
+        # Baseline the firmware's per-bay verdict counter (fw >= 1.9.3.0).
+        # The verdict for THIS scan is "the seq advanced past this value" --
+        # which still fires when the same spool is re-inserted and the record
+        # bytes come back identical, the case that sinks any content compare.
+        try:
+            seq0 = getattr(self, "_scan_seq0", None)
+            if seq0 is None:
+                seq0 = self._scan_seq0 = {}
+            info = (self._slots[slot]
+                    if 0 <= slot < len(getattr(self, "_slots", []) or [])
+                    else None) or {}
+            seq0[slot] = info.get("scan_seq")
+        except Exception:
+            pass
+        # Baseline the MEASUREMENT counter the same way, for the models that
+        # wait for it before touching the lane (see quiet_while_measuring).
+        try:
+            mseq0 = getattr(self, "_meas_seq0", None)
+            if mseq0 is None:
+                mseq0 = self._meas_seq0 = {}
+            info = (self._slots[slot]
+                    if 0 <= slot < len(getattr(self, "_slots", []) or [])
+                    else None) or {}
+            mseq0[slot] = info.get("meas_seq")
+        except Exception:
+            pass
+        # ONE BACKSTOP, for a bridge that stops talking. The scan resolves in
+        # _sync_lanes the moment the firmware publishes its verdict, and the
+        # firmware closes its own window on the unit's cycle-end sentence --
+        # so nothing here decides anything on a working bus. There were two
+        # callbacks while the shorter one could still pre-empt a live scan;
+        # with verdicts per bay that is no longer possible, so the earlier
+        # one only ever fired into an already-resolved scan.
         try:
             self.afc.reactor.register_callback(
                 lambda et, s=slot: self._scan_timeout(s),
-                t0[slot] + self.SCAN_FALLBACK_CAP + 1.0)
+                t0[slot] + self.SCAN_VERDICT_CAP + 1.0)
         except Exception:
             pass
 
@@ -5640,6 +6591,50 @@ class afcBambuAMS(afcUnit):
         started = t0arr[slot]
         if started is None:
             return "none"
+        # ── THE FIRMWARE'S PER-BAY VERDICT, WHEN IT HAS ONE (fw >= 1.9.3.0) ──
+        #
+        # The narration stamps below are bridge-wide (per address class at
+        # best), and two boxed units both narrate as 0x0700 -- so a sibling's
+        # "read success" answered for this bay, and ANY cycle-end (including
+        # this unit's own insert-preload, which runs BEFORE the commanded
+        # scan) finalised this bay as no-tag. Measured live, back-to-back
+        # inserts on two units: the second finalised "no readable tag profile"
+        # while the tag's UID sat in the same log line.
+        #
+        # The firmware runs ONE scan window at a time for a known (unit,
+        # slot), watches the same narration, and publishes the outcome per
+        # bay: scan_seq advances when the window resolves, scan_res says how.
+        # A seq that moved past the value baselined at _open_scan IS this
+        # scan's answer, attributed at the only layer that can attribute it.
+        # Older firmware reports no seq, and the stamps below still decide.
+        try:
+            info = (self._slots[slot]
+                    if 0 <= slot < len(getattr(self, "_slots", []) or [])
+                    else None) or {}
+            seq = info.get("scan_seq")
+            if seq is not None:
+                base = (getattr(self, "_scan_seq0", None) or {}).get(slot)
+                if seq != base:
+                    # 1 = read; 2 (foreign) and 3 (no tag) both finalize to
+                    # defaults -- _finalize_scan's operator message already
+                    # tells a third-party tag from an empty reader.
+                    return ("read" if info.get("scan_res") == 1 else "notag")
+                # Unresolved: wait for the firmware, NOT for the narration
+                # stamps below (they cross-credit siblings -- the reason this
+                # path exists) and NOT for SCAN_FALLBACK_CAP (the firmware
+                # always resolves; a shorter module clock firing first is a
+                # timer answering instead of the unit). Only a bridge whose
+                # frames stopped entirely can strand the seq, and that is
+                # what this longer cap is for.
+                try:
+                    if (self.afc.reactor.monotonic() - started
+                            >= self.SCAN_VERDICT_CAP):
+                        return "notag"
+                except Exception:
+                    pass
+                return "waiting"
+        except Exception:
+            pass
         bridge = getattr(self, "_bridge", None)
         if bridge is None:
             return "notag"           # nothing can answer; do not wait for it
@@ -5672,11 +6667,126 @@ class afcBambuAMS(afcUnit):
         return next((lanes.get(n) for n, sl in smap.items()
                      if sl == slot and n in lanes), None)
 
+    # ══ ONE PROFILE PER MODEL. EVERY MODEL DECISION LIVES HERE. ══
+    #
+    # The module used to ask _is_ht() and treat everything else as "boxed",
+    # which merged AMS 1 and AMS 2 into one path. They are not one machine,
+    # and every difference below cost a live regression when it was decided
+    # by a shared branch:
+    #
+    #   AMS 1  ends its scan "STEP7:finish,cali tray" and MEASURES 12 s
+    #          later. Read as a cycle end, it cuts off every measurement.
+    #   AMS 2  reads through its calibration ("STEP7:cali read tray N") and
+    #          emits no auth phrases at all when the card is already in
+    #          range. Judged by AMS 1's vocabulary, a perfectly identified
+    #          bay reads as empty.
+    #   HT     emits "feed with rfid success" and "read success" on attempts
+    #          that FAIL and retry; only its flash-commit family is terminal.
+    #          A plain read returns its flash cache -- the PREVIOUS spool --
+    #          so it must never be pre-read, and its scan is armed by the
+    #          firmware rather than commanded here.
+    #
+    # Adding a model means adding a row, not hunting for branches.
+    _PROFILES = {
+        "ams1": {
+            "fw_model": 0,
+            "commands_scan": True,   # the module asks; the unit answers
+            "pre_read_safe": True,   # a plain 0x211 is this bay's own record
+            "measure_route": "narration",   # narrates "odom C:..,P:NN%"
+            "quiet_while_measuring": False,  # measures with us talking
+            "slots": 4,
+        },
+        "ams2": {
+            "fw_model": 1,
+            "commands_scan": True,
+            "pre_read_safe": True,
+            "measure_route": "narration",
+            # DO NOT TOUCH THIS UNIT BETWEEN ITS READ AND ITS MEASUREMENT.
+            #
+            # AMS 2 announces the read ("read success,valid") BEFORE it
+            # calibrates, and applying the tag right then is what stops the
+            # calibration. Two cycles, same unit, same spool, read line by
+            # line:
+            #
+            #   07:00 SUCCEEDED. The card was already in range, so the read
+            #   was silent -- "cali read tray 1" and no read phrase -- the
+            #   module never fired an apply, and nothing but our capacity
+            #   enables sat between "first detected" (07:00:33) and
+            #   "second detected ... P:87%" (07:00:40).
+            #
+            #   12:03 STALLED. "read success,valid" landed at 12:03:15, the
+            #   apply and its Spoolman round-trip went out at 12:03:15.141,
+            #   the unit started calibrating at 12:03:18 -- and mid-window,
+            #   at 12:03:35, "STEP:rfid pull 0" (which in the good cycle came
+            #   AFTER "odom calib success"). Five seconds later: "cali end",
+            #   no second detection, no percentage.
+            #
+            # Every AMS 2 cycle since has ended the same way. So on this
+            # model the apply waits for the measurement -- or for the unit to
+            # end the cycle without one. Both are answers from the unit, not
+            # a clock.
+            "quiet_while_measuring": True,
+            "slots": 4,
+        },
+        "ht": {
+            "fw_model": 2,
+            "commands_scan": False,  # FIRMWARE-armed on the insert edge
+            "pre_read_safe": False,  # a plain read serves the flash cache
+            "measure_route": "narration",
+            # The HT measures with the apply going out mid-cycle (it has been
+            # doing so all along), and AMS 1 has nine clean measurements in
+            # the same log. Neither needs the wait, so neither takes it.
+            "quiet_while_measuring": False,
+            "slots": 1,
+        },
+    }
+
+    @property
+    def profile(self) -> dict:
+        """This unit's model profile -- the single source of model behaviour."""
+        return self._PROFILES.get(getattr(self, "ams_model", "ams2"),
+                                  self._PROFILES["ams2"])
+
+    def _send_unit_model(self, bridge: Any) -> None:
+        """
+        Tell the firmware which machine this unit is.
+
+        Until it knows, it treats a unit as an AMS 1 and judges its narration
+        by AMS 1's vocabulary -- which is exactly the cross-model confusion
+        this split exists to end. Sent at every connect so it survives a Pico
+        reboot, beside the HT flag.
+
+        :param bridge: the BambuBridge to send on; ignored when None
+        """
+        if bridge is None:
+            return
+        # Everything getattr'd: this runs on duck-typed stand-ins in the
+        # tests, and a diagnostic send must never be able to break a connect.
+        try:
+            prof = afcBambuAMS._PROFILES.get(
+                getattr(self, "ams_model", "") or "ams2",
+                afcBambuAMS._PROFILES["ams2"])
+            bridge.send({"cmd": "model",
+                         "unit": int(getattr(self, "ams_index", 0) or 0),
+                         "m": int(prof["fw_model"])})
+        except Exception:
+            pass
+
     def _is_ht(self) -> bool:
         """True if this unit is an AMS HT (device 0x1800). The HT scans its RFID
         itself on its preload switch, so the firmware -- not the module -- drives
         the scan (armed on the insert edge)."""
-        return bool(self.has_heater) and getattr(self, "dry_dev_addr", 0) == 0x1800
+        # Answered from the model profile now, not re-derived from heater +
+        # address. Two sources of truth for "which machine is this" is how a
+        # unit ends up judged by another model's rules. getattr, because the
+        # duck-typed stand-ins in the tests carry ams_model and nothing else.
+        prof = afcBambuAMS._PROFILES.get(
+            getattr(self, "ams_model", "") or "",
+            None)
+        if prof is not None:
+            return prof["fw_model"] == 2
+        return bool(getattr(self, "has_heater", False)) and \
+            getattr(self, "dry_dev_addr", 0) == 0x1800
 
     def _send_ht_flag(self, bridge: Any) -> None:
         """
@@ -5757,7 +6867,12 @@ class afcBambuAMS(afcUnit):
                     is_ht = bool(unit._is_ht())
                 except Exception:
                     is_ht = False
-                units.append((is_ht, name, uid))
+                try:
+                    model = int(unit.profile["fw_model"])
+                except Exception:
+                    model = 1             # AMS 2: the module's own default
+                rank = int(getattr(unit, "_bind_rank", 0))
+                units.append((is_ht, rank, name, uid, model))
             if not units:
                 return
             # Plain sequential order: boxed first, then HTs, numbered 0..N-1.
@@ -5766,10 +6881,29 @@ class afcBambuAMS(afcUnit):
             # real printer ever uses. The firmware does the class placement
             # itself when the toggle is on, because only it knows the toggle.
             # What the host owns is the ORDER, which is what was missing.
-            units.sort()                      # boxed (False) first, then by name
-            for i, (_, _, uid) in enumerate(units):
+            units.sort()          # boxed first, then configured ams_index
+                                  # (frozen at init), name as the tiebreak
+            for i, (_, _, _, uid, model) in enumerate(units):
                 if i < 12:
-                    bridge.send({"cmd": "bind", "uid": uid, "idx": i})
+                    # THE MODEL RIDES WITH THE BINDING, and it is not a
+                    # convenience. bb_set_unit_model takes an INDEX and is sent
+                    # at connect, so from the Pico's power-up until Klipper
+                    # attaches, every unit is judged by AMS 1's vocabulary --
+                    # the exact cross-model confusion the split exists to end,
+                    # in the window where AMS 2 and the HT are narrating.
+                    # Keyed by UID it is knowable before a unit has an index,
+                    # which is what lets the firmware restore it from flash and
+                    # have it right at the first enrollment.
+                    bridge.send({"cmd": "bind", "uid": uid, "idx": i,
+                                 "m": model})
+            # PERSIST, SO THE NEXT POWER-UP DOES NOT HAVE TO BE TOLD.
+            #
+            # Compare-then-write on the firmware side: a record that already
+            # matches costs a memcmp and touches no flash, so this is safe to
+            # send every prep. It writes only on a fresh Pico or a config
+            # change -- and then during prep, with the bus idle and no motion
+            # armed, which is the safest moment in the session.
+            bridge.send({"cmd": "idsave"})
         except Exception:
             pass
 
@@ -5854,12 +6988,26 @@ class afcBambuAMS(afcUnit):
             miss = getattr(self, "_spoolman_no_match", None)
             if not miss:
                 return
-            info = (self._slots or [None] * self.SLOTS_PER_UNIT)[slot]
-            uid = (info or {}).get("uid") or (info or {}).get("tray_uid")
-            if uid:
-                miss.discard(uid)
+            # The whole set, not this slot's UID. Two reasons, both learned
+            # the hard way: (a) the per-UID variant read info["uid"], a key
+            # the normalized dict never has -- it is "rfid_uid" -- so this
+            # function cleared nothing for the entire time it existed; (b) the
+            # slot record's UID can already be gone (unit power-cycled), and a
+            # memo keyed by a UID nobody can name anymore is unclearable by
+            # key. Clearing the set costs at most one memoized re-lookup per
+            # still-unmatched bay, and it is what makes the operator's actual
+            # workflow work: read misses -> they bind the spool in Spoolman ->
+            # re-insert -> it must re-check.
+            miss.clear()
         except Exception:
             pass
+        # The binding-contradiction memo is NOT cleared here, deliberately.
+        # Clearing it on every removal edge re-probes Spoolman for every
+        # bound lane on the next status pass -- and a scan's own filament
+        # motion can flap the presence switch, so edges arrive in bursts.
+        # Each burst then multiplied into blocking HTTP on the reactor, the
+        # "Timer too close" failure class. The memo instead resets with the
+        # connection (_handle_disconnect), which is rare and quiet.
 
     def _unbind_spool(self, lane: Any, reason: str = "the bay is empty") -> None:
         """
@@ -5887,9 +7035,43 @@ class afcBambuAMS(afcUnit):
                 f"AFC bambu {self.name}: unbinding {lane.name} from spool "
                 f"{lane.spool_id} -- {reason}")
             lane.spool_id = ''
+            restore = getattr(self, "_restore_config_tare", None)
+            if restore is not None:
+                restore(lane)
         except Exception as e:
             self.logger.debug(
                 f"AFC bambu {self.name}: could not unbind {lane}: {e}")
+
+    def _restore_config_tare(self, lane: Any) -> None:
+        """
+        Give an unbound lane its CONFIGURED empty-spool weight back.
+
+        The tare is the spool's, not the lane's: binding to Spoolman overwrites
+        ``empty_spool_weight`` from the spool's ``spool_weight`` field
+        (AFC_spool), so dropping the link has to put it back or the lane keeps
+        a departed spool's number forever -- and it is persisted, so "forever"
+        outlives restarts.
+
+        Not hypothetical, and not small. Several of this printer's Spoolman
+        entries carry ``spool_weight: 1000`` -- the NET FILAMENT weight typed
+        into the empty-spool field -- so lane15, which measured 220 g and is
+        bound to nothing at all, was reporting a total of 220 + 1000 g. It had
+        held such a spool once, months of restarts ago.
+
+        The configured value is the only honest answer, and it is still there:
+        AFC_lane keeps its ``_config``. A lane object without one (the
+        duck-typed stand-ins in the tests) is left exactly as it was.
+
+        :param lane: the lane whose Spoolman link has just been dropped
+        """
+        try:
+            cfg = getattr(lane, "_config", None)
+            if cfg is None:
+                return
+            lane.empty_spool_weight = cfg.getfloat(
+                "empty_spool_weight", 190, minval=1)
+        except Exception:
+            pass
 
     def _reconcile_empty_bays(self) -> None:
         """
@@ -5984,6 +7166,57 @@ class afcBambuAMS(afcUnit):
             return False
         return True
 
+    # Motion states any AFC lane can be in while filament is actually moving.
+    # A scan started against any of these is the crash below.
+    _AFC_BUSY_STATES = ("Tool Loading", "Tool Unloading", "HUB Loading",
+                        "Ejecting", "Calibrating", "Infinite Runout")
+
+    def _afc_motion_busy(self) -> bool:
+        """
+        Is a load/unload in flight ANYWHERE in AFC -- any lane, any unit?
+
+        ══ THE GUARD THAT WAS MISSING, AND IT CRASHED KLIPPER. ══
+
+            23:38:09  Loading lane21                     (AMS 2, slot 2)
+            23:38:28  spool INSERTED in slot 0 (BambuAMS_1)
+            23:38:28  new spool detected in slot 0, scanning tag
+            23:38:44  MCU 'EBBT0' shutdown: Timer too close
+
+        A tag scan does blocking bus work for tens of seconds. Run beside a
+        load it starves Klipper's reactor until the TOOLHEAD mcu misses its
+        timers, and the whole print dies -- not a bad read, a shutdown.
+
+        Two guards already stood here and both had a hole the other did not
+        cover:
+
+        * ``in_print()`` -- a bare TOOL_LOAD outside a print is not a print.
+        * ``_unit_tool_loaded(self)`` -- asks about THIS unit. The insert was
+          on BambuAMS_1 while BambuAMS_2 was loading, so it passed.
+
+        The hazard is not per-unit and not print-only: it is filament moving
+        anywhere while we take the bus. AFC already says so on the lane
+        itself, so ask every lane rather than reasoning about which unit
+        matters.
+
+        Defensive on lookup: an AFC that cannot answer is treated as BUSY.
+        The cost of a false busy is a scan deferred by a few seconds (the
+        caller replays it); the cost of a false idle is this crash.
+
+        :return bool: True while any lane is loading, unloading or ejecting
+        """
+        afc = getattr(self, "afc", None)
+        if afc is None:
+            return False                      # no AFC at all: nothing to hit
+        try:
+            if getattr(afc, "in_toolchange", False):
+                return True
+            for ln in (getattr(afc, "lanes", None) or {}).values():
+                if str(getattr(ln, "status", "")) in self._AFC_BUSY_STATES:
+                    return True
+        except Exception:
+            return True                       # cannot tell -> do not move
+        return False
+
     def _maybe_auto_scan(self, slot: int, present: bool, info: dict) -> None:
         """
         Trigger an RFID/tag scan when a spool is newly inserted into a bay.
@@ -6033,6 +7266,16 @@ class afcBambuAMS(afcUnit):
             self.logger.info(
                 f"AFC bambu {self.name}: spool INSERTED in slot {slot} "
                 f"(AMS bay {slot + 1})")
+            # A physical insert means a measurement is COMING, whatever the
+            # tag says. The unit re-reads its own cached uid on a reinsert
+            # and reports same-info -- and still measures (the printer reels
+            # prove it: "info same as last read" -> Calibration -> P:93%).
+            # This flag disarms the same-tag early-settle exactly once, so
+            # the decline path cannot release the hold and write mid-cycle.
+            fi = getattr(self, "_fresh_insert", None)
+            if fi is None:
+                fi = self._fresh_insert = {}
+            fi[slot] = 1
         elif was_present and not present:
             self.logger.info(
                 f"AFC bambu {self.name}: spool REMOVED from slot {slot} "
@@ -6044,6 +7287,13 @@ class afcBambuAMS(afcUnit):
             # tag would be reapplied on a swap). Spoolman-linked lanes stay
             # authoritative.
             if was_present:
+                # The held measurement leaves with the spool: the same-spool
+                # decline wording keys off _measured_remain, and a fresh spool
+                # in this bay must never inherit the departed one's percent.
+                try:
+                    (getattr(self, "_measured_remain", None) or {}).pop(slot, None)
+                except Exception:
+                    pass
                 lane = self._lane_for_slot(slot)
                 if lane is not None:
                     # Clear REGARDLESS of a Spoolman binding. Treating a
@@ -6076,6 +7326,21 @@ class afcBambuAMS(afcUnit):
                 bu = getattr(self, "_bound_uid", None)
                 if isinstance(bu, dict):
                     bu.pop(slot, None)
+                # And the Spoolman-miss memo. Its own docstring claimed
+                # "cleared on removal" for as long as it existed, but nothing
+                # on this edge ever called it -- so a spool the operator added
+                # to Spoolman after a missed lookup stayed unmatched until a
+                # Klipper restart. Live: UID 0A1882AC refused to bind while
+                # spool 87 verifiably carried it. (Unbound call: the removal
+                # edge runs on duck-typed stand-ins in tests, and the method
+                # body getattrs everything it touches.)
+                afcBambuAMS._forget_spoolman_miss(self, slot)
+                # Re-arm the one-shot: the next spool in this bay gets its
+                # own single lookup (OpenAMS re-arms the same way).
+                try:
+                    self._spoolman_latched.discard(slot)
+                except Exception:
+                    pass
                 # PERSIST IT. A REMOVAL IS A PHYSICAL FACT.
                 #
                 # This edge cleared the lane and dropped the Spoolman link in
@@ -6116,6 +7381,10 @@ class afcBambuAMS(afcUnit):
         defer = getattr(self, "_scan_defer", None)
         if defer is not None and 0 <= slot < len(defer) and defer[slot]:
             if _unit_tool_loaded(self):
+                return
+            # The replay has to re-ask the same question the hold asked, or
+            # the deferred scan simply fires into the next load instead.
+            if afcBambuAMS._afc_motion_busy(self):
                 return
             afc_d = getattr(self, "afc", None)
             try:
@@ -6165,6 +7434,21 @@ class afcBambuAMS(afcUnit):
                 f"AFC bambu {self.name}: spool in slot {slot} will be scanned "
                 f"when the unit is free -- a lane here is loaded to the toolhead "
                 f"and a scan would move filament on it")
+            return
+        # ...AND NOT WHILE ANYTHING ANYWHERE IS MOVING FILAMENT. Applies to
+        # the HT too: its scan is firmware-driven, but arming it still takes
+        # this bus, and the reactor starvation is what shuts the toolhead mcu
+        # down. Deferred, not dropped -- replayed by the branch at the top of
+        # this method once AFC is idle again.
+        if afcBambuAMS._afc_motion_busy(self):
+            self._auto_scanned[slot] = True
+            defer = getattr(self, "_scan_defer", None)
+            if defer is not None and 0 <= slot < len(defer):
+                defer[slot] = True
+            self.logger.info(
+                f"AFC bambu {self.name}: spool in slot {slot} will be scanned "
+                f"when AFC is idle -- a lane is loading or unloading and a "
+                f"scan now would take the bus out from under it")
             return
         afcBambuAMS._start_tag_scan(self, slot, info)
 
@@ -6250,8 +7534,90 @@ class afcBambuAMS(afcUnit):
             # unit type, including an HT whose window is armed on the insert
             # edge without the module being involved. Branching here would
             # cover boxed units only.
-            if not afcBambuAMS._start_capscan(self, slot):
-                self.scan(slot)
+            # NO SEAT GATE. A version of this waited for the unit to
+            # narrate "tray[N] sw_sta update, X -> 3" before commanding the
+            # scan, on the theory that the presence bit leads the physical
+            # seat. Measured with one spool alone on the bus: AMS 1 NEVER
+            # emits sw_sta at all -- that line is AMS 2 vocabulary -- so on
+            # an AMS 1 the gate could never fire, burned its full 24-retry
+            # budget (2 minutes) on every insert, then fell through to the
+            # scan that worked immediately. A gate built on one unit's
+            # dialect is a gate that silently breaks the others; the filament
+            # is drawn in by the unit's own feeder, so there is no slow
+            # insertion to wait out in the first place.
+            if afcBambuAMS._start_capscan(self, slot):
+                getattr(self, "_scan_claim_tries", {}).pop(slot, None)
+            else:
+                # The bus claim was refused: another unit's spool operation is
+                # running. The old fallback sent the burst scan ANYWAY -- the
+                # exact two-scans-at-once collision the claim exists to
+                # prevent (two units scanning during a relink took Klipper
+                # down). Defer instead: re-run this same insert sequence once
+                # the bus frees. _start_tag_scan re-opens the hold on each
+                # retry, so the no-tag backstop restarts rather than expiring
+                # mid-queue and defaulting a bay that was never scanned.
+                if not afcBambuAMS._defer_scan_retry(self, slot, info,
+                                                     "bus busy"):
+                    # No reactor to defer on, or the queue has outlived any
+                    # plausible sibling scan: fall back to the burst rather
+                    # than never scanning at all.
+                    getattr(self, "_scan_claim_tries", {}).pop(slot, None)
+                    self.scan(slot)
+
+    def _defer_scan_retry(self, slot: int, info: dict, why: str) -> bool:
+        """
+        Re-run this slot's insert scan in 5 s; True if the retry was armed.
+
+        Shared by the not-yet-seated wait and the bus-claim wait -- both are
+        "the world is not ready, ask again shortly", both bounded by the
+        same counter so neither can queue forever.
+
+        :param slot: 0-based AMS slot index on this unit
+        :param info: Normalized slot info captured at the insert edge
+        :param why: For the debug log
+        :return bool: True when the retry was scheduled
+        """
+        tries = getattr(self, "_scan_claim_tries", None)
+        if tries is None:
+            tries = self._scan_claim_tries = {}
+        n = tries.get(slot, 0) + 1
+        tries[slot] = n
+        if n > 24:                           # ~2 minutes of polite retry
+            return False
+        try:
+            self.afc.reactor.register_callback(
+                lambda et, s=slot, i=dict(info):
+                    afcBambuAMS._retry_claimed_scan(self, s, i),
+                self.afc.reactor.monotonic() + 5.0)
+            self.logger.debug(
+                f"AFC bambu {self.name}: {why}, deferring slot {slot} "
+                f"tag scan (try {n})")
+            return True
+        except Exception:
+            return False
+
+    def _retry_claimed_scan(self, slot: int, info: dict) -> None:
+        """
+        Re-run a deferred insert scan once the bus should be free.
+
+        A no-op when the question answered itself while queued: the spool was
+        pulled, or a verdict already resolved for this bay (the firmware's
+        window may have run via another path).
+
+        :param slot: 0-based AMS slot index on this unit
+        :param info: Normalized slot info captured at the insert edge
+        """
+        try:
+            cur = (self._slots[slot]
+                   if 0 <= slot < len(getattr(self, "_slots", []) or [])
+                   else None) or {}
+            if not cur.get("present"):
+                getattr(self, "_scan_claim_tries", {}).pop(slot, None)
+                return                           # spool gone; nothing to scan
+            afcBambuAMS._start_tag_scan(self, slot, info)
+        except Exception as e:
+            self.logger.debug(
+                f"AFC bambu {self.name}: deferred scan retry failed: {e}")
 
     def _clear_lane_filament(self, lane: Any) -> None:
         """
@@ -6287,6 +7653,13 @@ class afcBambuAMS(afcUnit):
             lane.bambu_sku = ""
         except Exception:
             pass
+        # The tare came from the departed spool too -- see _restore_config_tare.
+        # getattr, per this file's convention: both clear paths are exercised
+        # against duck-typed stand-ins, and one without the helper must fall
+        # back to the old behaviour rather than raise.
+        restore = getattr(self, "_restore_config_tare", None)
+        if restore is not None:
+            restore(lane)
 
     def _finalize_scan(self, slot: int) -> None:
         """
@@ -6388,6 +7761,36 @@ class afcBambuAMS(afcUnit):
             if _uid:
                 _why = (f" -- the tag's UID is {str(_uid).upper()}, bind it to "
                         f"a spool in Spoolman to track this reel")
+                # THE UID IS AN IDENTITY EVEN WHEN THE PROFILE IS NOT THERE.
+                # A scan that ends read-less can still leave the chip UID in
+                # the record (anticollision needs no auth), and Spoolman may
+                # already know that reel -- in which case set_spoolID hydrates
+                # the lane's full profile from Spoolman and the operator gets
+                # their spool instead of defaults. One lookup, on this edge
+                # only, memoized through _spoolman_no_match like every other
+                # miss. This is U1's undecoded-read path, applied here.
+                try:
+                    afc2 = getattr(self, "afc", None)
+                    miss = getattr(self, "_spoolman_no_match", None) or set()
+                    if (afc2 is not None
+                            and getattr(afc2, "spoolman", None) is not None
+                            and find_spool_by_uid is not None
+                            and _uid not in miss):
+                        client = _bambu_spoolman_client(afc2)
+                        spool = (find_spool_by_uid(client, _uid)
+                                 if client else None)
+                        if spool and afc2.spool is not None:
+                            afc2.spool.set_spoolID(lane, spool.get("id"))
+                            self._remember_bound_uid(slot, str(_uid))
+                            _why = (f" -- then matched Spoolman spool "
+                                    f"{spool.get('id')} by UID "
+                                    f"{str(_uid).upper()} and bound it")
+                        else:
+                            if getattr(self, "_spoolman_no_match", None) is None:
+                                self._spoolman_no_match = set()
+                            self._spoolman_no_match.add(_uid)
+                except Exception:
+                    pass
             elif _foreign:
                 _why = (" -- the bay HAS a tag, but its keys are not Bambu's "
                         "so the unit could not read the profile "
@@ -6447,6 +7850,61 @@ class afcBambuAMS(afcUnit):
             si["tray_uid"] = info["tray_uid"]
         return si
 
+    def _binding_contradicted(self, spool_id: Any, uid: str) -> bool:
+        """
+        Does Spoolman say the bound spool is NOT the one whose tag is in the bay?
+
+        The restart-proof half of the stale-binding check: `_bound_uid` is our
+        own memory and starts empty every boot, but Spoolman's record of which
+        UIDs a spool carries outlives any restart.
+
+        Deliberately asymmetric, because the two wrong answers cost very
+        different things. Unbinding a lane somebody bound by hand loses their
+        work; leaving a stale binding shows the wrong spool until the next
+        insert. So this returns True ONLY on positive proof -- the spool
+        carries UIDs and this bay's tag is not among them. No record, no UIDs
+        on it, no Spoolman, or a failed lookup all return False and the binding
+        stands.
+
+        Memoized on (spool_id, uid). The caller runs on every status pass, and
+        an unmemoized lookup here is a blocking HTTP call on the reactor at
+        1 Hz -- the failure mode documented at _bind_spoolman, which cost an
+        MCU timer and took the printer down. Self-invalidating: a different
+        spool or a different tag is a different key.
+
+        :param spool_id: the Spoolman id the lane is currently bound to
+        :param uid: the tag UID actually present in the bay
+        :return bool: True only if Spoolman positively contradicts the binding
+        """
+        if not spool_id or not uid or _spool_uids is None or _norm_uid is None:
+            return False
+        memo = getattr(self, "_binding_check", None)
+        if memo is None:
+            memo = self._binding_check = {}
+        key = (str(spool_id), str(uid))
+        if key in memo:
+            return memo[key]
+        verdict = False
+        try:
+            client = _bambu_spoolman_client(getattr(self, "afc", None))
+            spool = client.get_spool(int(spool_id)) if client else None
+            if spool:
+                known = _spool_uids(spool)
+                # No UIDs recorded => nothing to contradict. That is the
+                # hand-assigned spool, and it keeps its lane.
+                if known:
+                    verdict = _norm_uid(uid) not in known
+        except Exception:
+            # Never unbind on a lookup failure -- and never MEMOIZE one
+            # either. A transient Spoolman outage on the first check would
+            # otherwise mask a genuinely stale binding for the whole session,
+            # which is the exact bug class this method exists to close. The
+            # next status pass retries; the memo below is only ever a settled
+            # answer.
+            return False
+        memo[key] = verdict
+        return verdict
+
     def _remember_bound_uid(self, slot: Optional[int], uid: str) -> None:
         """
         Record that this slot's Spoolman binding was made from tag ``uid``.
@@ -6465,6 +7923,118 @@ class afcBambuAMS(afcUnit):
             self._bound_uid[slot] = uid
         except Exception:
             pass
+
+    #: Spoolman HTTP runs on a WORKER THREAD, never the reactor. Three MCU
+    #: shutdowns in one night ("Timer too close" after a clock-variance
+    #: flood) traced to the bind that follows a successful read: 7-9
+    #: sequential blocking HTTP calls on the reactor thread. Bounding each
+    #: call (the 2 s transport timeout) was not enough -- the SEQUENCE still
+    #: starves clock sync on a loaded host. So the lookups go to one shared
+    #: worker (the same split the bridge's serial reader uses), and only the
+    #: lane mutation comes back to the reactor via register_async_callback.
+    #: False on duck-typed test stand-ins (SimpleNamespace has no class
+    #: attrs), which keeps every existing test inline and deterministic.
+    SPOOLMAN_BG = True
+
+    def _spoolman_bg(self, job) -> None:
+        """Run ``job`` on the shared Spoolman worker thread (inline when
+        SPOOLMAN_BG is absent/false -- tests, or an explicit opt-out)."""
+        if not getattr(self, "SPOOLMAN_BG", False):
+            job()
+            return
+        import queue as _queue
+        import threading
+        q = getattr(afcBambuAMS, "_spool_q", None)
+        if q is None:
+            q = afcBambuAMS._spool_q = _queue.Queue()
+
+            def _drain():
+                while True:
+                    fn = q.get()
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+
+            t = threading.Thread(target=_drain, daemon=True,
+                                 name="afc_bambu_spoolman")
+            afcBambuAMS._spool_t = t
+            t.start()
+        q.put(job)
+
+    def _bind_by_uid_bg(self, lane: Any, slot: Optional[int], uid: str,
+                        note: str) -> None:
+        """
+        Match ``uid`` against Spoolman off-reactor; bind the lane on-reactor.
+
+        The worker does the HTTP (find_spool_by_uid is a full-table scan, and
+        the UID stamp another two calls); the reactor callback does the ONE
+        thing that touches Klipper state -- set_spoolID -- plus the memos.
+        An in-flight set stops the status pass from enqueuing the same UID
+        again while its lookup is still running.
+        """
+        if not uid or find_spool_by_uid is None:
+            return
+        inflight = getattr(self, "_spoolman_inflight", None)
+        if inflight is None:
+            inflight = self._spoolman_inflight = set()
+        if uid in inflight:
+            return
+        inflight.add(uid)
+        afc = getattr(self, "afc", None)
+
+        def job():
+            spool = None
+            try:
+                client = _bambu_spoolman_client(afc)
+                spool = find_spool_by_uid(client, uid) if client else None
+                if spool is not None and client is not None:
+                    # Warm AFC's spool cache from HERE, so the set_spoolID in
+                    # the reactor callback below does not have to make its own
+                    # blocking get_spool. Best-effort: a cold cache only costs
+                    # the old behaviour.
+                    try:
+                        mr = getattr(afc, "moonraker", None)
+                        if mr is not None and hasattr(mr, "get_spool"):
+                            mr.get_spool(spool.get("id"))
+                    except Exception:
+                        pass
+                    # Keep the re-match healthy: union this UID into the
+                    # spool's card_uids while we are already off-reactor.
+                    try:
+                        client.write_spool_metadata(spool.get("id"), uid=uid)
+                    except Exception:
+                        pass
+            except Exception:
+                spool = None
+
+            def apply(eventtime=None):
+                try:
+                    inflight.discard(uid)
+                    if (spool is not None and afc is not None
+                            and getattr(afc, "spool", None) is not None
+                            and getattr(lane, "spool_id", None)
+                            in (None, "", 0)):
+                        afc.spool.set_spoolID(lane, spool.get("id"))
+                        self._remember_bound_uid(slot, uid)
+                        self.logger.info(
+                            f"AFC bambu {self.name}: matched {lane.name} to "
+                            f"Spoolman spool {spool.get('id')} by UID "
+                            f"{uid}{note}")
+                    elif spool is None:
+                        miss = getattr(self, "_spoolman_no_match", None)
+                        if miss is None:
+                            miss = self._spoolman_no_match = set()
+                        miss.add(uid)
+                except Exception:
+                    pass
+
+            try:
+                self.afc.reactor.register_async_callback(apply)
+            except Exception:
+                apply()
+
+        afcBambuAMS._spoolman_bg(self, job)
 
     def _spoolman_sync(self, lane: Any, info: dict) -> None:
         """
@@ -6504,10 +8074,41 @@ class afcBambuAMS(afcUnit):
         bound = getattr(lane, "spool_id", None)
         if bound not in (None, "", 0):
             prev = (getattr(self, "_bound_uid", None) or {}).get(slot)
-            if prev is None:
-                return           # not bound by a tag read -- someone else's call
             if prev == uid:
                 return           # already bound BY THIS TAG: nothing to do
+            if prev is None:
+                # ── THE MEMO DOES NOT SURVIVE A RESTART, THE BINDING DOES. ──
+                #
+                # _bound_uid is in-memory and starts empty, so after every
+                # Klipper restart EVERY tagged bay looks "not bound by a tag
+                # read" and this returned -- keeping a binding that names
+                # whatever spool was in the bay before the restart. Measured
+                # live: lane17 held a blue PLA Matte tag (UID ECB61CD0) while
+                # still bound to spool 87, the Glow, which had physically moved
+                # to another unit's bay. The lane read Matte and displayed
+                # "Glow" because the binding, not the tag, names the spool.
+                #
+                # U1 has no such state to lose: on every tag detect it clears
+                # spool_id outright and re-binds from the tag (AFC_U1_rfid,
+                # _check_channel), and ACE2 sidesteps it by staging
+                # next_spool_id instead of binding. Bambu cannot copy U1
+                # verbatim -- this runs on every status pass, not on a detect
+                # edge, so an unconditional clear would fight a manual
+                # assignment once a second.
+                #
+                # So ask the authority instead of our own memory: Spoolman
+                # records the UIDs a spool carries. If the bound spool carries
+                # UIDs and this bay's tag is not among them, the binding names
+                # a different physical spool and is stale -- restart or no
+                # restart. A spool with NO recorded UID cannot be contradicted
+                # (that is the manual-assignment case), so it is left alone.
+                # getattr, not a direct call: _spoolman_sync is exercised
+                # unbound against duck-typed stand-ins, and a stand-in without
+                # the checker must fall back to the old "leave it alone"
+                # behaviour rather than raise.
+                checker = getattr(self, "_binding_contradicted", None)
+                if checker is None or not checker(bound, uid):
+                    return
             # A DIFFERENT TAG IS IN THIS BAY. The binding names the previous
             # spool, so it is a leftover record like any other -- and holding it
             # is not passive: every measurement this bay produces gets written
@@ -6541,44 +8142,39 @@ class afcBambuAMS(afcUnit):
             if uid in miss:
                 return
         try:
-            if have_profile and sync_rfid_to_spoolman is not None:
-                allow = False
-                if get_auto_spoolman_create is not None:
-                    allow = get_auto_spoolman_create(
-                        lane, getattr(self, "auto_spoolman_create", False))
+            allow = False
+            if get_auto_spoolman_create is not None:
+                allow = get_auto_spoolman_create(
+                    lane, getattr(self, "auto_spoolman_create", False))
+            if (have_profile and allow
+                    and sync_rfid_to_spoolman is not None):
+                # CREATE needs the full shared-helper flow (vendor, filament,
+                # spool, stamp) and stays inline -- it is opt-in, rare, and
+                # its cost is a one-off the operator asked for. The default
+                # path below never creates and never blocks the reactor.
                 sync_rfid_to_spoolman(afc, lane, si, self.logger,
-                                      "Bambu RFID", allow_create=allow)
-                # Bound? Then it matched. Still unbound means Spoolman has no
-                # spool for this UID -- remember it so the next status pass
-                # does not ask again.
+                                      "Bambu RFID", allow_create=True)
                 if uid and getattr(lane, "spool_id", None) in (None, "", 0):
                     self._spoolman_no_match.add(uid)
                 else:
                     self._remember_bound_uid(slot, uid)
-            elif find_spool_by_uid is not None:
-                # UID-only: bind if Spoolman already carries this UID.
-                client = _bambu_spoolman_client(afc)
-                spool = find_spool_by_uid(client, uid) if client else None
-                if spool and afc.spool is not None:
-                    afc.spool.set_spoolID(lane, spool.get("id"))
-                    self._remember_bound_uid(slot, uid)
-                    self.logger.info(
-                        f"AFC bambu {self.name}: matched {lane.name} to "
-                        f"Spoolman spool {spool.get('id')} by UID {uid} "
-                        f"(no tag profile decoded)")
-                elif uid:
-                    # THE MEMO BELONGS ON BOTH BRANCHES. This path is a bay with
-                    # a readable UID whose profile has not landed yet, which is
-                    # EVERY scan for its first seconds. Without the memo it
-                    # re-queries Spoolman on every status pass, blocking the
-                    # reactor in HTTP each time -- the exact loop the note above
-                    # describes, whose measured cost is 1061 "Resetting
-                    # prediction variance" events and an MCU shutdown, with lane
-                    # data, Mainsail and the panel all queued behind it.
-                    self._spoolman_no_match.add(uid)
+            else:
+                # MATCH-ONLY, OFF-REACTOR. The lane already carries the tag's
+                # own values (applied before this call), so the bind's only
+                # job is identity: find the spool by UID on the worker
+                # thread, then set_spoolID from the reactor callback. The
+                # miss memo is written by the same callback, and the
+                # in-flight set keeps the 1 Hz status pass from stacking
+                # duplicate lookups while one is running.
+                afcBambuAMS._bind_by_uid_bg(
+                    self, lane, slot, uid,
+                    "" if have_profile else " (no tag profile decoded)")
         except Exception:
-            self.logger.debug("AFC bambu: spoolman sync failed",
-                              exc_info=True)
+            try:
+                self.logger.debug("AFC bambu: spoolman sync failed",
+                                  traceback=traceback.format_exc())
+            except Exception:
+                self.logger.debug("AFC bambu: spoolman sync failed")
 
     def calibrate_bowden(self, cur_lane: Any, dis: float,
                          tol: float) -> "Tuple[bool, str, int]":
@@ -6684,15 +8280,72 @@ class afcBambuAMS(afcUnit):
         # is the stale one.
         idx = info.get("index")
         measured = (getattr(self, "_measured_remain", None) or {}).get(idx)
-        # Remember WHICH of the two produced the number, so the write can say
-        # so. Announcing a tag record as a physical measurement is the machine
-        # claiming work it did not do.
-        src = "the spool's tag record, not a fresh measurement"
-        if isinstance(measured, int) and measured > 0:
-            rp = measured
-            src = "physical AMS measurement"
-        if not (isinstance(rp, int) and rp > 0):
-            return
+        # ── ONLY A MEASUREMENT SETS A WEIGHT. ──
+        #
+        # The tag's stored remain% used to be the fallback here, and it is
+        # wrong often enough to be worse than nothing. Read off the wire on
+        # one reel, at one moment:
+        #
+        #     tag's stored remain   0.800 -> 80%  (~800 g)
+        #     AMS measured                  23%   (~230 g)
+        #     operator's scale                     230 g
+        #
+        # Nothing writes a measurement back to the tag, so that 80% is
+        # whatever the last calibration left there -- it does not track
+        # printing, and it survives every read that does not measure. Seeding
+        # a lane from it put 800 g on a reel holding 230, and pushing it to
+        # Spoolman wrote that fiction into the operator's inventory.
+        #
+        # So the tag's figure is no longer a source of weight at all. A bay
+        # with no measurement keeps whatever the lane already had (AFC's
+        # defaults on a fresh insert, or the value it is decrementing as it
+        # prints), which is honest: we do not know, and we do not pretend to.
+        # ══ ...AND WHEN THERE IS NO MEASUREMENT, THE LOWER NUMBER WINS. ══
+        #
+        # Operator's rule, and it is a better one than either half of the
+        # argument above: FILAMENT ONLY GOES DOWN. So between the tag's
+        # stored remain and whatever the lane is already carrying (normally
+        # Spoolman's tracked weight, written at bind), the SMALLER value is
+        # the more recent truth --
+        #
+        #   tag  <  lane   the tag saw usage the tracking missed  -> tag wins
+        #   tag  >= lane   the tracking saw usage the tag never did, or they
+        #                  agree                                  -> keep it
+        #
+        # This is exactly what the 80%-vs-23% reel above needs: that tag read
+        # HIGH (800 g against a measured 230), so under this rule it loses and
+        # never reaches the lane or Spoolman. The failure mode the old comment
+        # was written about cannot happen through a floor.
+        #
+        # Live case that prompted it: lane21, orange PLA, no measurement (the
+        # unit fast-pathed a card it knew). Tag 60% = 600 g, Spoolman spool 97
+        # = 800 g, and the console promised 600 while the lane showed 800.
+        src = "physical AMS measurement"
+        if not (isinstance(measured, int) and measured > 0):
+            trp = info.get("remain_pct")
+            try:
+                tnom = int(info.get("weight") or 1000)
+            except (TypeError, ValueError):
+                tnom = 1000
+            try:
+                # 0 on a Bambu tag is "never measured", not "empty".
+                if trp is None or not (0 < int(trp) <= 100):
+                    return
+                tag_g = max(1, (tnom * int(trp)) // 100)
+                cur_g = int(getattr(lane, "weight", 0) or 0)
+            except (TypeError, ValueError):
+                return
+            # A floor needs a floor to stand on. With no tracked weight (a
+            # bare lane at 0) there is nothing for "lower" to mean, and
+            # pushing the tag's figure into Spoolman on that basis is the
+            # fiction the old rule was written against. Seeding a fresh lane
+            # is _surface_slot_info's job, where it stays on the lane and
+            # nothing is claimed to the inventory.
+            if not cur_g or tag_g >= cur_g:
+                return                       # the lane already knows of more use
+            measured = int(trp)
+            src = "tag's stored remain (no measurement; lower than tracked)"
+        rp = measured
         tag_w = info.get("weight")
         try:
             nominal = int(tag_w) if tag_w else 1000
@@ -6786,15 +8439,139 @@ class afcBambuAMS(afcUnit):
         setter = getattr(client, "set_remaining_weight", None)
         if client is None or not callable(setter):
             return
+        # OFF THE REACTOR. set_remaining_weight is two blocking HTTP calls
+        # (fetch the spool, then PATCH it) and this runs from the status
+        # path, so on the reactor it starves clock sync -- the measured
+        # "Timer too close" failure. Nothing downstream reads the result;
+        # the lane's grams were already applied by the caller.
+        src = source or "physical AMS measurement"
+
+        def _job(sid=sid, grams=float(grams), source=src):
+            try:
+                setter(sid, grams)
+                self.logger.info(
+                    f"AFC bambu {self.name}: wrote {grams} g remaining to "
+                    f"Spoolman spool {sid} ({source})")
+            except Exception as e:
+                self.logger.debug(
+                    f"AFC bambu {self.name}: Spoolman weight write failed: {e}")
+        afcBambuAMS._spoolman_bg(self, _job)
+        return
+
+    def _log_tag_readout(self, lane: Any, info: dict,
+                         force: bool = False) -> None:
+        """
+        Print what the tag actually said, on the read.
+
+        Fires when a scan RESOLVES as a read -- not when the lane's values
+        change. A re-scan of a bay that already showed the right spool is
+        still an answer to a question the operator asked, and printing
+        nothing reads as nothing having happened.
+
+        remain% is labelled MEASURED or stored because the two disagree
+        routinely and only one is a fact about the spool in the bay: read off
+        the wire on one reel, the tag said 80% (~800 g) while the unit
+        measured 23% and the scale said 230 g.
+
+        :param lane: the AFC lane the tag was applied to
+        :param info: normalized bridge slot info
+        """
         try:
-            setter(sid, float(grams))
+            mat = info.get("material")
+            if not mat:
+                return
+            # ONCE PER DISTINCT ANSWER. Two paths deliver a tag -- a scan the
+            # operator asked for, and the background fill picking a bay up on
+            # its own (verdict "none", which is how a re-insert into a fresh
+            # bay lands) -- and both deserve the line. A steady status frame
+            # repeating the same record does not. force=True is the asked-for
+            # scan: it always answers, even when nothing changed.
+            slot_i = info.get("index")
+            key = (info.get("rfid_uid"), mat, info.get("meas_seq"))
+            seen = getattr(self, "_readout_last", None)
+            if seen is None:
+                seen = self._readout_last = {}
+            if not force and seen.get(slot_i) == key:
+                return
+            seen[slot_i] = key
+            colour = info.get("color") or ""
+            colour = ("#" + colour.lstrip("#")) if colour else "?"
+            r, meas = info.get("remain_pct"), info.get("meas_pct")
+            try:
+                nominal = int(info.get("weight") or 1000)
+            except (TypeError, ValueError):
+                nominal = 1000
+            if meas:
+                rtxt = f"{meas}% MEASURED (~{int(nominal * meas / 100)} g)"
+            elif r:
+                # "NOT MEASURED" IS A VERDICT, AND AT THIS POINT IT IS NOT IN
+                # YET. The read resolves seconds before the unit finishes
+                # weighing the spool, so this line was calling the result while
+                # the measurement was still running -- and being contradicted
+                # by the truth a few seconds later:
+                #
+                #   17:51:57  odom C:0.473,R:0.075,P:75%     (the wire)
+                #   17:52     tag read: PLA Glow ... Measured about 75% left
+                #             -- roughly 750 g; updated Spoolman spool 87
+                #   17:52     lane23 tag -- ... remaining 70% stored on the tag
+                #             -- not measured, so the lane weight is unchanged
+                #
+                # Both lines about the same spool, one of them wrong. Say what
+                # is actually known now: the tag's number, and whether a
+                # measurement is still coming. _say_spool_summary delivers the
+                # verdict once there is one.
+                pending = False
+                try:
+                    pending = bool(self._measuring_slot(slot_i, info))
+                except Exception:
+                    pass
+                # ── THE SAME-SPOOL DECLINE IS NOT "NOT MEASURED". ──
+                #
+                # A commanded re-scan of a spool the unit measured earlier this
+                # session reads the tag, narrates "[RF] trayN: info same as
+                # last read", and correctly declines to re-pull an unchanged
+                # spool -- its radius is already saved. Watched live on the
+                # night the AMS 2 scan was fixed: runs 1 and 3 measured
+                # (P:96/97), run 2 "failed"... by re-reading the identical tag
+                # 35 seconds after saving its radius. The operator caught it in
+                # the unit's own comments. Calling that "not measured" scores
+                # correct behaviour as failure; say what actually happened.
+                #
+                # The module-side evidence IS the decline case: a measurement
+                # adopted for this slot earlier in the session (cleared on
+                # removal, so it can only refer to the spool still seated) and
+                # no new one this cycle.
+                held = None
+                try:
+                    if not pending:
+                        held = (getattr(self, "_measured_remain", None)
+                                or {}).get(slot_i)
+                except Exception:
+                    held = None
+                if held:
+                    tail = (f" -- already measured this session (~"
+                            f"{int(nominal * min(int(held), 100) / 100)} g, "
+                            f"{held}% held); spool unchanged, so the unit "
+                            f"declined to re-measure")
+                elif pending:
+                    tail = (" -- the unit is still measuring the spool; the "
+                            "lane weight updates when that lands")
+                else:
+                    tail = " -- not measured, so the lane weight is unchanged"
+                rtxt = (f"{r}% stored on the tag "
+                        f"(~{int(nominal * r / 100)} g){tail}")
+            else:
+                rtxt = "not recorded"
             self.logger.info(
-                f"AFC bambu {self.name}: wrote {grams} g remaining to "
-                f"Spoolman spool {sid} "
-                f"({source or 'physical AMS measurement'})")
+                f"AFC bambu {self.name}: {lane.name} tag -- {mat}"
+                f"{(' ' + str(info.get('sku'))) if info.get('sku') else ''}"
+                f" | colour {colour}"
+                f" | uid {str(info.get('rfid_uid') or '?').upper()}"
+                f" | remaining {rtxt}"
+                f" | nozzle {info.get('temp_min') or '?'}"
+                f"-{info.get('temp_max') or '?'}C")
         except Exception:
-            self.logger.debug("AFC bambu: spoolman weight write failed",
-                              exc_info=True)
+            pass
 
     def _surface_slot_info(self, lane: Any, info: dict) -> None:
         """
@@ -6874,10 +8651,58 @@ class afcBambuAMS(afcUnit):
                 nominal = int(tag_w) if tag_w else 1000
             except (TypeError, ValueError):
                 nominal = 1000
+            # THE TAG'S STORED REMAIN NEVER SETS THE WEIGHT. Only a
+            # measurement does, and it arrives through
+            # _adopt_measured_remain.
+            #
+            # This scaled the nominal by info["remain_pct"] -- the percentage
+            # written on the tag by whatever last wrote it, which is not this
+            # spool's current contents and is frequently stale. It overwrote
+            # lane15's MEASURED 250 g with the tag's 80% of 1000 = 800 g, and
+            # once _adopt_measured_remain started persisting properly that
+            # wrong number went into the var file rather than evaporating.
+            #
+            # The guard below ("only seed an unset or still-nominal weight")
+            # did not save it: a lane that has been through lane defaults sits
+            # at exactly the nominal, so the next surface re-scaled it. Two
+            # rules fighting over one field, and the tag was winning.
+            #
+            # So the seed is the NOMINAL and nothing else -- enough that a
+            # spool never renders as 0 g / empty, and never a claim about how
+            # much is left. That claim belongs to the measurement.
             w = nominal
-            rp = info.get("remain_pct")
-            if isinstance(rp, int) and rp > 0:
-                w = max(1, (nominal * rp) // 100)
+            # ── ...UNLESS NOTHING WILL EVER MEASURE THIS SPOOL. ──
+            #
+            # The rule above is right about precedence and wrong about the
+            # fallback. It was written from a case where the tag OVERWROTE a
+            # measurement (lane15's measured 250 g became the tag's 800 g),
+            # so the tag was barred from the weight entirely. But the AMS 2
+            # fast-paths any card it recognises -- "odom calib success exit
+            # 0", the stored per-tray calibration confirmed on one edge, no
+            # percent published -- which is the unit's design and what a real
+            # printer does too. On that path no measurement ever arrives, so
+            # a 60%-remaining PETG reel sat on the lane as a full 1000 g
+            # indefinitely, while the console printed the honest 60% two
+            # lines earlier.
+            #
+            # Precedence is what actually matters, and it is already in hand:
+            # _measured_remain holds this bay's adopted measurement. So use
+            # the tag's remain ONLY when there is no measurement for this
+            # spool. A measurement landing later still wins --
+            # _adopt_measured_remain writes it and sets _measured_remain, and
+            # from then on this branch is skipped. The tag can no longer
+            # overwrite a ruler; it just stops us reporting a part-used spool
+            # as full.
+            _meas_here = (getattr(self, "_measured_remain", None)
+                          or {}).get(info.get("index"))
+            if _meas_here is None:
+                try:
+                    trp = info.get("remain_pct")
+                    # 0 on a Bambu tag means "never measured", not "empty".
+                    if trp is not None and 0 < int(trp) <= 100:
+                        w = max(1, (nominal * int(trp)) // 100)
+                except (TypeError, ValueError):
+                    pass
             # The AMS's measured remain% is authoritative for a spool sitting in
             # the bay -- more so than Spoolman's stored value, which binding
             # just wrote into lane.weight (e.g. 998 g, nearly-full, while the
@@ -6900,8 +8725,19 @@ class afcBambuAMS(afcUnit):
                 # coincidence of the AMS still holding the record -- persist it
                 # so the lane does not depend on that.
                 self._save_lane_vars()
+                # The fill delivers tags with no scan window open (verdict
+                # "none"), which is how a re-insert into a fresh bay lands.
+                # Without this the lane visibly changed and the console said
+                # nothing about the tag that changed it.
+                afcBambuAMS._log_tag_readout(self, lane, info)
             # Full decode + a UID -> bind/create in Spoolman, keyed on the UID.
-            self._spoolman_sync(lane, info)
+            slot_i = info.get("index")
+            latch = getattr(self, "_spoolman_latched", None)
+            if latch is None:
+                latch = self._spoolman_latched = set()
+            if slot_i not in latch:
+                latch.add(slot_i)
+                self._spoolman_sync(lane, info)
         # No readable tag yet (a bay is staged but not yet fed past the reader):
         # do NOT apply an AFC default here. The tag arrives after the scan feeds
         # the spool past the reader, and a default applied on stage would show
@@ -6925,7 +8761,13 @@ class afcBambuAMS(afcUnit):
             #
             # _sync_lanes is what keeps that out now: it does not call this
             # function at all until the unit has answered.
-            self._spoolman_sync(lane, info)
+            slot_i = info.get("index")
+            latch = getattr(self, "_spoolman_latched", None)
+            if latch is None:
+                latch = self._spoolman_latched = set()
+            if slot_i not in latch:
+                latch.add(slot_i)
+                self._spoolman_sync(lane, info)
 
         # The AMS remain% sets the weight for ANY present lane -- bound or not,
         # tagged or not. The unit physically measured this reel; Spoolman's
@@ -8641,7 +10483,7 @@ class afcBambuAMS(afcUnit):
         """
         if self._bridge is None:
             return False
-        self._bridge.send({"cmd": "rehome"})
+        self._bridge.send({"cmd": "rehome", "unit": int(self.ams_index)})
         return True
 
     def scan(self, lane_or_slot: Any = None) -> bool:
@@ -9006,6 +10848,7 @@ class afcBambuAMS(afcUnit):
         deadline = self.afc.reactor.monotonic() + timeout
         last_kick = -1.0
         kicks = 0
+        self._fault_said_this_load = False    # say it once per load, not per kick
         while self.afc.reactor.monotonic() < deadline:
             now = self.afc.reactor.monotonic()
             if now - last_kick >= self.load_retry_interval:
@@ -9015,24 +10858,37 @@ class afcBambuAMS(afcUnit):
                     f"AFC bambu {self.name}: feeding {cur_lane.name} to sensor "
                     f"(kick {kicks}); letting the AMS run its own retry")
                 self.feed(cur_lane, self.load_retry_pulse)
-            # THE UNIT DECLARES ITS OWN ERRORS -- STOP KICKING A LATCHED ONE.
+            # ══ A FAULT IS NOT A REASON TO STOP ASKING. ══
             #
-            # A jammed AMS latches and will not move again until told to load.
-            # Kicking it every load_retry_interval for the rest of the window
-            # is the "stuck in the load loop" the operator hit: minutes of
-            # feed commands at a unit that has already given up, with the real
-            # failure invisible underneath.
+            # This used to break out of the kick loop the moment the unit
+            # declared a fault, on the reasoning that a latched AMS "has
+            # already given up" and further feeds are noise. The captures say
+            # the opposite, and the real printer is the authority here.
+            # Counted in ams1_print_fault_2026-08-05, from the `stall`
+            # narration to the end of the capture:
             #
-            # Its own report is the authority ("feed finish -1, stall",
-            # "pull err, bdc stall", err_code), so break out and let the
-            # caller's error path run -- which is where the retry/park
-            # decisions already live.
-            if self._ams_declared_fault():
+            #     op-03 drive frames AFTER the fault ....... 12,556
+            #     op-04 polls .............................. 8,060
+            #     op-20 heartbeats ......................... 8,410
+            #
+            # The printer does not flinch. It keeps the request going and the
+            # AMS runs its OWN error recovery underneath it -- unlatching,
+            # re-homing, re-feeding -- until the operator resumes or the load
+            # completes. Recovery on this bus is driven BY the continued
+            # request; withdrawing it is what makes a fault terminal.
+            #
+            # Live cost of getting this wrong: an HT declared a fault, we quit
+            # kicking one interval later, and it died mid-recovery -- "ht just
+            # died mid recovery because we quit asking". So: report it once,
+            # keep feeding for the rest of the window, and let the caller's
+            # error path run only when the window genuinely expires.
+            if self._ams_declared_fault() and not getattr(
+                    self, "_fault_said_this_load", False):
+                self._fault_said_this_load = True
                 self.logger.warning(
                     f"AFC bambu {self.name}: {cur_lane.name} -- the AMS "
-                    f"reported a fault during the load; stopping rather than "
-                    f"kicking a latched unit")
-                break
+                    f"reported a fault during the load; still feeding, the "
+                    f"unit runs its own recovery while the request continues")
             if self._toolhead_sensor_triggered(cur_lane):
                 self.stop()          # halt instantly so the AMS can't retract it
                 # READ THE ODOMETER NOW, not after the load finishes.
@@ -10185,6 +12041,57 @@ class afcBambuAMS(afcUnit):
         # decode, which satisfies this immediately. The wait only ever covers
         # our own poll catching up.
         ready = bool(info.get("material") or info.get("rfid_uid"))
+        # ── A UID IS NOT AN ANSWER WHILE THE SCAN IS STILL RUNNING. ──
+        #
+        # The `or` above is what makes the third-party case work, and it is
+        # also a trap: the two halves of a record do not land together. On an
+        # AMS HT the UID arrives from the anticollision well before the profile
+        # is fetched, so a UID-only record satisfied this and the operator was
+        # told the opposite of the truth, seven seconds early:
+        #
+        #   16:01:58  tag 0A1882AC read but its profile could not be decoded
+        #             (not a Bambu tag?) ... not linked to a Spoolman spool
+        #   16:02:06  applied tag to lane23: Bambu PLA Glow #A1FFAC
+        #             matched lane23 to Spoolman spool 87 by UID 0a1882ac
+        #
+        # "Could not be decoded" and "not linked" were both false, and both
+        # were printed with the evidence still in flight. So while the bay's
+        # scan window is UNRESOLVED, a bare UID does not settle anything --
+        # the record is still filling by definition. This asks the unit, not a
+        # clock: _scan_verdict returns "waiting" exactly while the window is
+        # open, and any resolution at all ends the hold.
+        if ready and not info.get("material"):
+            try:
+                if self._scan_verdict(slot) == "waiting":
+                    ready = False
+            except Exception:
+                pass
+        # ── A SPOOLMAN LOOKUP IN FLIGHT IS THE SAME KIND OF UNSETTLED. ──
+        #
+        # This sentence names the spool binding, and _bind_by_uid_bg does the
+        # lookup off-reactor -- a full-table scan plus two more calls. So the
+        # bay's record can be complete while the fact this line depends on is
+        # still a round-trip away, and 170 ms was enough to print the opposite
+        # of the truth:
+        #
+        #   17:20:11.781  ... not linked to a Spoolman spool, so this is kept
+        #                 on the lane only -- Spoolman has no spool carrying
+        #                 ECB61CD0
+        #   17:20:11.950  matched lane19 to Spoolman spool 109 by UID ecb61cd0
+        #
+        # Same shape as the UID-only trap above: the evidence was still in
+        # flight. _spoolman_inflight holds exactly the UIDs whose lookup is
+        # running, so ask it rather than guess. The backstop below still
+        # applies unchanged, so a Spoolman that never answers cannot hold this
+        # line for ever -- it just stops it being confidently wrong first.
+        if ready:
+            try:
+                uid = str(info.get("rfid_uid") or "").lower()
+                inflight = getattr(self, "_spoolman_inflight", None) or set()
+                if uid and uid in {str(u).lower() for u in inflight}:
+                    ready = False
+            except Exception:
+                pass
         if not ready:
             try:
                 ready = (deadline is None
@@ -10258,8 +12165,32 @@ class afcBambuAMS(afcUnit):
         if not getattr(self, "sync_measured_to_spoolman", True):
             went = "Spoolman sync is off, so this is kept on the lane only"
         elif sid in (None, "", 0):
-            went = ("not linked to a Spoolman spool, so this is kept on the "
-                    "lane only")
+            # ── SAY WHY, AND SAY THE FIX. ──
+            #
+            # "not linked to a Spoolman spool" is true and useless: it names a
+            # state, not a cause, and the two causes need opposite actions. A
+            # tag we could not decode has to be bound by hand; a tag we read
+            # perfectly well is unbound only because auto-create is off, and
+            # that is one config line. This cost a full investigation to work
+            # out from the outside -- lane15 read PLA Sparkle GFA08 / 04C07001
+            # cleanly all day and never linked, and the reason turned out to be
+            # that auto_spoolman_create: True was set on a DIFFERENT unit's
+            # section in another file. The log had every fact except that one.
+            went = "not linked to a Spoolman spool, so this is kept on the "
+            if not uid:
+                went += "lane only"
+            elif not material:
+                went += (f"lane only -- bind {str(uid).upper()} to a spool in "
+                         f"Spoolman to track this reel")
+            elif not getattr(self, "auto_spoolman_create", False):
+                went += (f"lane only -- Spoolman has no spool carrying "
+                         f"{str(uid).upper()} and auto-create is off for this "
+                         f"unit (add 'auto_spoolman_create: True' to "
+                         f"[AFC_BambuAMS {self.name}], or bind that UID to an "
+                         f"existing spool)")
+            else:
+                went += (f"lane only -- Spoolman has no spool carrying "
+                         f"{str(uid).upper()} yet")
         else:
             went = f"updated Spoolman spool {sid}"
         self.logger.info(
@@ -10286,6 +12217,21 @@ class afcBambuAMS(afcUnit):
         # re-applied on every pass in get_status.
         if not hasattr(self, "_measured_remain"):
             self._measured_remain = {}
+        # IDEMPOTENT. Two paths adopt the same measurement now -- the per-slot
+        # one the firmware publishes (meas_pct/meas_seq) and the older one
+        # scraped from narration -- so a single measurement was reaching
+        # Spoolman twice:
+        #
+        #   wrote 870.0 g remaining to Spoolman spool 109 (physical AMS measurement)
+        #   wrote 870.0 g remaining to Spoolman spool 109 (physical AMS measurement)
+        #
+        # Harmless to the number, but it is two blocking round-trips for one
+        # fact, and a duplicated line makes a log unreadable when something is
+        # actually wrong. Re-adopting a value this slot already holds is a
+        # no-op; a genuinely new measurement always differs, or arrives with a
+        # new meas_seq after a removal has cleared this.
+        if self._measured_remain.get(slot) == pct:
+            return True
         self._measured_remain[slot] = pct
         nominal = 1000
         for sl in (self._slots or []):
@@ -10301,6 +12247,10 @@ class afcBambuAMS(afcUnit):
         # So 102-119% means a full spool sitting slightly proud of that
         # reference geometry, NOT 19% more filament than the tag declares.
         # Believing it would write 1190 g onto a 1 kg spool.
+        try:
+            (getattr(self, "_fresh_insert", None) or {}).pop(slot, None)
+        except Exception:
+            pass
         grams = max(1, (int(nominal) * min(pct, 100)) // 100)
         if lane is not None:
             lane.weight = grams
@@ -10313,6 +12263,12 @@ class afcBambuAMS(afcUnit):
         # part-used spool stops looking full. Gated so a user who does not want
         # the AMS writing Spoolman can opt out.
         self._push_measured_to_spoolman(lane, grams)
+        # PERSIST IT. A bound lane survives a restart through Spoolman
+        # re-hydration, so this was invisible on lane19 (900 g came back) and
+        # not on lane15, whose measured 250 g reverted to the stored 220 the
+        # moment Klipper restarted -- the value only ever lived in RAM. A
+        # measurement that does not outlive the session is not much of one.
+        self._save_lane_vars()
         return True
 
     def _measure_path_from_odom(self) -> Optional[float]:

@@ -190,29 +190,34 @@ class TestNarrationToConsole:
     # misses the third unit's punctuation.
     def test_a_matched_line_is_rendered_in_english(self):
         b, r, lg = self._b()
-        b._narrate_human("[AMS_DEV] STEP:read success", 100.0)
-        assert any("read the spool tag" in m for m in lg.texts("info"))
+        b._narrate_human("[AMS_DEV] STEP:card auth success!", 100.0)
+        assert any("tag authenticated" in m for m in lg.texts("info"))
 
     def test_every_dialect_renders_the_SAME_message(self):
-        """One event, one sentence -- whichever unit said it."""
-        for line in ("[AMS_DEV] STEP:read success",
-                     "[AMS_RFID]STEP:read success",
-                     "[AMS_RFID] STEP3,read success ,goto Cali"):
+        """One event, one sentence -- whichever unit said it.
+
+        Anchored on the AUTHENTICATION rather than "read success": an HT
+        emits "read success ,goto Cali" on an attempt that then FAILS and
+        retries, so that phrasing was removed from the console table for
+        announcing a read which had not happened."""
+        for line in ("[AMS_DEV] STEP:card auth success!",
+                     "[AMS_RFID]STEP:card auth success!",
+                     "[AMS_RFID] STEP3,auth card successful"):
             b, r, lg = self._b()
             b._narrate_human(line, 100.0)
-            assert any("read the spool tag" in m for m in lg.texts("info")), line
+            assert any("tag authenticated" in m for m in lg.texts("info")), line
 
     def test_the_same_line_twice_is_said_once(self):
         b, r, lg = self._b()
-        b._narrate_human("[AMS_DEV] STEP:read success", 100.0)
-        b._narrate_human("[AMS_DEV] STEP:read success", 200.0)
+        b._narrate_human("[AMS_DEV] STEP:card auth success!", 100.0)
+        b._narrate_human("[AMS_DEV] STEP:card auth success!", 200.0)
         assert len([m for m in lg.texts("info")
-                    if "read the spool tag" in m]) == 1
+                    if "tag authenticated" in m]) == 1
 
     def test_a_burst_is_rate_limited_to_one_a_second(self):
         b, r, lg = self._b()
-        b._narrate_human("[AMS_DEV] STEP:read success", 100.0)
-        b._narrate_human("[AMS_DEV] STEP:card auth success", 100.2)
+        b._narrate_human("[AMS_DEV] STEP:card auth success!", 100.0)
+        b._narrate_human("[RF] tray0: info write to flash", 100.2)
         assert len(lg.texts("info")) == 1
 
     def test_an_unmatched_line_says_nothing(self):
@@ -1434,10 +1439,12 @@ def test_capacity_pattern_ignores_unrelated_odom_chatter():
 # one unit. These are REAL lines, copied verbatim from the captures.
 DIALECT_LINES = [
     # (event, HT form, AMS 2 form, AMS 1 form)
-    ("tag read",
-     "[AMS_RFID] STEP3,read success ,goto Cali",
-     "[AMS_RFID]STEP:read success",
-     "[AMS_DEV] STEP:read success"),
+    # The AUTHENTICATION, not "read success": the latter fires mid-cycle on
+    # an HT attempt that then fails and retries, so it is not the event.
+    ("tag authenticated",
+     "[AMS_RFID] STEP3,auth card successful",
+     "[AMS_RFID]STEP:card auth success!",
+     "[AMS_DEV] STEP:card auth success!"),
     ("calibration done",
      "[AMS_RFID] STEP4,odom calib sucess",          # HT misspells it
      "[AMS_RFID]STEP:odom calib success",

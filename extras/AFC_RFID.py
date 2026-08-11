@@ -409,6 +409,39 @@ class SpoolmanClient:
             return None
         return self._spoolman_proxy("PATCH", f"/v1/spool/{spool_id}", body=body)
 
+    def set_remaining_weight(self, spool_id: int,
+                             grams: float) -> Optional[dict]:
+        """PATCH a spool's remaining net filament weight, in grams.
+
+        Spoolman derives remaining_weight from used_weight, so it is set by
+        writing used_weight = initial_weight - remaining. initial_weight comes
+        from the spool (or its filament's weight) so the arithmetic matches
+        Spoolman's own. Used for a PHYSICAL remaining measurement (e.g. an AMS
+        that measured the spool by radius), which is authoritative in a way
+        extrusion-accounting is not.
+
+        :param spool_id: Spoolman spool id.
+        :param grams: measured remaining net weight, grams.
+        :return: PATCH result dict, or None.
+        """
+        if spool_id in (None, "", 0) or grams is None or grams < 0:
+            return None
+        spool = self.get_spool(spool_id) or {}
+        initial = spool.get("initial_weight")
+        if not initial:
+            fil = spool.get("filament") or {}
+            initial = fil.get("weight")
+        try:
+            initial = float(initial) if initial else None
+        except (TypeError, ValueError):
+            initial = None
+        if not initial:
+            return None
+        used = max(0.0, initial - float(grams))
+        return self._spoolman_proxy(
+            "PATCH", f"/v1/spool/{spool_id}",
+            body=json.dumps({"used_weight": round(used, 2)}))
+
     def write_spool_metadata(self, spool_id: int, lot_nr: Optional[str] = None,
                              uid: Optional[str] = None) -> Optional[dict]:
         """Write the tag's manufacturing date (-> lot_nr) and NFC UID (-> the
@@ -560,6 +593,25 @@ def _spool_uids(spool: dict) -> set:
             if n:
                 uids.add(n)
     return uids
+
+
+def _cached_spoolman_client(afc: Any) -> "SpoolmanClient":
+    """One SpoolmanClient per AFC instance, not per call.
+
+    The client's _fields_ensured/_filament_fields_ensured memos are
+    per-instance; constructing a fresh client for every sync threw them away,
+    so every bind re-fetched the Spoolman field schema -- more blocking HTTP
+    on the reactor in exactly the burst that has taken the printer down
+    ("Timer too close"). Cached on the afc object so all units share it.
+    """
+    client = getattr(afc, "_afc_spoolman_client_cache", None)
+    if client is None:
+        client = SpoolmanClient(afc.moonraker)
+        try:
+            afc._afc_spoolman_client_cache = client
+        except Exception:
+            pass
+    return client
 
 
 def find_spool_by_uid(client: SpoolmanClient, uid: Any) -> Optional[dict]:
@@ -1240,7 +1292,7 @@ def sync_rfid_to_spoolman(afc: Any, lane: Any, slot_info: dict, logger: Any,
     # Prefer the tag's own density (BTT tags carry one) over the material table.
     density = slot_info.get("density") or density_for_material(material)
 
-    moonraker = SpoolmanClient(afc.moonraker)
+    moonraker = _cached_spoolman_client(afc)
     scanned_uid = _norm_uid(slot_info.get("uid"))
 
     # If Spoolman is unreachable, don't fail — the tag's decoded values were
@@ -1573,7 +1625,8 @@ class AFCUnitRFID:
             spool_id = getattr(lane, "spool_id", None)
             mr = getattr(self.afc, "moonraker", None) if self.afc else None
             if spool_id and mr is not None:
-                info = enrich_from_spool(SpoolmanClient(mr), spool_id, slot_info)
+                info = enrich_from_spool(_cached_spoolman_client(self.afc),
+                                         spool_id, slot_info)
             lane_name = getattr(lane, "name", "") or ""
             where = " on %s" % lane_name if lane_name else ""
             summary = format_tag_summary(

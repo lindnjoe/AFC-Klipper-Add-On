@@ -1,0 +1,19 @@
+# model:     ams1
+# outcome:   read
+# source:    docs/captures/ams1_alone_insert_timestamped.txt, header block.
+#            One AMS 1 alone on the bus (0x0700 id 0x00) behind a real Bambu
+#            printer, Pico passive inline. Tagged spool, insert edge at +0.000s.
+# verbatim:  yes -- offsets and text exactly as the capture records them.
+#
+# THE SCAN TAKES 42 SECONDS on this model, against ~4 s on an AMS 2. The tag is
+# authenticated, cached and announced at +37.980s, all in the same second, and
+# the feed completes 4.4 s after that.
+#
+# offset | expect | line
++0.000  | .             | [AMS_DEV] STEP,first detected
++5.571  | end           | [AMS_DEV] STEP:odom calib success exit 0,dis:0.773
++6.639  | inflight      | [AMS_DEV] STEP:rfid pull 0
++37.980 | inflight      | [AMS_DEV] STEP:card auth success!
++37.980 | read inflight | [RF] tray0: info write to flash
++37.980 | read inflight | [AMS_DEV] STEP:read success,valid
++42.430 | read end inflight | [AMS_DEV] STEP:feed with rfid success / STEP7:finish,cali tray

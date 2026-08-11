@@ -506,12 +506,17 @@ _AMS_HUMAN = (
     # third unit. Match the CONTENT instead: the wording is shared, only the
     # tag and the punctuation around STEP differ ("STEP4," / "STEP:" / "STEP2:",
     # with or without a space after the bracket).
-    (_STEP("read success"),
-     lambda m: "AMS read the spool tag"),
+    # "read success" and "feed with rfid success" are NOT here, deliberately.
+    # Captured on an HT: a failed attempt emits BOTH, then "info_valid 0",
+    # then the unit retries and only the auth/flash pair marks the read that
+    # actually landed. Announcing "AMS read the spool tag" on those told the
+    # operator a read had succeeded seconds before one had -- the same
+    # mistake the firmware's read latch used to make, in words. The two
+    # lines below are true on every unit.
     (_STEP("card auth success"),
      lambda m: "AMS: tag authenticated"),
-    (_STEP("feed with rfid success"),
-     lambda m: "AMS: spool fed and tag read"),
+    (_STEP("auth card successful"),
+     lambda m: "AMS: tag authenticated"),
     (_STEP("first detected"),
      lambda m: "AMS: spool detected"),
     (_STEP(r"select card fail, err (\d+)"),
@@ -523,6 +528,95 @@ _AMS_HUMAN = (
                 f"flash (a later read returns it even after a swap)")),
     (re.compile(r"preload\s+finish", re.IGNORECASE),
      lambda m: "AMS staged the spool at its feeder"),
+    # ── PLAIN ENGLISH FOR THE LINES THAT ACTUALLY MATTER ─────────────────
+    # Suppressing the chatter is only half the job: what survives should
+    # read like a sentence, not like a register dump. These are the events
+    # an operator acts on, in the wording they would use themselves.
+    #
+    # The measurement result. "odom C:0.478,R:0.076,P:79%, od:0.491" is the
+    # circumference, radius and percent from the unit's own two-edge
+    # measure -- the percent is the only part a human wants.
+    (re.compile(r"odom\s+C:[0-9.]+\s*,\s*R:([0-9.]+)\s*,\s*P:(\d+)%"),
+     lambda m: (f"AMS measured the spool: about {m.group(2)}% left "
+                f"(spool radius {float(m.group(1)) * 1000:.0f} mm)")),
+    # The stored per-tray value, read back at power-up. This is the number
+    # the unit keeps in its own flash and the only place it says it out
+    # loud -- worth surfacing rather than burying.
+    (re.compile(r"odom\s+load\s+from\s+flash\s*(\d+)\s*,\s*"
+                r"R:[0-9.]+\s*,\s*P:(\d+)"),
+     lambda m: (f"AMS: bay {int(m.group(1)) + 1} remembers about "
+                f"{m.group(2)}% left from its last measurement")),
+    # The saved calibration -- the unit committing a fresh measure to flash.
+    (re.compile(r"odom\s+save\s+tray:(\d+)"),
+     lambda m: f"AMS stored a new measurement for bay {int(m.group(1)) + 1}"),
+    # A feed that stalled. len_det is how far the filament actually got,
+    # tube_len how far it should have gone -- the two numbers that tell you
+    # whether it barely moved or nearly made it.
+    (re.compile(r"feed\s+finish\s+-?\d+\s*,\s*stall\s*,\s*"
+                r"len_det:([0-9.]+)\s*m\s*,\s*tube_len:([0-9.]+)\s*m"),
+     lambda m: (f"AMS: the filament STALLED after {float(m.group(1)):.2f} m "
+                f"of a {float(m.group(2)):.2f} m path -- check for a jam "
+                f"between the bay and the toolhead")),
+    # The unit's own error register changing. 0x00 -> anything is a fault
+    # being raised; anything -> 0x00 is it clearing.
+    (re.compile(r"err_code:0x00\s*->\s*0x([0-9A-Fa-f]+)"),
+     lambda m: f"AMS raised error 0x{m.group(1).upper()}"),
+    (re.compile(r"err_code:0x[0-9A-Fa-f]+\s*->\s*0x0+\b"),
+     lambda m: "AMS cleared its error"),
+    # A spool leaving the bay, and the calibration that goes with it.
+    (re.compile(r"tray\s+(\d+)\s+out\s*,\s*clear\s+magic_num"),
+     lambda m: f"AMS: bay {int(m.group(1)) + 1} is now empty"),
+    # Power-up. The self-check is the unit's boot, which is worth one line
+    # because it means everything it knew about follower state is gone.
+    (re.compile(r"ams\s+pmsm\s+cali\s+finish", re.IGNORECASE),
+     lambda m: "AMS finished its power-up self-check"),
+    (re.compile(r"pmsm\s+self\s+check\s+good", re.IGNORECASE),
+     lambda m: "AMS motor self-check passed"),
+    # ── THE REMAINING EVENTS, FROM THE SAME INVENTORY ────────────────────
+    # The second odometer edge -- one full turn of the spool, which is what
+    # a real measurement needs. Its absence is the fast-path.
+    (_STEP("second detected"),
+     lambda m: "AMS: spool turned a full revolution (measuring)"),
+    (_STEP(r"odom calib\s*,\s*tray (\d+)"),
+     lambda m: f"AMS started measuring bay {int(m.group(1)) + 1}"),
+    (_STEP(r"cali end"),
+     lambda m: "AMS finished its measuring cycle"),
+    (_STEP(r"Calibration rst:(\d+)"),
+     lambda m: f"AMS finished measuring (result {m.group(1)})"),
+    # A tag the unit cannot open -- almost always a non-Bambu spool.
+    (_STEP(r"auth fail:-?(\d+)"),
+     lambda m: ("AMS could not authenticate the tag -- third-party spool, "
+                "or the tag is unreadable")),
+    (re.compile(r"\[RF\]\s*tray(\d+): info same as last read"),
+     lambda m: (f"AMS: bay {int(m.group(1)) + 1} holds the same spool as "
+                f"before")),
+    # No stored calibration for this bay -- why a fast-path cannot happen.
+    (_STEP(r"odom invalid tray (\d+)"),
+     lambda m: (f"AMS: bay {int(m.group(1)) + 1} has no stored measurement "
+                f"yet")),
+    (_STEP(r"odom load tray (\d+) info invailed"),
+     lambda m: f"AMS: bay {int(m.group(1)) + 1} has no stored measurement yet"),
+    # The load fault we chased for hours -- worth naming exactly.
+    (_STEP(r"odom tray_id error (\d+)"),
+     lambda m: ("AMS: asked to move with NO TRAY SELECTED -- the unit "
+                "rejected the command")),
+    (re.compile(r"\[AMS_LED\]\s*TIMEOUT error (\d+)"),
+     lambda m: "AMS: TIMEOUT -- the unit gave up on the move"),
+    # Feed milestones, with the distance that makes them meaningful.
+    (re.compile(r"feed to dw ok\s*,\s*len_det:([0-9.]+)\s*m"),
+     lambda m: f"AMS: filament reached the hub after {float(m.group(1)):.2f} m"),
+    (re.compile(r"feed finish\s*,\s*buff_pos:[0-9.]+\s*,\s*bldc_i:[0-9.]+A"
+                r"\s*,\s*t:([0-9.]+)s"),
+     lambda m: f"AMS finished feeding ({float(m.group(1)):.1f} s)"),
+    (re.compile(r"new tube_len:(\d+)\s*mm"),
+     lambda m: f"AMS learned the bay-to-hub path length: {m.group(1)} mm"),
+    # Staging the spool at the feeder, and the bay lock that goes with it.
+    (re.compile(r"preload start", re.IGNORECASE),
+     lambda m: "AMS is staging the spool at its feeder"),
+    # Power-up of the whole unit -- everything it knew about follower state
+    # is gone, which is worth one visible line.
+    (re.compile(r"\[AMS_ADA\]\s*init", re.IGNORECASE),
+     lambda m: "AMS powered up (any follower state it held is gone)"),
 )
 
 # Narration that means the AMS has COMMITTED to the physical tag read -- it has
@@ -595,7 +689,22 @@ _RFID_READ_OK_RE = re.compile(
     # stating the tag it now serves BELONGS to the spool in the bay, which is
     # exactly the question the caller is asking.
     r"|" + _STEP_SEP + r"save to flash"
-    r"|card info valid")
+    r"|card info valid"
+    # The [RF]-prefixed commit lines: "trayN: info write to flash" on a fresh
+    # read, "trayN: info same as last read" on a re-insert of the same spool.
+    r"|info write to flash"
+    r"|info same as last read")
+
+# The HT's TERMINAL-only subset. On an HT, "feed with rfid success" and
+# "read success" fire on FAILED sub-cycles too (measured: a retry loop
+# emitted both, then "info_valid 0 or bbl:1", then finally committed) --
+# only the flash-commit family says the tag landed. handle_line consults
+# this pattern for 0x1800 narration and the full one for boxed.
+_RFID_READ_OK_HT_RE = re.compile(
+    _STEP_SEP + r"save to flash"
+    r"|card info valid"
+    r"|info write to flash"
+    r"|info same as last read")
 
 # End of the scan CYCLE, whatever its outcome. The unit emits this on both ends
 # -- after "feed with rfid success" and after "tray pull over 790 mm, but no
@@ -632,14 +741,30 @@ _RFID_READ_OK_RE = re.compile(
 #: is simply WRONG for a Snapmaker or Elegoo spool: it saw one and could not
 #: open it. Different problem, different thing for an operator to do.
 _RFID_FOREIGN_TAG_RE = re.compile(
-    r"auth fail\s*:\s*-?\d+"
-    r"|info_valid\s*0\s*or\s*bbl\s*:\s*-?\d+",
+    # ONLY the auth refusal. "info_valid 0 or bbl:N" looked like foreign-tag
+    # wording but the corpus shows it on EMPTY-BAY cycles (no card detected ->
+    # info_valid 0 -> cali end) and mid-retry on HT reads that then succeeded
+    # -- matching it worded empty bays as refused chips.
+    r"auth fail\s*:\s*-?\d+",
     re.IGNORECASE)
 
 _RFID_CYCLE_END_RE = re.compile(
     r"Calibration\s+rst:\d+"
     r"|odom\s+calib\s+succ?ess"
-    r"|STEP7:\s*(?:finish|cali\s+end)",
+    r"|STEP7:\s*(?:finish|cali\s+end)"
+    # An HT with the capacity measure disabled ends its cycle with "tray
+    # capacity no en" and never says "Calibration rst:" at all -- without
+    # this the scan-end stamp never advances and the bus claim rides its
+    # 120 s backstop.
+    r"|tray\s+capacity\s+no\s+en",
+    # NOT "tray pull over N mm, no card detected" -- that line is INFLIGHT.
+    # Tried 2026-08-10 and reverted the same hour: the dialect fixture
+    # (ams2_insert_untagged, from a real capture) shows the unit still
+    # finishing after it, with the true terminal -- "STEP7:finish,cali tray",
+    # already matched above -- arriving next. Stamping on the pull-over line
+    # ends the cycle EARLY, which is cueing on the wrong answer: the exact
+    # failure the end-on-answers rule exists to prevent. The fixture caught
+    # it before the hardware had to.
     re.IGNORECASE)
 
 # Bus chatter with no operational content. These are the AMS's own link-layer
@@ -672,6 +797,98 @@ _AMS_NOISE_RE = re.compile(
     # run by the time this is decided. Chamber temperature reaches the card
     # through [AMS_CHMB], not this line.
     r"|\[AMS_COMMON\]\s*preload_disable:\d+\s*,\s*tmpr:[0-9.]+\s*,\s*cd:\d+"
+    # The RFID poller idling on an empty selection, and the state line it
+    # rides with. Measured on the console: these three segments accounted
+    # for essentially every line an operator saw while nothing was
+    # happening -- "state:0,tray_now:255" / "STEP0:checking" /
+    # "STEP0:idx 255 > 4", repeating a few times a second with tray_now 255
+    # meaning NO TRAY IS SELECTED. It is the unit asking itself a question
+    # about nothing. Console only, as above: the narration log still keeps
+    # every line verbatim and every parser has already run.
+    # states 0 and 3 ONLY, and only with NO tray selected. state:6 is an
+    # AMS 1 fault and state:1 is a load in progress -- both are things an
+    # operator must still see, and a bare state:\d+ swallowed them.
+    # ...and states 0/3 with ANY tray, not only tray_now:255. During a print
+    # the unit sits at "state:0,tray_now:1" between assist pulses -- idle,
+    # with a tray simply still selected -- and that leaked to the console on
+    # every frame. state 0 and 3 are both "not doing anything"; 1 (load in
+    # progress), 6 (loaded/engaged) and 7 (STALLED) are excluded above and
+    # stay visible.
+    r"|\[AMS_COMMON\]\s*state:[03]\s*,\s*tray_now:\d+\s*,\s*tray_exit:\d+"
+    r"|\[AMS_COMMON\]\s*en:\d+\s*,\s*mode:\d+\s*,\s*idx:\d+\s*,\s*ref:\d+"
+    r"|\[AMS_RFID\]\s*STEP0:\s*checking"
+    r"|\[AMS_RFID\]\s*STEP0:\s*idx\s+\d+\s*>\s*\d+"
+    # ── THE FOUR THAT FILL THE CONSOLE DURING A PRINT ────────────────────
+    # Counted off a live print: these were essentially every line an
+    # operator saw for minutes at a time, and not one of them is
+    # actionable. They are the assist mechanism doing its job.
+    #
+    #   [AMS_PMSM]mode:0->2 / 2->0   the assist motor cycling on and off,
+    #                                several times a second, forever
+    #   [AMS_LED]tray 1 loading      the bay LED restating itself
+    #   [AMS_SWITCH]BUFF,pos:..      buffer arm position + motor current,
+    #                                telemetry that already reaches the
+    #                                dryer/buffer card as numbers
+    #   [AMS_COMMON]state:4,..       "feeding, tray N selected" repeated for
+    #                                the whole load; AFC already prints
+    #                                "Loading laneN" once, which is the line
+    #                                a human wants
+    #
+    # CONSOLE ONLY, like every rule above: AFC_BambuAMS.log still keeps all
+    # of it verbatim, and every parser has already run before this is
+    # decided. state 1/6/7 are deliberately NOT here -- load-in-progress,
+    # loaded-engaged and STALLED are things an operator must still see.
+    r"|\[AMS_PMSM\]\s*mode:\s*\d+\s*->\s*\d+"
+    r"|\[AMS_LED\]\s*tray\s+\d+\s+\w+"
+    r"|\[AMS_SWITCH\]\s*BUFF\s*,[^\[]*"
+    r"|\[AMS_COMMON\]\s*state:4\s*,\s*tray_now:\d+\s*,\s*tray_exit:\d+"
+    # ── THE REST OF THE MECHANISM, INVENTORIED NOT GUESSED ───────────────
+    # Counted over 41,736 lines of live narration -- 161 distinct shapes.
+    # Everything below is the unit talking to itself while it works. The
+    # single biggest source by an order of magnitude:
+    #
+    #   [AMS_IDLE]set ams state assist, mode:4      9,541 lines
+    #
+    # ...the follower announcing it is still assisting, forever. The rest
+    # are the RFID state machine's internal steps, the link layer's select
+    # acks, and per-move bookkeeping. None of it is a decision, an outcome
+    # or a fault; the ones that ARE get plain-English sentences instead
+    # (see _AMS_HUMAN). Console only -- AFC.log keeps every line verbatim.
+    r"|\[AMS_IDLE\]\s*set ams state assist[^\[]*"
+    r"|\[AMS_LINK\]\s*en:\d+\s*,\s*mode:\d+\s*,\s*idx:\d+\s*,\s*ref:\d+"
+    # The select ack the old rule missed: it expected "ams1", the wire says
+    # "ams-0x00". 184 lines it never caught.
+    r"|\[AMS_(?:LINK|CALL)\]\s*ams-?(?:0x)?[0-9A-Fa-f]+\s+select[^\[]*"
+    # ([AMS_LINK]get_slot was NOT added here on purpose. It repeats hard,
+    # but TestTheHeartbeatCannotBreakTheDedupe pins it visible: that
+    # repetition is handled by the dedupe/"(xN repeated)" loop, and muting
+    # it instead would hide a stuck unit re-asking for the same slot.)
+    # Only the FEED-CYCLE transitions (state 3, filament riding through
+    # the switch). "0 -> 1" and "1 -> 0" are a spool arriving at or
+    # leaving the bay and stay visible -- pinned by the noise-filter test.
+    r"|\[AMS_TRAY\]\s*tray\[?\d*\]?\s*sw_sta\s*update\s*,\s*"
+    r"(?:3\s*->\s*\d+|\d+\s*->\s*3)[^\[]*"
+    r"|\[AMS_BDC\]\s*tray lock:[^\[]*"
+    r"|\[AMS_LED\]\s*mc set tray[^\[]*"
+    r"|\[AMS_ENC\]\s*clc[^\[]*"
+    r"|\[AMS_LINK\]\s*assist_err:[^\[]*"
+    r"|\[AMS_SWITCH\]\s*(?:assist finish|reset dw length|retry:|AMS_CTRL_"
+    r"|SWITCH_pull ignore|SWITHC_feed ignore|need to pull tray|feed tray:"
+    r"|pull tray:|pull sucess)[^\[]*"
+    # The RFID reader's own step machine. These are stages, not results --
+    # the results (auth success, first/second detected, the measurement,
+    # cali end) are translated and stay.
+    r"|\[AMS_(?:RFID|DEV)\]\s*STEP\d*[:,]?\s*(?:odom search|set \d+ tray_readid"
+    r"|rfid pull|time_reset|stop goto auth|check pass|checking|open_PCD"
+    r"|reader \d+ enable|pull tension|goS\d|done\d|search \d+ card"
+    r"|anticoll get UID|direct read card|empty to read|select card success"
+    r"|pull back|start,read all card|ready to cali tray|no card in RF"
+    r"|after tension|confirm RF have no card|odom select rslt"
+    r"|odom reset tray|cali read tray)[^\[]*"
+    # Motor/encoder self-test internals at power-up. "self check good" and
+    # "cali finish" are translated; the ADC dumps behind them are not.
+    r"|\[AMS_PMSM(?:_[A-Z])?\]\s*(?:adc\d|timeout, retry|get ams_id"
+    r"|has ams_id|P cali init|table_xy)[^\[]*"
     r"))+\s*$")
 
 #: The AMS's 10-second liveness heartbeat, as a segment rather than a line.
@@ -701,6 +918,11 @@ def _ams_is_noise(text: str) -> bool:
 # is surfaced (to AFC.log) rather than dropped -- see handle_line. The command
 # echoes are listed because the bridge answers every command with one and they
 # are not interesting on their own.
+#: Motion acks that ride the follower's own cadence rather than marking an
+#: operator-visible decision. Console-suppressed (AFC.log keeps them all):
+#: during a print these repeat every few seconds for the length of the job.
+_ACK_ROUTINE = frozenset(("assist", "select", "stop", "hold", "follow"))
+
 #: Sentinel for "no value yet", where None is itself meaningful.
 _UNSET = object()
 
@@ -710,7 +932,11 @@ _BRIDGE_EVENTS_KNOWN = frozenset((
     # command echoes
     "dry", "mon", "resync", "mcaddr", "armms", "arrivems", "hb",
     "htpoll", "htid", "htunit", "drain", "mute", "units", "variant", "baud",
-    "parity", "en", "replay", "load", "unload", "rdinfo", "relink", "rehome",
+    # ("load" was here too -- the firmware's bb_do_load replayed feed frames
+    # hard-wired to unit 0x00 and nothing ever sent it; removed with the
+    # addressing sweep. "unload" stayed: bridge_unload() genuinely uses it,
+    # and it is unit/slot-addressed now.)
+    "parity", "en", "replay", "unload", "rdinfo", "relink", "rehome",
     "capscan", "m6", "p0f", "poll", "extmimic", "ht0fhold",
     "tail", "arrived", "txecho",
     # Scan-path echoes. Both are the bridge repeating back a command we sent
@@ -755,6 +981,12 @@ class BambuBridge:
     One bridge per physical Pico. Multiple AFC units (daisy-chained AMS on the
     same bus) share it and each register a status listener via add_listener().
     """
+
+    # Console-bound narration lines per second before the rest of a burst is
+    # sent to AFC.log only. Generous enough that a normal load or scan (a few
+    # lines a second) never trips it; low enough that a retry storm cannot
+    # fill Klipper's gcode pipe and stall the reactor. See handle_line.
+    NARRATION_CONSOLE_MAX_PER_S = 12
 
     def __init__(self, serial_factory: Callable[[], Any], reactor: Any,
                  logger: Any) -> None:
@@ -920,6 +1152,18 @@ class BambuBridge:
         self._bldc_i: float = 0.0
         self._chain_uids: List[str] = []       # index -> 24-hex UID (from `chain`)
         self._last_raw_reply: str = ""         # last `reply` frame (diagnostic)
+        # Last {"evt":"idsave"} outcome as (state, n), or None if none since
+        # the caller cleared it. AFC_BAMBU_SAVEIDS waits on this rather than a
+        # clock: the firmware answers every idsave, so there is a real answer
+        # to wait for and no reason to guess how long a flash write takes.
+        self._last_idsave: Optional[tuple] = None
+        # Last {"evt":"mmfix"} payload, so AFC_BAMBU_MMFIX can report the
+        # firmware's own counters rather than a second copy kept here.
+        self._last_mmfix: Optional[dict] = None
+        # True between sending {"cmd":"reset"} and the disconnect it causes, so
+        # the reader can tell "the Pico is rebooting because we said so" from
+        # "the link died".
+        self._expect_reset: bool = False
         # Last {"cmd":"rdinfo"} result: the RAW 0x0211 filament-info reply for
         # one bay, straight off the wire and before any decode. The one way to
         # tell "the unit did not send this field" from "our decode missed it".
@@ -1566,6 +1810,10 @@ class BambuBridge:
         s = self._serial
         if s is None:
             return
+        # Arm the expected-disconnect flag BEFORE the write: a reset can take
+        # the port down before this call even returns.
+        if obj.get("cmd") in ("reset", "bootsel"):
+            self._expect_reset = True
         try:
             s.write((json.dumps(obj) + "\n").encode())
         except Exception as e:
@@ -1832,13 +2080,86 @@ class BambuBridge:
                     obj.get("hex") or obj.get("rx") or "")
         elif obj.get("evt") == "error":
             self.logger.warning(f"AFC bambu: bridge error: {obj.get('msg')}")
+        elif obj.get("evt") == "idsave":
+            # The identity table (uid -> chain index + model) persisted on the
+            # Pico, so the next power-up enrols with the class, order and model
+            # already known instead of guessing from announce order.
+            #
+            # "match" is the answer on every ordinary boot and means no flash
+            # was touched. "written" should appear once after a config change
+            # or on a fresh Pico -- if it appears every boot, the record is not
+            # sticking and that is worth knowing, so it is INFO, not debug.
+            state = obj.get("state")
+            n = obj.get("n")
+            # Latched for AFC_BAMBU_SAVEIDS, which must not reboot the Pico
+            # until the firmware has actually said the record is down.
+            with self._lock:
+                self._last_idsave = (str(state or ""), n)
+            if state == "wiped":
+                self.logger.info(
+                    "AFC bambu: bridge ERASED its stored unit identities; the "
+                    "next power-up will enroll from announce order until prep "
+                    "writes a fresh record")
+            elif state == "written":
+                self.logger.info(
+                    f"AFC bambu: bridge stored {n} unit identities -- the next "
+                    f"restart will enroll from them")
+            elif state == "failed":
+                self.logger.warning(
+                    "AFC bambu: bridge could NOT store the unit identities; "
+                    "the chain will keep enrolling from announce order")
+            else:
+                self.logger.debug(
+                    f"AFC bambu: bridge identities already stored ({n} units)")
+        elif obj.get("evt") == "mmfix":
+            # THE ADDRESS-MISMATCH REMEDY, AND ITS ONLY HONEST VERIFICATION.
+            #
+            # An op-05 reply carries the sender's UID, so a disagreement with
+            # our address map is a fact off the wire, not an inference. Acting
+            # on it broke the chain twice, so the action ships OFF and these
+            # counters are how it gets judged:
+            #
+            #   remedy stops climbing  -> it worked
+            #   remedy climbs at the cooldown rate -> it did not, and the map
+            #                                         is still contradicted
+            #   defer climbing         -> the bus was busy feeding, held back
+            #
+            # 1.18.0.0 was "verified" by watching the console for an event the
+            # module does not handle and could never print. Numbers that can be
+            # wrong, or nothing.
+            with self._lock:
+                self._last_mmfix = dict(obj)
+            det, rem = obj.get("detect"), obj.get("remedy")
+            if obj.get("on") and rem:
+                self.logger.info(
+                    f"AFC bambu: address-mismatch remedy has run {rem}x "
+                    f"({det} disagreements seen, last at address "
+                    f"{obj.get('addr')}, {obj.get('defer')} held back for a "
+                    f"busy bus) -- if this keeps climbing the map is still "
+                    f"wrong and the remedy is not fixing it")
+            else:
+                self.logger.debug(
+                    f"AFC bambu: mmfix on={obj.get('on')} detect={det} "
+                    f"remedy={rem} defer={obj.get('defer')} "
+                    f"addr={obj.get('addr')} streak={obj.get('streak')} "
+                    f"quiet={obj.get('quiet')}")
         elif obj.get("evt") == "ack":
             # Motion-command acknowledgements (select/feed/retract/assist/
             # stop/...). AFC.log via the AFC logger, not python logging.debug,
             # which klipper runs at INFO and therefore discards -- these are the
             # record of what the bridge was actually asked to do.
+            # ══ THE ROUTINE ONES ARE LOG-ONLY. ══
+            # assist/select/stop fire on the follower's own cadence -- during
+            # a print "bridge ack assist (slot 1)" repeated every couple of
+            # seconds for the whole job, which is the record of a mechanism
+            # working correctly and not something an operator reads. The
+            # motion acks that mark a real decision (feed, retract) stay on
+            # the console. AFC.log keeps ALL of them either way, so the audit
+            # trail of what the bridge was asked to do is unchanged.
+            _ack_cmd = str(obj.get("cmd") or "")
             self.logger.debug(
-                f"AFC bambu: bridge ack {obj.get('cmd')} (slot {obj.get('slot')})")
+                f"AFC bambu: bridge ack {_ack_cmd} (slot {obj.get('slot')})",
+                only_debug=_ack_cmd in _ACK_ROUTINE)
         elif obj.get("evt") == "amsdbg":
             # The AMS's own narration. Identical consecutive lines are
             # de-duplicated, but NOT suppressed forever: a repeating line is how
@@ -1869,7 +2190,9 @@ class BambuBridge:
                 self._rfid_step_t = now
                 if _addr:
                     self._rfid_step_by_addr[_addr] = now
-            if text and _RFID_READ_OK_RE.search(text):
+            _read_re = (_RFID_READ_OK_HT_RE if _addr == 0x1800
+                        else _RFID_READ_OK_RE)
+            if text and _read_re.search(text):
                 self._rfid_ok_t = now
                 if _addr:
                     self._rfid_ok_by_addr[_addr] = now
@@ -2104,8 +2427,59 @@ class BambuBridge:
                 # something stays on the console, where an operator with AFC's
                 # debug flag on watches a load happen.
                 if text:
-                    self.logger.debug(f"AMS: {text}",
-                                      only_debug=_ams_is_noise(text))
+                    # ══ THE CONSOLE IS A RATE-LIMITED CHANNEL, AND EXCEEDING
+                    # IT SHUT KLIPPER DOWN. ══
+                    #
+                    # Narration that "says something" goes to the console by
+                    # design, which is right until the unit says something
+                    # thousands of times. Live: a scan whose selects were
+                    # being acked by the wrong unit retried in a tight loop,
+                    # each retry narrating --
+                    #
+                    #   [AMS_LINK]ams-0x00 select ack, req ams-0x01, mode:1
+                    #   [AMS_DEV] STEP:set 0 tray_readid ...
+                    #
+                    # -- dozens of lines a second. Klipper's gcode responder
+                    # is a pipe; filling it raises
+                    # `BlockingIOError: [Errno 11]` inside _respond_raw, and
+                    # the reactor stalls behind it. The clocksync went with
+                    # it ("Resetting prediction variance ... diff=-921873102"
+                    # on a 520 MHz mcu) and every mcu was shut down.
+                    #
+                    # So the console gets a ceiling. Overflow is NOT lost --
+                    # it still goes to AFC.log, which is where a flood should
+                    # be read anyway. A burst is allowed through so normal
+                    # narration is unaffected; only a genuine storm is
+                    # throttled, and it says so once.
+                    # ══ JUDGE THE LINE WITHOUT THE HEARTBEAT RIDING ON IT.
+                    # ══  The AMS bundles its 10-second "[DBG] ams time"
+                    # liveness into whatever frame is going out. The dedupe
+                    # above already strips it for that reason -- but this
+                    # test ran on the RAW text, so any pure-chatter line
+                    # that happened to carry a heartbeat matched no noise
+                    # rule and went to the console anyway. Replaying the
+                    # live log: 2,916 lines reached the console on that
+                    # technicality alone, more than every other survivor
+                    # combined. Strip it here too, then judge.
+                    _quiet = _ams_is_noise(_DBG_AMSTIME_RE.sub("", text).strip())
+                    if not _quiet:
+                        _now = time.monotonic()
+                        _win = getattr(self, "_narr_win", 0.0)
+                        if _now - _win >= 1.0:
+                            self._narr_win = _now
+                            self._narr_n = 0
+                            self._narr_said = False
+                        self._narr_n = getattr(self, "_narr_n", 0) + 1
+                        if self._narr_n > self.NARRATION_CONSOLE_MAX_PER_S:
+                            _quiet = True            # log-only from here
+                            if not getattr(self, "_narr_said", False):
+                                self._narr_said = True
+                                self.logger.info(
+                                    "AFC bambu: the AMS is narrating faster "
+                                    "than the console can take "
+                                    f"(>{self.NARRATION_CONSOLE_MAX_PER_S}/s); "
+                                    "the rest of this burst is in AFC.log")
+                    self.logger.debug(f"AMS: {text}", only_debug=_quiet)
         elif obj.get("evt") == "rdinfo":
             with self._lock:
                 self._last_rdinfo = dict(obj)
@@ -2313,8 +2687,17 @@ class BambuBridge:
                 # Do NOT die on a read error -- drop the port and reconnect, so a
                 # transient USB/serial glitch self-heals instead of bricking the
                 # bridge until a Klipper restart.
-                self.logger.warning(
-                    f"AFC bambu: bridge read failed: {e}; reconnecting")
+                if self._expect_reset:
+                    # WE ASKED FOR THIS. A reset drops the USB CDC endpoint by
+                    # definition, so the read failing is the command working,
+                    # not a fault -- and shouting WARNING at an operator who
+                    # just typed AFC_BAMBU_SAVEIDS reads like something broke.
+                    self._expect_reset = False
+                    self.logger.info(
+                        "AFC bambu: bridge resetting as asked; reconnecting")
+                else:
+                    self.logger.warning(
+                        f"AFC bambu: bridge read failed: {e}; reconnecting")
                 self._drop_port()
                 continue
             if not chunk:
