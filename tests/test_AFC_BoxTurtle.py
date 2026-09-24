@@ -274,7 +274,7 @@ class TestCalibrateBowdenNegativeDistance:
         lane.is_direct_hub.return_value = True
         lane.is_direct_dist.return_value = True
         lane.extruder_obj.tool_start = "toolhead"
-        # Sensor reads "not yet at toolhead" once, then "arrived" — exits
+        # Sensor reads "not yet at toolhead" once, then "arrived", exits
         # the homing loop after a single short move.
         lane.get_toolhead_pre_sensor_state.side_effect = [False, True]
         lane.move_to.return_value = (True, 1, AFCMoveWarning.NONE)

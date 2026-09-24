@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Point this clone's git at the repo-tracked hooks (the key-material guard).
+# Run once per clone:  ./.githooks/install
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-commit 2>/dev/null || true
+echo "core.hooksPath -> .githooks  (pre-commit key guard active)"

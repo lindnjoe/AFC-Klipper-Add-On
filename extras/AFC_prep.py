@@ -229,6 +229,13 @@ class afcPrep:
                 error_string = 'Error: {} Unit not found in  config section.'.format(unit)
                 self.afc.error.AFC_error(error_string, False)
                 return
+            # Skip an inert Bambu pool spare: it carries the `pool` flag until it
+            # claims a physical AMS, holds no lanes, and would otherwise print a
+            # "Prepping lanes" banner + empty READY logo for every unused slot at
+            # boot. Real (claimed) units and every non-Bambu unit have no truthy
+            # `pool` attribute, so they prep exactly as before.
+            if getattr(cur_unit, "pool", False):
+                continue
             self.logger.info('{} {} Prepping lanes'.format(cur_unit.type, unit))
             lanes_for_first_hub = []
             hub_name = ""

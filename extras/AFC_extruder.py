@@ -428,11 +428,16 @@ class AFCExtruder:
                 self.tc_lane.set_tool_loaded()
 
             if self.tool_start == "buffer":
-                error_msg = (
-                    f"buffer is not valid config for pin_tool_start when using {self.name} "
-                    "as a standalone extruder"
-                )
-                raise error(error_msg)
+                if not self._lanes_pending():
+                    error_msg = (
+                        f"buffer is not valid config for pin_tool_start when using {self.name} "
+                        "as a standalone extruder"
+                    )
+                    raise error(error_msg)
+                self.logger.info(
+                    f"{self.name}: no lane has registered yet, so pin_tool_start "
+                    f"buffer cannot be judged now. Lanes are on their way from a "
+                    f"pool; the verdict waits for them.")
         else:
             if self.tool_start == "virtual":
                 error_msg = (
@@ -440,6 +445,45 @@ class AFCExtruder:
                     "lanes are configured for this toolhead."
                 )
                 raise error(error_msg)
+
+    def _lanes_pending(self) -> bool:
+        """
+        Is a lane still on its way to this extruder?
+
+        A pooled lane resolves its extruder when its unit connects but stays
+        out of every registry until it is claimed, and a claim lands AFTER
+        ready. So an extruder carrying only pooled lanes -- a Bambu chain on
+        a toolhead of its own is the real case -- looks standalone at ready
+        on every single boot and stops looking standalone a few seconds
+        later. Rejecting `buffer` outright there shut the printer down on
+        every restart, with a message about standalone extruders that named
+        nothing the user could act on.
+
+        A unit with real config lane sections, a BoxTurtle say, never
+        reaches this: its lanes register at connect, so the extruder is not
+        standalone by the time ready runs.
+
+        Whatever has already registered is in self.lanes, so only the
+        unregistered ones are evidence of anything. BridgeBox clears
+        no_lanes itself once a claim gives this extruder real lanes
+        (_clear_standalone), which is the other half of this.
+
+        :return bool: True if an unregistered lane names this extruder
+        """
+        for _name, lane in self.printer.lookup_objects("AFC_lane"):
+            lane_name = getattr(lane, "name", None)
+            if not lane_name or lane_name == self.name or lane_name in self.lanes:
+                continue
+            # The resolved object is the strong answer. The configured NAME
+            # is the fallback, for a lane whose unit has not connected yet
+            # and so has not resolved anything: it still says where it is
+            # going, and waiting for a lane that never comes costs nothing,
+            # while refusing one that does costs the whole boot.
+            if getattr(lane, "extruder_obj", None) is self:
+                return True
+            if getattr(lane, "afc_extruder_name", None) == self.name:
+                return True
+        return False
 
     def handle_connect(self):
         """
@@ -558,6 +602,10 @@ class AFCExtruder:
 
         :param eventtime: Event time from the button press
         """
+        if not hasattr(self, 'fila_tool_start') or self.fila_tool_start is None:
+            # FPS buffer setups don't have fila_tool_start — runout is handled
+            # by the FPS/OpenAMS monitoring layer, not the filament switch.
+            return
         self._handle_toolhead_sensor_runout(self.fila_tool_start.runout_helper.filament_present, "tool_start")
         self.fila_tool_start.runout_helper.min_event_systime = self.reactor.monotonic() + self.fila_tool_start.runout_helper.event_delay
 
@@ -964,7 +1012,10 @@ class AFCExtruder:
             or self.check_transmit_status_fn is None):
             return
 
-        color = tuple(map(float, color.split(',')))
+        if isinstance(color, str):
+            color = tuple(map(float, color.split(',')))
+        elif isinstance(color, (list, tuple)):
+            color = tuple(map(float, color))
         for idx in self.toolhead_status_index:
             self.set_status_color_fn(idx, color)
 

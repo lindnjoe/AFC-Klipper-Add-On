@@ -307,7 +307,12 @@ class afc:
         self.debug                  = config.getboolean('debug', False)             # Setting to True turns on more debugging to show on console
         self.log_frame_data         = config.getboolean('log_frame_data', True)
         self.testing                = config.getboolean('testing', False)           # Set to true for testing only so that failure states can be tested without stats being reset
-        self.enable_multiple_mapping = config.getboolean("enable_multiple_mapping",False)
+        # "afc_enable_multiple_mapping" accepted as an alias -- an unread
+        # option in [AFC] halts Klipper, and the prefixed spelling is an easy
+        # reach for anyone used to the macro name.
+        self.enable_multiple_mapping = (
+            config.getboolean("enable_multiple_mapping", False)
+            or config.getboolean("afc_enable_multiple_mapping", False))
         self.manual_home_has_probe_pos_param: bool = False
 
         # Klippy debuginput start_args can only be passed in when doing tests, this way AFC
@@ -766,8 +771,13 @@ class afc:
             and (self.disable_print_temp_check or not self.print_tool_temperatures)):
             return
 
+        # disable_print_temp_check is checked here as well as in the guard above, because the
+        # guard only runs when the heater can ALREADY extrude. A cold extruder falls through
+        # it, so without this the flag has no effect in the one case an operator reaches for
+        # it: a print whose metadata does not answer for the lane being changed.
         if (self.function.is_printing()
-            and self.print_tool_temperatures):
+            and self.print_tool_temperatures
+            and not self.disable_print_temp_check):
             using_min_value = False
             target_temp = None
             try:
@@ -783,15 +793,25 @@ class afc:
                 self.logger.info(
                     f"Could not resolve print_tool_temperatures index for lane {cur_lane.name}: {e}"
                 )
-                # Returning instead of trying to lookup from default material
-                return
 
             if target_temp is None:
-                self.logger.info(f"No print_tool_temperatures entry for lane {cur_lane.name}")
-                # Returning instead of trying to lookup from default material,
-                # don't want to modify extruder temperature to temperatures that could be wrong
-                # during prints
-                return
+                if self.heater.can_extrude:
+                    self.logger.info(f"No print_tool_temperatures entry for lane {cur_lane.name}")
+                    # The metadata cannot answer for this lane and the extruder is already hot
+                    # enough to move filament. Leave it where the slicer put it rather than
+                    # applying a temperature the file did not ask for.
+                    return
+                # A COLD EXTRUDER HAS NO "LEAVE IT ALONE". The caller is about to move
+                # filament, so returning here does not preserve the slicer's temperature -- it
+                # hands the toolchange a nozzle below min_extrude_temp and the change aborts
+                # part-way through, with the lane half unloaded. The lane's own configured
+                # material temp is the right temperature for the filament being moved, and is
+                # what AFC uses for it outside a print.
+                self.logger.info(
+                    f"No print_tool_temperatures entry for lane {cur_lane.name} and the "
+                    f"extruder is too cold to extrude -- heating to its material temperature "
+                    f"so the toolchange can finish")
+                target_temp, using_min_value = self._get_default_material_temps(cur_lane)
         else:
             target_temp, using_min_value = self._get_default_material_temps(cur_lane)
 
@@ -862,7 +882,8 @@ class afc:
             pheaters.set_temperature(temp_state["extruder"].get_heater(), temp_state["target_temp"], wait=False)
             self.logger.info(f"Restoring extruder temperature to {temp_state['target_temp']} for {temp_state['extruder'].name}")
         except Exception:
-            self.logger.debug("Unable to restore extruder temperature")
+            self.logger.debug("Unable to restore extruder temperature",
+                              traceback=traceback.format_exc())
 
     def _set_display_status(self, variable: str, value: bool) -> None:
         """
@@ -882,7 +903,8 @@ class afc:
                 self.gcode.run_script_from_command(
                     f"_AFC_DISPLAY_STATUS VARIABLE={variable} VALUE={value}")
             except Exception:
-                self.logger.debug("_AFC_DISPLAY_STATUS macro raised an error")
+                self.logger.debug("_AFC_DISPLAY_STATUS macro raised an error",
+                                  traceback=traceback.format_exc())
 
     def _set_quiet_mode(self, val):
         """

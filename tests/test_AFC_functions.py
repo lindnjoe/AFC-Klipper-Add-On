@@ -1734,6 +1734,7 @@ class TestCmdAfcLaneResetToolheadLoadedGuard:
         func = _make_func()
         afc, lane = self._make_afc_lane()
         func.afc = afc
+        func.afc.homing_enabled = True
         from tests.conftest import MockGCodeCommand
         gcmd = MockGCodeCommand(params={"LANE": lane.name, "DISTANCE": distance})
         return func, lane, gcmd
@@ -2064,3 +2065,96 @@ class TestCmdAfcTestLanesParkAndVerify:
         func = _make_func()
         self._run_test_lane(func, park=True, park_cmd=None)
         func.afc.gcode.run_script_from_command.assert_not_called()
+        func.afc.gcode.run_script_from_command.assert_not_called()
+
+
+# ── check_absolute_mode ──────────────────────────────────────────────────────
+
+class _FakeGcodeMove:
+    """gcode_move stand-in carrying just the coordinate state the mode check
+    reads and writes."""
+
+    def __init__(self, absolute_coord=True, absolute_extrude=True,
+                 base_e=0.0, last_e=0.0):
+        self.absolute_coord = absolute_coord
+        self.absolute_extrude = absolute_extrude
+        self.base_position = [0.0, 0.0, 0.0, base_e]
+        self.last_position = [10.0, 20.0, 0.5, last_e]
+        self.homing_position = [0.0, 0.0, 0.0, 0.0]
+        self.speed = 100.0
+        self.speed_factor = 1 / 60.
+        self.extrude_factor = 1.0
+
+    def get_status(self, eventtime=None):
+        return {"absolute_extrude": self.absolute_extrude}
+
+
+def _func_with_gcode_move(gm):
+    func = _make_func()
+    func.afc.gcode_move = gm
+    func.afc.toolhead = MagicMock()
+    func.afc.toolhead.get_position.return_value = list(gm.last_position)
+    return func
+
+
+def test_check_absolute_mode_rezeroes_e_origin_on_the_flip():
+    # A relative-extrude print: base_position[3] never moves while
+    # last_position[3] accumulates, so logical E is hundreds of mm by
+    # mid-print. Flipping to absolute without re-zeroing left the next
+    # relative E value meaning "go to E=<small>" -- a ~-518mm retract.
+    gm = _FakeGcodeMove(absolute_extrude=False,
+                        base_e=156801.453808, last_e=157319.250561)
+    func = _func_with_gcode_move(gm)
+
+    func.check_absolute_mode("TOOL_UNLOAD")
+
+    assert gm.absolute_extrude is True
+    # Logical E is now 0, so a following `G1 E0.0168` read as absolute moves
+    # 0.0168mm instead of -517.780mm.
+    assert gm.base_position[3] == gm.last_position[3]
+    assert gm.last_position[3] - gm.base_position[3] == 0.0
+
+
+def test_check_absolute_mode_leaves_e_origin_alone_when_already_absolute():
+    # No reinterpretation happens without a flip, so the origin must not move
+    # -- shifting it here would corrupt an absolute-extrude print instead.
+    gm = _FakeGcodeMove(absolute_extrude=True, base_e=100.0, last_e=250.0)
+    func = _func_with_gcode_move(gm)
+
+    func.check_absolute_mode("TOOL_UNLOAD")
+
+    assert gm.absolute_extrude is True
+    assert gm.base_position[3] == 100.0
+    assert gm.last_position[3] == 250.0
+
+
+def test_check_absolute_mode_still_fixes_relative_coords():
+    gm = _FakeGcodeMove(absolute_coord=False, absolute_extrude=True)
+    func = _func_with_gcode_move(gm)
+
+    func.check_absolute_mode("TOOL_LOAD")
+
+    assert gm.absolute_coord is True
+
+
+def test_restore_pos_arithmetic_undoes_the_rezero():
+    # The safety property the re-zero relies on: restore_pos rebuilds
+    # base_position[3] from the SAVED positions, so the print's logical E comes
+    # back exactly regardless of what the origin was during the operation.
+    saved_base_e, saved_last_e = 156801.453808, 157319.250561
+    logical_before = saved_last_e - saved_base_e
+
+    gm = _FakeGcodeMove(absolute_extrude=False,
+                        base_e=saved_base_e, last_e=saved_last_e)
+    func = _func_with_gcode_move(gm)
+    func.check_absolute_mode("TOOL_UNLOAD")
+
+    # ... unload moves the extruder around ...
+    gm.last_position[3] += -2.0
+
+    # restore_pos: base_position restored from the saved copy, then corrected.
+    gm.base_position[3] = saved_base_e
+    gm.base_position[3] += gm.last_position[3] - saved_last_e
+
+    assert gm.last_position[3] - gm.base_position[3] == pytest.approx(
+        logical_before)

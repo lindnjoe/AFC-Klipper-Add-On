@@ -254,7 +254,7 @@ def _make_afc_extruder(name="extruder"):
     ext.no_lanes = False
     ext.next_pickup = False
     ext.status = State.IDLE
-    
+
     # Toolchanger stuff
     ext.tool_obj = None
     ext.tc_unit_name = None
@@ -1173,7 +1173,7 @@ def _make_ext_for_tool_start(name="extruder"):
     tc_lane._load_state   = False
     tc_lane.prep_state    = False
     tc_lane._afc_prep_done = False
-    tc_lane.custom_load_cmd = None
+    tc_lane.custom_load_cmd = None   # standard lane: built-in load runs
     ext.tc_lane           = tc_lane
 
     return ext
@@ -1331,6 +1331,17 @@ class TestToolStartCallback_StateChanged_WithToolchanger:
     def test_load_sequence_not_called_when_load_already_active(self):
         ext = self._make_tc_ext(printer_ready=True, prep_done=True,
                                 state=True, load_active=True)
+        ext.tool_start_callback(100.0, True)
+        ext.load_unload_sequence.assert_not_called()
+
+    def test_load_sequence_skipped_when_lane_has_custom_load_cmd(self):
+        # A lane with a custom_load_cmd drives the whole load (incl. the tool_stn
+        # advance) itself, so the built-in extruder move must be skipped — else
+        # its completion restores the toolhead temp to idle and cold-faults the
+        # still-running custom load.
+        ext = self._make_tc_ext(printer_ready=True, prep_done=True,
+                                state=True, load_active=False)
+        ext.tc_lane.custom_load_cmd = "AFC_STANDALONE_LOAD_U1"
         ext.tool_start_callback(100.0, True)
         ext.load_unload_sequence.assert_not_called()
 
@@ -2022,3 +2033,93 @@ class TestRestoreVirtualToolStart:
         ext.restore_virtual_tool_start(1)
         assert ext.tc_lane._load_state is True
         ext._apply_virtual_tool_start_state.assert_called_once_with(True)
+# ── The standalone verdict and pooled lanes ─────────────────────────
+
+def _make_ready_extruder(tool_start="buffer"):
+    """An AFCExtruder at the moment handle_ready() runs, with no lanes yet."""
+    from tests.conftest import MockAFC, MockLogger, MockPrinter
+    ext = AFCExtruder.__new__(AFCExtruder)
+    ext.name = "e0"
+    ext.tool_start = tool_start
+    ext.tool_start_state = False
+    ext.no_lanes = False
+    ext.logger = MockLogger()
+    ext.printer = MockPrinter(afc=MockAFC())
+    ext.tc_lane = MagicMock()
+    ext.tc_lane.name = "e0"
+    ext.lanes = {"e0": ext.tc_lane}       # its own pseudo-lane, nothing else
+    return ext
+
+
+def _register_lane(ext, name, extruder_obj):
+    lane = MagicMock()
+    lane.name = name
+    lane.extruder_obj = extruder_obj
+    ext.printer._objects[f"AFC_lane {name}"] = lane
+    return lane
+
+
+def test_a_standalone_extruder_with_nothing_coming_still_refuses_a_buffer():
+    # The original protection, unchanged: a toolhead that is its own lane
+    # has no buffer to ask, so "buffer" can never mean anything there.
+    ext = _make_ready_extruder()
+
+    with pytest.raises(KlipperError, match="standalone extruder"):
+        ext.handle_ready()
+
+
+def test_an_extruder_waiting_on_pooled_lanes_does_not_refuse_a_buffer():
+    """
+    A Bambu chain on a toolhead of its own. Its lanes exist and know their
+    extruder, but stay out of every registry until a unit claims a bay, and
+    a claim lands AFTER ready -- so the extruder looks standalone on every
+    boot and stops looking standalone seconds later. Refusing here shut the
+    printer down on every restart.
+    """
+    ext = _make_ready_extruder()
+    _register_lane(ext, "lane7", ext)
+
+    ext.handle_ready()                     # must not raise
+
+    assert [m for lvl, m in ext.logger.messages
+            if lvl == "info" and "verdict waits" in m]
+
+
+def test_a_lane_already_registered_is_not_evidence_of_one_coming():
+    # Only the UNREGISTERED lanes are evidence. One already in self.lanes
+    # has arrived and cannot arrive again, so it must not hold the verdict
+    # open forever on an extruder that really is standalone.
+    ext = _make_ready_extruder()
+    lane = _register_lane(ext, "lane7", ext)
+    ext.lanes["lane7"] = lane
+
+    assert ext._lanes_pending() is False
+
+
+def test_a_pooled_lane_bound_to_another_extruder_is_not_evidence():
+    ext = _make_ready_extruder()
+    _register_lane(ext, "lane7", MagicMock())     # someone else's lane
+
+    with pytest.raises(KlipperError, match="standalone extruder"):
+        ext.handle_ready()
+
+
+def test_a_standalone_extruder_with_a_real_pin_is_untouched():
+    ext = _make_ready_extruder(tool_start="^!EBBT1:PB3")
+
+    ext.handle_ready()
+
+    assert ext.no_lanes is True
+
+
+def test_a_lane_that_only_names_this_extruder_still_counts():
+    # A lane whose unit has not connected yet has resolved nothing, but it
+    # still says where it is going. Waiting for a lane that never comes
+    # costs nothing; refusing one that does costs the whole boot.
+    ext = _make_ready_extruder()
+    lane = _register_lane(ext, "lane7", None)
+    lane.afc_extruder_name = "e0"
+
+    ext.handle_ready()                     # must not raise
+
+    assert ext._lanes_pending() is True

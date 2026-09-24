@@ -529,7 +529,7 @@ class TestEjectLaneDoEnable:
 #
 # Pattern:
 #   1. Pop extras.AFC_EMU from sys.modules so it is re-imported fresh.
-#   2. Set the target dependency to None — Python treats a None entry as
+#   2. Set the target dependency to None, Python treats a None entry as
 #      "blocked", raising ModuleNotFoundError on import.
 #   3. importlib.import_module('extras.AFC_EMU') re-executes the module body.
 #   4. Restore sys.modules in a finally block so nothing leaks.

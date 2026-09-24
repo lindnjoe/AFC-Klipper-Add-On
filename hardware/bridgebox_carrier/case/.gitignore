@@ -1,0 +1,4 @@
+# The STLs and the pictures ARE the deliverable here -- the parent
+# .gitignore drops out/ because gerbers are regenerated, but nobody
+# should need OpenSCAD installed to print this.
+!out/

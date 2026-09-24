@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "bridgebox")(type "KiCad")(uri "${KIPRJMOD}/bridgebox.kicad_sym")(options "")(descr "BridgeBox carrier: modules with no stock symbol"))
+)

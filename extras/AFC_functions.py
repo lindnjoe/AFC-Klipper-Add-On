@@ -721,6 +721,12 @@ class afcFunction:
         if not get_gcode_absolute_extrude(self.afc.gcode_move):
             self.logger.debug("Printer extruder not in absolute mode, setting to absolute mode")
             set_gcode_absolute_extrude(self.afc.gcode_move, True)
+            # Re-zero the E origin with the flip, as G92 E0 would. A relative
+            # print's logical E can be hundreds of mm, and an in-flight
+            # relative E read as absolute became a -517mm move that cancelled
+            # a print.
+            gcode_move = self.afc.gcode_move
+            gcode_move.base_position[3] = gcode_move.last_position[3]
 
     def get_extruder_pos(self, eventtime=None, past_extruder_position=None, extruder=None):
         """

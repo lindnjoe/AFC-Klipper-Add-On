@@ -144,3 +144,18 @@ klippy-test-results*.xml
 site/
 
 .claude/
+
+# Pico sniffer build tree (mirrors build/, same source, -DSNIFF_BOOT=ON)
+bambu_ams_bridge/firmware/build-sniff/
+# Every other firmware build tree. Named individually before, which meant
+# the next variant -- build-wsec, the no_flash SECURE+WIFI one -- was not
+# ignored and 1055 CMake artifacts went into a commit.
+bambu_ams_bridge/firmware/build-*/
+
+# --- secure-boot key material: NEVER commit (real keys live in bambu_secure/ only) ---
+# (the pre-commit hook in .githooks is the hard block; these are belt-and-suspenders)
+**/bambu_secure/
+**/signing.pem
+**/aes_key.bin
+**/iv_salt.bin
+*.pem

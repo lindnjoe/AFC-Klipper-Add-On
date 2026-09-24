@@ -858,7 +858,12 @@ class AFC_moonraker:
                 "key": key
             }
             req = Request( self.database_url, urlencode(payload).encode(), method="DELETE")
-            with urlopen(req):
+            # TIMEOUT, like every other call here. This one runs on the
+            # background writer thread, so it cannot stall the reactor -- but
+            # an untimed urlopen against a moonraker that stops answering hangs
+            # that thread for ever, and every write queued behind it (stats,
+            # lane data, spool lookups) stops with it.
+            with urlopen(req, timeout=self.REQUEST_TIMEOUT):
                 pass
             self._log_async(self.logger.debug, f"Removing {key} from {namespace}")
         except HTTPError as e:

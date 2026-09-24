@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# ============================================================================
+# HARD BLOCK: secure-boot key material must NEVER enter this repository.
+#
+# The real per-fleet keys -- signing.pem (RP2350 secure-boot signing key),
+# aes_key.bin (flash-encryption AES key), iv_salt.bin -- live ONLY in
+# bambu_ams_bridge/bambu_secure/ on the provisioning Pi. Committing any of them
+# would let anyone sign or decrypt firmware for EVERY provisioned board, and on
+# a locked board that is unrecoverable. So this refuses the commit outright.
+#
+# Runs on every commit via core.hooksPath=.githooks (see .githooks/install or
+# `git config core.hooksPath .githooks`). It checks staged files by PATH, by
+# NAME, and by CONTENT (a PEM private-key block). The two committed DEV
+# placeholder keys are explicitly allowed; they protect nothing.
+# ============================================================================
+set -u
+
+is_allowed_devkey() {
+    case "$1" in
+        bambu_ams_bridge/keys/dev_signing.key|bambu_ams_bridge/keys/dev_distrib.key) return 0;;
+    esac
+    return 1
+}
+
+blocked=""
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    is_allowed_devkey "$f" && continue
+    reason=""
+    case "$f" in
+        bambu_secure/*|*/bambu_secure/*) reason="under bambu_secure/ (key store)";;
+        *signing.pem)                    reason="secure-boot signing key";;
+        *.pem)                           reason="PEM key file";;
+        *aes_key.bin)                    reason="flash-encryption AES key";;
+        *iv_salt.bin)                    reason="IV salt";;
+    esac
+    if [ -z "$reason" ]; then
+        # Content: a PEM private-key block, even under an innocent name.
+        #
+        # A WHOLE BLOCK, not just the words. This used to match the BEGIN line
+        # alone, which is a label rather than a secret -- and mbedtls ships that
+        # label table as string constants, so every firmware image linking
+        # esp-tls (the display's OTA build, for one) tripped the guard while
+        # carrying no key at all. Blocking those taught the only lesson a false
+        # positive ever teaches: to reach for --no-verify.
+        #
+        # So require a base64 BODY between BEGIN and END. Real key material
+        # always has one, hundreds of characters of it. The label table has
+        # nothing between its constants but NUL padding, which the character
+        # class excludes, so it cannot match however many labels sit together.
+        if git show ":$f" 2>/dev/null | python3 -c '
+import re, sys
+d = sys.stdin.buffer.read()
+sys.exit(0 if re.search(
+    rb"-----BEGIN [A-Z ]*PRIVATE KEY-----[ \t\r\n]*"
+    rb"[A-Za-z0-9+/=\r\n]{64,}?"
+    rb"-----END [A-Z ]*PRIVATE KEY-----", d, re.S) else 1)
+'; then
+            reason="contains a PRIVATE KEY block"
+        fi
+    fi
+    [ -n "$reason" ] && blocked="${blocked}
+  $f  --  $reason"
+done < <(git diff --cached --name-only --diff-filter=AM)
+
+if [ -n "$blocked" ]; then
+    cat >&2 <<EOF
+
+COMMIT BLOCKED -- secure-boot key material must never be committed:$blocked
+
+The real keys live only in bambu_ams_bridge/bambu_secure/ on the provisioning Pi.
+Unstage with:  git restore --staged <file>
+Do NOT bypass this with --no-verify. If a board's key reaches the repo, that key
+is compromised for the whole fleet.
+EOF
+    exit 1
+fi
+exit 0

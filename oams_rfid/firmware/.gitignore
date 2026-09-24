@@ -1,0 +1,3 @@
+# Vendor firmware binaries are not committed (copyright); analysis only.
+*.bin
+__pycache__/

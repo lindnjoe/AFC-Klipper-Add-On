@@ -195,6 +195,7 @@ def _make_afc_lane(fullname="AFC_stepper lane1"):
     """Build an AFCLane bypassing the complex __init__."""
     lane = AFCLane.__new__(AFCLane)
     parts = fullname.split()
+    lane.status = AFCLaneState.NONE
     lane.logger = MockLogger()
     lane.fullname = fullname
     lane.name = parts[-1]
@@ -919,12 +920,12 @@ class TestHandleLoadRunout:
         lane.afc.save_vars.assert_called_once_with()
 
 
-# ── handle_prep_runout — TTC (Timer Too Close) cross-lane guard ────────────────
+# ── handle_prep_runout, TTC (Timer Too Close) cross-lane guard ────────────────
 #
 # handle_prep_runout() reacts to the PREP switch returning to rest. Its
 # set_unloaded() call changes lane state and updates the LED, which can collide
 # with real-time step scheduling if a PREP cycle (this lane's own, or another
-# lane's) is still actively driving a stepper — tripping Klipper's trsync
+# lane's) is still actively driving a stepper, tripping Klipper's trsync
 # watchdog and shutting the hub MCU down with "Timer too close". The guard
 # below is scoped to that one branch only; the mid-print runout/pause branch
 # must never be delayed by it (that's a safety-relevant path).
@@ -949,7 +950,7 @@ class TestHandlePrepRunout:
         lane._perform_infinite_runout = MagicMock()
         lane._perform_pause_runout = MagicMock()
         lane.afc.save_vars = MagicMock()
-        # Real dict, not the MagicMock default — _any_lane_prep_active() iterates it.
+        # Real dict, not the MagicMock default, _any_lane_prep_active() iterates it.
         # Starts with just this lane, itself not active.
         lane.afc.lanes = {lane.name: lane}
         lane.afc.last_prep_activity_time = 0.0
@@ -2391,7 +2392,7 @@ def _make_lane_for_set_loaded(
         load_state: Value for lane._load_state (read-only property).
         bypass_active: Return value of afc.get_bypass_state(). Mocked directly
             on afc so tests are decoupled from get_bypass_state internals.
-        bypass_name: afc.bypass.name — controls virtual vs normal message path.
+        bypass_name: afc.bypass.name, controls virtual vs normal message path.
     """
     from tests.conftest import MockAFC, MockLogger
  
@@ -2402,7 +2403,7 @@ def _make_lane_for_set_loaded(
     # load_state is a read-only property; drive it via its backing attribute.
     lane._load_state = load_state
  
-    # Mock get_bypass_state directly — the method under test only calls this;
+    # Mock get_bypass_state directly, the method under test only calls this;
     # it doesn't inspect the bypass object internals directly.
     lane.afc.get_bypass_state = MagicMock(return_value=bypass_active)
     lane.afc.bypass.name = bypass_name
@@ -3058,7 +3059,7 @@ class TestPerformInfiniteRunout:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AFCU1Lane — external-feeder standalone lane (e.g. U1 side feeders)
+# AFCU1Lane, external-feeder standalone lane (e.g. U1 side feeders)
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # AFCU1Lane mirrors an external `[filament_feed left|right]` module's per-channel
@@ -3320,7 +3321,7 @@ class TestAFCU1LaneFeedReevaluate:
 
 class TestAFCU1LaneFeedPortEvent:
     """_feed_port_event filters by channel index, then trusts the event's own
-    `detected` flag directly (no _feed_obj lookup — deliberately, so the
+    `detected` flag directly (no _feed_obj lookup, deliberately, so the
     handler works even before _handle_ready has set _feed_obj up; see
     TestAFCU1LaneEventBeforeReady). Tests assert on real prep_state/_load_state
     outcomes so each would fail if the index guard let the wrong event
@@ -3396,7 +3397,7 @@ class TestAFCU1LaneFeedPortEvent:
 
 class TestAFCU1LaneHandleReady:
     """_handle_ready is exercised for real, including the AFCLane base-class
-    portion (super()._handle_ready()) — the feeder module and AFC_extruder
+    portion (super()._handle_ready()), the feeder module and AFC_extruder
     lookups are injected via MockPrinter._objects, the same pattern other
     AFC test files already use for wiring lookup_object() dependencies."""
 
@@ -3543,7 +3544,7 @@ class TestAFCU1LaneHandleReady:
 # ── event ordering: __init__ registers before _handle_ready is ready ─────────
 #
 # __init__ subscribes _feed_port_event to "filament_feed:port" before
-# _handle_ready has set up _feed_obj/_feed_ch_index — event registration order
+# _handle_ready has set up _feed_obj/_feed_ch_index, event registration order
 # does not guarantee callback order, so the feeder could fire that event in
 # the window between construction and klippy:ready. _feed_port_event is
 # deliberately self-contained (it trusts the event's own `detected` flag
@@ -4122,7 +4123,7 @@ class TestPrepCallback:
 
         Sequence: lane A's prep_callback is captured mid-cycle (via
         prep_load's side effect) with a second lane (B) releasing PREP at
-        that exact moment — handle_prep_runout must be blocked. Once A's
+        that exact moment, handle_prep_runout must be blocked. Once A's
         prep_callback finishes and self.prep_active is back to False, the
         same release event must now go through.
         """
@@ -4168,7 +4169,7 @@ class TestPrepCallback:
     # ── TTC fix follow-up (CodeRabbit review on PR #827): exception-safe cleanup ──
     # prep_active is set True before prep_load() runs and was only reset in the
     # normal/early-return exit paths. If prep_load() (or anything else in the
-    # active-cycle block) raised, it would stay stuck True permanently — meaning
+    # active-cycle block) raised, it would stay stuck True permanently, meaning
     # every lane's handle_prep_runout stays gated forever (since it's aggregated
     # across lanes), not just this lane's own prep_callback re-entrancy guard.
 
@@ -4180,7 +4181,7 @@ class TestPrepCallback:
         assert lane.prep_active is False
 
     def test_exception_in_prep_load_still_propagates(self):
-        """The fix guarantees cleanup, not error suppression — the original
+        """The fix guarantees cleanup, not error suppression, the original
         exception must still reach the caller unchanged."""
         lane = _make_lane_ready_to_load()
         lane.unit_obj.prep_load.side_effect = RuntimeError("boom")

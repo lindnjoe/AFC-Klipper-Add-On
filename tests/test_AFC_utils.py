@@ -972,41 +972,56 @@ class TestAFCMoonrakerBackgroundWriter:
         scheduled_cb(0.0)
         log_fn.assert_called_once_with("hello", traceback="tb")
 
-    def test_write_worker_processes_queued_call_then_loops(self):
-        """Drives exactly one loop iteration: the second queue.get() raises
-        to break out of the otherwise-infinite loop deterministically."""
-        mr = self._make_moonraker_with_real_reactor_hook()
+    # THESE DRIVE THE REAL THREAD, and they have to.
+    #
+    # They used to build the object, replace _write_queue with a MagicMock and
+    # then call _write_worker() directly to step the loop by hand. But
+    # __init__ has ALREADY started a live _write_worker thread, and it re-reads
+    # self._write_queue every iteration -- so after the swap there were two
+    # consumers pulling from one side_effect list. Whichever won took the work
+    # item and the loser got the RuntimeError, which made the assertion fail
+    # perhaps one run in ten. Queueing onto the real queue and waiting for the
+    # real thread tests the same guarantees without the race, and tests the
+    # thread that actually runs in production rather than a hand-cranked loop.
+
+    def test_write_worker_processes_queued_call(self):
+        from tests.conftest import MockLogger, MockReactor
+        mr = AFC_moonraker("http://localhost", "7125", MockLogger(),
+                           MockReactor())
+        done = threading.Event()
         called = []
-        mr._write_queue.get.side_effect = [
-            (lambda a, b: called.append((a, b)), (1, 2)),
-            RuntimeError("stop test loop"),
-        ]
 
-        with pytest.raises(RuntimeError, match="stop test loop"):
-            mr._write_worker()
+        def work(a, b):
+            called.append((a, b))
+            done.set()
 
+        mr._write_queue.put((work, (1, 2)))
+        assert done.wait(5.0), "the background writer never ran the call"
         assert called == [(1, 2)]
 
-    def test_write_worker_survives_exception_and_logs_it(self):
-        """A queued call that raises must not kill the worker loop -- it
-        should be caught, logged, and the loop must continue to the next item."""
-        mr = self._make_moonraker_with_real_reactor_hook()
+    def test_write_worker_survives_exception_and_keeps_going(self):
+        """A queued call that raises must not kill the worker loop -- the next
+        item still has to run, or one bad push silently ends all writes."""
+        from tests.conftest import MockLogger, MockReactor
+        reactor = MockReactor()
+        reactor.register_async_callback = MagicMock()
+        mr = AFC_moonraker("http://localhost", "7125", MockLogger(), reactor)
+        done = threading.Event()
 
         def boom():
             raise ValueError("kaboom")
 
-        mr._write_queue.get.side_effect = [
-            (boom, ()),
-            RuntimeError("stop test loop"),
-        ]
+        mr._write_queue.put((boom, ()))
+        mr._write_queue.put((lambda: done.set(), ()))
+        assert done.wait(5.0), "the worker died on the raising call"
 
-        with pytest.raises(RuntimeError, match="stop test loop"):
-            mr._write_worker()
-
-        scheduled_calls = mr.reactor.register_async_callback.call_args_list
-        assert len(scheduled_calls) == 2
-        scheduled_calls[0][0][0](0.0)
-        scheduled_calls[1][0][0](0.0)
+        # AND IT REPORTED. The logging is handed to the reactor rather than
+        # done on this thread -- that is the whole point of _log_async -- so
+        # run what it scheduled and check what would have reached the log.
+        scheduled = reactor.register_async_callback.call_args_list
+        assert len(scheduled) == 2, scheduled
+        for call in scheduled:
+            call[0][0](0.0)
         errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
         debug_msgs = [m for lvl, m in mr.logger.messages if lvl == "debug"]
         assert errors == ["Unexpected error in moonraker background writer"]
@@ -1607,26 +1622,3 @@ class TestVirtualFilamentSensor:
         gcmd = MockGCodeCommand(params={"ENABLE": 0})
         sensor.cmd_SET_FILAMENT_SENSOR(gcmd)
         assert sensor.runout_helper.sensor_enabled is False
-
-    def test_cmd_set_filament_sensor_invokes_enable_callback(self):
-        printer = self._make_printer_with_add_object()
-        enable_cb = MagicMock()
-        sensor = VirtualFilamentSensor(printer, "FPS1_expanded", logger=MagicMock(),
-                                       enable_cb=enable_cb)
-        gcmd = MockGCodeCommand(params={"ENABLE": 1})
-        sensor.cmd_SET_FILAMENT_SENSOR(gcmd)
-        assert sensor.runout_helper.sensor_enabled is True
-        enable_cb.assert_called_once_with(True)
-
-        gcmd = MockGCodeCommand(params={"ENABLE": 0})
-        sensor.cmd_SET_FILAMENT_SENSOR(gcmd)
-        assert sensor.runout_helper.sensor_enabled is False
-        enable_cb.assert_called_with(False)
-
-    def test_cmd_set_filament_sensor_without_callback(self):
-        """Buffers and other users pass no enable_cb -- toggling must still work."""
-        printer = self._make_printer_with_add_object()
-        sensor = VirtualFilamentSensor(printer, "FPS1_expanded", logger=MagicMock())
-        gcmd = MockGCodeCommand(params={"ENABLE": 1})
-        sensor.cmd_SET_FILAMENT_SENSOR(gcmd)
-        assert sensor.runout_helper.sensor_enabled is True

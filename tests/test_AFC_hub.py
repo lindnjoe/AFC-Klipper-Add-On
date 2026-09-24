@@ -46,12 +46,42 @@ def _make_hub(switch_pin="PA0", name="test_hub", extra_values=None):
         hub = afc_hub(config)
     printer.send_event("klippy:connect")
 
-    if switch_pin and switch_pin.lower() != "virtual":
-        # add_filament_switch is mocked above (it does real pin/hardware
-        # setup), so the fila/runout_helper it would normally wire up need
-        # their own defaults set by hand for handle_runout's tests.
-        hub.fila.runout_helper.min_event_systime = 0.0
-        hub.fila.runout_helper.event_delay = 0.5
+    hub.fullname = f"AFC_hub {name}"
+    hub.name = name
+    hub.unit = None
+    hub.lanes = {}
+    hub._state = False
+    hub._state_driven = False
+    hub.switch_pin = switch_pin
+
+    # Default config values
+    hub.hub_clear_move_dis = 65.0
+    hub.afc_bowden_length = 900.0
+    hub.td1_bowden_length = 850.0
+    hub.afc_unload_bowden_length = 900.0
+    hub.assisted_retract = False
+    hub.move_dis = 75.0
+    hub.cut = False
+    hub.cut_cmd = None
+    hub.cut_servo_name = "cut"
+    hub.cut_dist = 50.0
+    hub.cut_clear = 120.0
+    hub.cut_min_length = 200.0
+    hub.cut_servo_pass_angle = 0.0
+    hub.cut_servo_clip_angle = 160.0
+    hub.cut_servo_prep_angle = 75.0
+    hub.cut_confirm = False
+    hub.config_bowden_length = hub.afc_bowden_length
+    hub.config_unload_bowden_length = hub.afc_unload_bowden_length
+    hub.enable_sensors_in_gui = False
+    hub.debounce_delay = 0.1
+    hub.enable_runout = False
+
+    # Filament sensor mock (used in handle_runout)
+    hub.fila = MagicMock()
+    hub.fila.runout_helper.min_event_systime = 0.0
+    hub.fila.runout_helper.event_delay = 0.5
+    hub.debounce_button = MagicMock()
 
     if extra_values:
         for k, v in extra_values.items():
@@ -269,6 +299,11 @@ class TestHandleReady:
         lane = MagicMock()
         lane.fullname = "AFC_stepper lane1"
         lane.load = None  # no load sensor
+        # The virtual-hub load-sensor check moved from handle_connect to
+        # handle_ready (and now skips SENSORLESS_UNITS); give the lane a
+        # non-sensorless type and a prep sensor so the check fires.
+        lane.unit_obj.type = "BoxTurtle"
+        lane.prep = object()
         hub.lanes = {"lane1": lane}
         with pytest.raises(config_error):
             hub.handle_ready()
