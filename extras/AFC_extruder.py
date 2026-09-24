@@ -428,11 +428,16 @@ class AFCExtruder:
                 self.tc_lane.set_tool_loaded()
 
             if self.tool_start == "buffer":
-                error_msg = (
-                    f"buffer is not valid config for pin_tool_start when using {self.name} "
-                    "as a standalone extruder"
-                )
-                raise error(error_msg)
+                if not self._lanes_pending():
+                    error_msg = (
+                        f"buffer is not valid config for pin_tool_start when using {self.name} "
+                        "as a standalone extruder"
+                    )
+                    raise error(error_msg)
+                self.logger.info(
+                    f"{self.name}: no lane has registered yet, so pin_tool_start "
+                    f"buffer cannot be judged now. Lanes are on their way from a "
+                    f"pool; the verdict waits for them.")
         else:
             if self.tool_start == "virtual":
                 error_msg = (
@@ -440,6 +445,26 @@ class AFCExtruder:
                     "lanes are configured for this toolhead."
                 )
                 raise error(error_msg)
+
+    def _lanes_pending(self) -> bool:
+        """
+        Check whether a lane not yet registered names this extruder.
+
+        A pooled (Bambu) lane only registers when its unit is claimed, after
+        ready, so an extruder with only pooled lanes looks standalone at ready.
+
+        :return bool: True if an unregistered lane names this extruder
+        """
+        for _name, lane in self.printer.lookup_objects("AFC_lane"):
+            lane_name = getattr(lane, "name", None)
+            if not lane_name or lane_name == self.name or lane_name in self.lanes:
+                continue
+            # The configured name covers a lane whose unit has not connected yet.
+            if getattr(lane, "extruder_obj", None) is self:
+                return True
+            if getattr(lane, "afc_extruder_name", None) == self.name:
+                return True
+        return False
 
     def handle_connect(self):
         """

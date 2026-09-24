@@ -624,6 +624,11 @@ class TestCheckExtruderTemp:
         obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
             heater_target_temp=150, actual_temp=148, target_material_temp=210
         )
+        # The extruder is ALREADY hot here: this is the case where
+        # leaving the heater alone is a real choice. Cold, the caller's
+        # next move is a min_extrude_temp abort -- see the paired
+        # TestCheckExtruderTempColdFallback tests below.
+        heater.can_extrude = True
         obj.function.is_printing.return_value = True
         obj.print_tool_temperatures = [230]
         lane.current_map = "custom_lane"
@@ -641,6 +646,7 @@ class TestCheckExtruderTemp:
         obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
             heater_target_temp=150, actual_temp=148, target_material_temp=210
         )
+        heater.can_extrude = True
         obj.function.is_printing.return_value = True
         obj.print_tool_temperatures = [230]
         lane.current_map = "T5"
@@ -661,6 +667,7 @@ class TestCheckExtruderTemp:
         obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
             heater_target_temp=150, actual_temp=148, target_material_temp=210
         )
+        heater.can_extrude = True
         obj.function.is_printing.return_value = True
         obj.print_tool_temperatures = [230, 999]
         lane.current_map = "T-1"
@@ -679,6 +686,7 @@ class TestCheckExtruderTemp:
         obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
             heater_target_temp=150, actual_temp=148, target_material_temp=210
         )
+        heater.can_extrude = True
         obj.function.is_printing.return_value = True
         obj.print_tool_temperatures = {230}  # set: truthy but not subscriptable
         lane.current_map = "T0"
@@ -705,6 +713,7 @@ class TestCheckExtruderTemp:
         obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
             heater_target_temp=150, actual_temp=148, target_material_temp=210
         )
+        heater.can_extrude = True
         obj.function.is_printing.return_value = True
         obj.print_tool_temperatures = [230]
         lane.current_map = _RaisesAttributeError()
@@ -720,10 +729,12 @@ class TestCheckExtruderTemp:
         """A None entry in print_tool_temperatures (e.g. slicer had no data for
         that tool) still resolves via the index lookup, but the None result is
         not used and does NOT fall back to _get_default_material_temps while
-        printing -- it returns without touching the heater instead."""
+        printing with a hot extruder -- it returns without touching the heater
+        instead."""
         obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
             heater_target_temp=150, actual_temp=148, target_material_temp=210
         )
+        heater.can_extrude = True
         obj.function.is_printing.return_value = True
         obj.print_tool_temperatures = [None, 220]
         lane.current_map = "T0"
@@ -734,6 +745,115 @@ class TestCheckExtruderTemp:
         assert result is None
         infos = [m for lvl, m in obj.logger.messages if lvl == "info"]
         assert any(lane.name in m for m in infos)
+
+    # ── the same metadata gaps, with the extruder COLD ───────────────────────
+    #
+    # The tests above hold the heater where the slicer left it, which is right
+    # while it is hot enough to move filament. Cold, "leave it alone" is not a
+    # neutral choice: the caller is mid-toolchange and about to extrude, so
+    # returning hands it a nozzle below min_extrude_temp and the change aborts
+    # with the lane part-unloaded.
+    #
+    # Reported from a Snapmaker U1: a lane whose tool number ran past the end of
+    # the file's per-tool list unloaded at 140C, and CHANGE_TOOL paused the
+    # print on "extruder below minimum temp".
+
+    def test_a_bad_index_on_a_cold_extruder_uses_the_lanes_material_temp(self):
+        """The failure from the U1: lane.map indexes past the end of the list
+        and the extruder cannot extrude, so the lane's own material temp is
+        applied rather than leaving it cold for the unload."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=250
+        )
+        heater.can_extrude = False
+        obj.function.is_printing.return_value = True
+        obj.print_tool_temperatures = [230]
+        lane.current_map = "T5"
+        result = obj._check_extruder_temp(lane)
+        obj._get_default_material_temps.assert_called_once_with(lane)
+        pheaters.set_temperature.assert_called_once_with(heater, 250.0)
+        assert result is True
+
+    def test_a_non_numeric_map_on_a_cold_extruder_uses_the_lanes_material_temp(self):
+        """The fallback is on the outcome, not on which exception produced it:
+        a map that never parses reaches it the same way an overflowing index
+        does."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=250
+        )
+        heater.can_extrude = False
+        obj.function.is_printing.return_value = True
+        obj.print_tool_temperatures = [230]
+        lane.current_map = "custom_lane"
+        result = obj._check_extruder_temp(lane)
+        obj._get_default_material_temps.assert_called_once_with(lane)
+        pheaters.set_temperature.assert_called_once_with(heater, 250.0)
+        assert result is True
+
+    def test_a_none_entry_on_a_cold_extruder_uses_the_lanes_material_temp(self):
+        """A tool the slicer had no temperature for resolves to None, which is
+        a metadata gap like any other."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=250
+        )
+        heater.can_extrude = False
+        obj.function.is_printing.return_value = True
+        obj.print_tool_temperatures = [None, 220]
+        lane.map = "T0"
+        result = obj._check_extruder_temp(lane)
+        obj._get_default_material_temps.assert_called_once_with(lane)
+        pheaters.set_temperature.assert_called_once_with(heater, 250.0)
+        assert result is True
+
+    def test_the_cold_fallback_says_why_it_heated(self):
+        """The operator gets both halves: which lookup failed, and what was
+        applied instead. Without the second line the log reads as a refusal and
+        the heat that followed looks unexplained."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=250
+        )
+        heater.can_extrude = False
+        obj.function.is_printing.return_value = True
+        obj.print_tool_temperatures = [230]
+        lane.current_map = "T5"
+        obj._check_extruder_temp(lane)
+        infos = [m for lvl, m in obj.logger.messages if lvl == "info"]
+        assert any(lane.name in m and "index out of range" in m for m in infos)
+        assert any(lane.name in m and "material temperature" in m for m in infos)
+
+    def test_a_good_index_on_a_cold_extruder_still_uses_the_metadata(self):
+        """The fallback is reached only when the metadata cannot answer. A lane
+        the file DOES cover takes the file's temperature, cold or not."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=999
+        )
+        heater.can_extrude = False
+        obj.function.is_printing.return_value = True
+        obj.print_tool_temperatures = [180, 220, 260]
+        lane.current_map = "T1"
+        result = obj._check_extruder_temp(lane)
+        obj._get_default_material_temps.assert_not_called()
+        pheaters.set_temperature.assert_called_once_with(heater, 220.0)
+        assert result is True
+
+    def test_disable_print_temp_check_reaches_a_cold_extruder(self):
+        """disable_print_temp_check has to work when the heater is cold, which
+        is the state an operator sets it in. The guard at the top of the
+        function only runs when the heater can ALREADY extrude, so the flag is
+        checked on the metadata branch too -- otherwise setting it changes
+        nothing about the failure it is reached for."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=250,
+            disable_print_temp_check=True,
+        )
+        heater.can_extrude = False
+        obj.function.is_printing.return_value = True
+        obj.print_tool_temperatures = [230]
+        lane.current_map = "T5"
+        result = obj._check_extruder_temp(lane)
+        obj._get_default_material_temps.assert_called_once_with(lane)
+        pheaters.set_temperature.assert_called_once_with(heater, 250.0)
+        assert result is True
 
 
 # ── _cooldown_last_extruder ───────────────────────────────────────────────────
